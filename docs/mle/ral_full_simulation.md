@@ -257,8 +257,8 @@ profile, and short adaptive shield-program planning profile.
 
 ```bash
 uv run estimate-radiation-mle ral-full-simulation \
-  --scenario /secure/runtime/ral-mix9-scenario.json \
-  --output-dir /home/moeu/research/ral-runs/ral-mix9-mle \
+  --scenario .local/private-scenarios/ral-mix9-scenario.json \
+  --output-dir results/ral-runs/ral-mix9-mle \
   --dashboard-public-host HOSTNAME \
   --json
 ```
@@ -278,9 +278,9 @@ For a persistent multi-hour run:
 tmux new-session -d -s ral_mle \
   "cd /home/moeu/research/radiation-surface-mle-estimator && \
    uv run estimate-radiation-mle ral-full-simulation \
-   --scenario /secure/runtime/ral-mix9-scenario.json \
-   --output-dir /home/moeu/research/ral-runs/ral-mix9-mle \
-   > /home/moeu/research/ral-runs/ral-mix9-mle.log 2>&1"
+   --scenario .local/private-scenarios/ral-mix9-scenario.json \
+   --output-dir results/ral-runs/ral-mix9-mle \
+   > results/ral-runs/ral-mix9-mle.log 2>&1"
 ```
 
 ## Replay an existing physical log
@@ -290,7 +290,7 @@ An already completed compatible RA-L log can be analyzed without acquisition:
 ```bash
 uv run estimate-radiation-mle ral-full-simulation \
   --run-dir /path/to/measurement-log-v2 \
-  --output-dir /home/moeu/research/ral-runs/ral-mix9-mle \
+  --output-dir results/ral-runs/ral-mix9-mle \
   --json
 ```
 

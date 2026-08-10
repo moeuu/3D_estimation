@@ -105,8 +105,7 @@ def test_two_stage_planner_exactly_evaluates_only_adaptive_shortlist(
         dtype=np.float64,
     )
     screening_actions = tuple(
-        _planning_action(index, pose, 10.0 - index)
-        for index, pose in enumerate(poses)
+        _planning_action(index, pose, 10.0 - index) for index, pose in enumerate(poses)
     )
 
     def fake_screen(*args: object, **kwargs: object) -> MLEPlanningResult:
@@ -1022,3 +1021,4 @@ def test_floor_ceiling_competition_rewards_height_discrimination() -> None:
 
     assert metrics["floor_ceiling"][1] > metrics["floor_ceiling"][0]
     assert metrics["correlation"][1] > metrics["correlation"][0]
+    assert metrics["surface_coverage"][1] > metrics["surface_coverage"][0]

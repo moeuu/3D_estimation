@@ -168,6 +168,16 @@ def test_mle_config_rejects_invalid_online_and_laplace_controls() -> None:
         MLEConfig(laplace_support_threshold_fraction=1.1)
     with pytest.raises(ValueError, match="bootstrap_batch_size"):
         MLEConfig(bootstrap_batch_size=True)
+    with pytest.raises(ValueError, match="debias_max_active_parameters"):
+        MLEConfig(debias_max_active_parameters=0)
+    with pytest.raises(TypeError, match="debias_requires_convergence"):
+        MLEConfig(debias_requires_convergence=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="refinement_max_patches"):
+        MLEConfig(refinement_max_patches=0)
+    with pytest.raises(ValueError, match="debias_max_pearson_dispersion"):
+        MLEConfig(debias_max_pearson_dispersion=0.0)
+    with pytest.raises(ValueError, match="Structured spectral nuisance"):
+        MLEConfig(mode="spectral", fit_station_rate_nuisance=True)
 
 
 def test_mle_config_resolves_calibration_relative_to_config_file(

@@ -292,9 +292,49 @@ def _draw_obstacles(
                 ),
                 cell_size,
                 cell_size,
-                facecolor="#404040",
-                edgecolor="#404040",
+                facecolor="black",
+                edgecolor="none",
+                alpha=0.75,
                 zorder=0,
+            )
+        )
+
+
+def _draw_obstacles_3d(
+    axis: object,
+    environment: Mapping[str, object],
+) -> None:
+    """Draw runtime obstacle cells as flat floor patches on a 3-D axis."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    raw_grid = environment.get("obstacle_grid", {})
+    grid = raw_grid if isinstance(raw_grid, Mapping) else {}
+    cell_size = max(_finite_float(grid.get("cell_size"), fallback=1.0), 1.0e-9)
+    origin = np.asarray(grid.get("origin", (0.0, 0.0)), dtype=np.float64).reshape(-1)
+    if origin.size < 2:
+        origin = np.zeros(2, dtype=np.float64)
+    patches: list[list[tuple[float, float, float]]] = []
+    for raw_cell in grid.get("blocked_cells", []):
+        cell = np.asarray(raw_cell, dtype=np.float64).reshape(-1)
+        if cell.size < 2 or np.any(~np.isfinite(cell[:2])):
+            continue
+        x0 = float(origin[0] + cell[0] * cell_size)
+        y0 = float(origin[1] + cell[1] * cell_size)
+        patches.append(
+            [
+                (x0, y0, 0.0),
+                (x0 + cell_size, y0, 0.0),
+                (x0 + cell_size, y0 + cell_size, 0.0),
+                (x0, y0 + cell_size, 0.0),
+            ]
+        )
+    if patches:
+        axis.add_collection3d(
+            Poly3DCollection(
+                patches,
+                facecolor="black",
+                edgecolor="none",
+                alpha=0.25,
             )
         )
 
@@ -330,9 +370,7 @@ def _hotspot_arrays(
     if estimate is None:
         return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
     rows = [
-        row
-        for row in _hotspot_payload(estimate)
-        if str(row.get("isotope")) == isotope
+        row for row in _hotspot_payload(estimate) if str(row.get("isotope")) == isotope
     ]
     if not rows:
         return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
@@ -345,45 +383,216 @@ def _hotspot_arrays(
     )
 
 
-def _draw_path(axis: object, payload: Mapping[str, object], *, three_d: bool) -> None:
-    """Draw the traversed detector path using the PF CUI visual vocabulary."""
-    positions = np.asarray(payload.get("detector_positions_xyz", []), dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3 or not positions.size:
-        return
-    if three_d:
+def _xyz_rows(value: object) -> NDArray[np.float64]:
+    """Return finite xyz rows or an empty array for malformed display input."""
+    rows = np.asarray(value, dtype=np.float64)
+    if rows.size == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[1] != 3 or np.any(~np.isfinite(rows)):
+        return np.zeros((0, 3), dtype=np.float64)
+    return rows
+
+
+def _path_segments(payload: Mapping[str, object]) -> list[NDArray[np.float64]]:
+    """Return validated obstacle-aware runtime path segments."""
+    segments: list[NDArray[np.float64]] = []
+    raw_segments = payload.get("travel_path_segments_xyz", [])
+    if not isinstance(raw_segments, list):
+        return segments
+    for raw_segment in raw_segments:
+        segment = _xyz_rows(raw_segment)
+        if segment.shape[0] >= 2:
+            segments.append(segment)
+    return segments
+
+
+def _measurement_stations(
+    payload: Mapping[str, object],
+) -> tuple[NDArray[np.float64], list[str]]:
+    """Return measurement positions and PF-style station visit labels."""
+    points: list[NDArray[np.float64]] = []
+    labels: list[str] = []
+    raw_stations = payload.get("measurement_stations", [])
+    if isinstance(raw_stations, list):
+        for index, raw_station in enumerate(raw_stations):
+            if not isinstance(raw_station, Mapping):
+                continue
+            point = np.asarray(raw_station.get("position_xyz", ()), dtype=np.float64)
+            if point.shape != (3,) or np.any(~np.isfinite(point)):
+                continue
+            visits = max(int(raw_station.get("visit_count", 1)), 1)
+            station_id = int(raw_station.get("station_id", index))
+            labels.append(str(station_id) if visits <= 1 else f"{station_id}({visits})")
+            points.append(point)
+    if points:
+        return np.vstack(points), labels
+
+    positions = _xyz_rows(payload.get("detector_positions_xyz", []))
+    if not positions.size:
+        return positions, []
+    unique_points: list[NDArray[np.float64]] = []
+    counts: list[int] = []
+    for point in positions:
+        if unique_points and float(np.linalg.norm(point - unique_points[-1])) <= 1.0e-6:
+            counts[-1] += 1
+        else:
+            unique_points.append(point.copy())
+            counts.append(1)
+    labels = [
+        str(index) if count <= 1 else f"{index}({count})"
+        for index, count in enumerate(counts)
+    ]
+    return np.vstack(unique_points), labels
+
+
+def _unique_path_waypoints(
+    segments: list[NDArray[np.float64]],
+    stations: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return distinct intermediate waypoints that are not station positions."""
+    waypoints: list[NDArray[np.float64]] = []
+    for segment in segments:
+        for point in segment[1:-1]:
+            if (
+                stations.size
+                and float(np.min(np.linalg.norm(stations - point, axis=1))) <= 1.0e-6
+            ):
+                continue
+            if any(
+                float(np.linalg.norm(point - prior)) <= 1.0e-6 for prior in waypoints
+            ):
+                continue
+            waypoints.append(point.copy())
+    return np.vstack(waypoints) if waypoints else np.zeros((0, 3), dtype=np.float64)
+
+
+def _draw_path(
+    axis: object,
+    payload: Mapping[str, object],
+    *,
+    three_d: bool,
+    show_station_labels: bool = False,
+    show_legend_context: bool = True,
+) -> None:
+    """Draw the runtime route using the same visual contract as the PF CUI."""
+    from matplotlib import patheffects
+
+    segments = _path_segments(payload)
+    stations, station_labels = _measurement_stations(payload)
+    for index, segment in enumerate(segments):
+        coordinates = (
+            (segment[:, 0], segment[:, 1], segment[:, 2])
+            if three_d
+            else (segment[:, 0], segment[:, 1])
+        )
         axis.plot(
-            positions[:, 0],
-            positions[:, 1],
-            positions[:, 2],
-            color="#20dfe3",
-            linewidth=1.8,
+            *coordinates,
+            "-",
+            color="cyan",
+            linewidth=1.6 if three_d else 2.0,
+            alpha=0.68 if three_d else 0.75,
+            label=("traversed path" if index == 0 and show_legend_context else None),
             zorder=4,
         )
-        axis.scatter(
-            positions[:, 0],
-            positions[:, 1],
-            positions[:, 2],
-            s=28,
-            facecolors="white",
-            edgecolors="#00cfd5",
-            zorder=5,
-        )
-    else:
-        axis.plot(
-            positions[:, 0],
-            positions[:, 1],
-            color="#20dfe3",
-            linewidth=1.8,
-            zorder=4,
+    waypoints = _unique_path_waypoints(segments, stations)
+    if waypoints.size:
+        coordinates = (
+            (waypoints[:, 0], waypoints[:, 1], waypoints[:, 2])
+            if three_d
+            else (waypoints[:, 0], waypoints[:, 1])
         )
         axis.scatter(
-            positions[:, 0],
-            positions[:, 1],
-            s=34,
-            facecolors="white",
-            edgecolors="#00cfd5",
-            zorder=5,
+            *coordinates,
+            s=9 if three_d else 18,
+            color="cyan",
+            edgecolor="black",
+            linewidth=0.25 if three_d else 0.3,
+            alpha=0.28 if three_d else 0.55,
+            marker=".",
+            label="path waypoint" if show_legend_context else None,
+            zorder=6,
         )
+    if stations.size:
+        coordinates = (
+            (stations[:, 0], stations[:, 1], stations[:, 2])
+            if three_d
+            else (stations[:, 0], stations[:, 1])
+        )
+        axis.scatter(
+            *coordinates,
+            s=34 if three_d else 55,
+            color="white",
+            edgecolor="cyan",
+            linewidth=0.8 if three_d else 1.0,
+            label="measurement station" if show_legend_context else None,
+            zorder=9,
+        )
+        if show_station_labels and not three_d:
+            for point, label in zip(stations, station_labels):
+                text = axis.text(
+                    point[0],
+                    point[1],
+                    label,
+                    color="black",
+                    fontsize=8,
+                    ha="center",
+                    va="center",
+                    zorder=10,
+                )
+                text.set_path_effects(
+                    [patheffects.withStroke(linewidth=1.8, foreground="white")]
+                )
+    current = np.asarray(
+        payload.get("current_detector_position_xyz", ()), dtype=np.float64
+    )
+    if current.shape != (3,) or np.any(~np.isfinite(current)):
+        current = stations[-1] if stations.size else np.zeros(0, dtype=np.float64)
+    if current.size:
+        coordinates = (
+            (current[0:1], current[1:2], current[2:3])
+            if three_d
+            else (current[0:1], current[1:2])
+        )
+        axis.scatter(
+            *coordinates,
+            s=70 if three_d else 130,
+            color="cyan",
+            edgecolor="black",
+            linewidth=0.7 if three_d else 1.0,
+            label="robot" if show_legend_context else None,
+            zorder=12,
+        )
+
+
+def _apply_metric_ticks_2d(
+    axis: object,
+    *,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+) -> None:
+    """Apply PF-style two-metre major ticks to a 2-D scene axis."""
+    axis.set_xticks(np.arange(xlim[0], xlim[1] + 1.0e-9, 2.0))
+    axis.set_yticks(np.arange(ylim[0], ylim[1] + 1.0e-9, 2.0))
+
+
+def _format_3d_axis(
+    axis: object,
+    *,
+    bounds: tuple[float, float, float],
+    title: str,
+) -> None:
+    """Apply PF-style world bounds, ticks, aspect, labels, and camera."""
+    x_max, y_max, z_max = bounds
+    axis.set(xlim=(0.0, x_max), ylim=(0.0, y_max), zlim=(0.0, z_max))
+    axis.set_xticks(np.arange(0.0, x_max + 1.0e-9, 2.0))
+    axis.set_yticks(np.arange(0.0, y_max + 1.0e-9, 2.0))
+    axis.set_zticks(np.arange(0.0, z_max + 1.0e-9, 2.0))
+    axis.set_box_aspect((x_max, y_max, z_max))
+    axis.set_xlabel("x [m]")
+    axis.set_ylabel("y [m]")
+    axis.set_zlabel("z [m]")
+    axis.set_title(title, fontsize=10)
+    axis.view_init(elev=26.0, azim=-58.0)
 
 
 def _save_figure_atomic(figure: object, path: Path) -> None:
@@ -416,8 +625,12 @@ def _render_dashboard_images(
         f"step={payload.get('latest_step_id', '—')}"
     )
 
-    overview, axes = plt.subplots(1, 2, figsize=(12.0, 6.0))
-    top_axis, elevation_axis = axes
+    overview = plt.figure(figsize=(11.2, 8.0))
+    overview_grid = overview.add_gridspec(2, 2)
+    top_axis = overview.add_subplot(overview_grid[:, 0])
+    elevation_axis = overview.add_subplot(overview_grid[0, 1])
+    info_axis = overview.add_subplot(overview_grid[1, 1])
+    info_axis.axis("off")
     _draw_obstacles(top_axis, environment)
     _draw_path(top_axis, payload, three_d=False)
     for isotope in isotopes:
@@ -426,60 +639,153 @@ def _render_dashboard_images(
         hotspots, _ = _hotspot_arrays(estimate, isotope)
         if truth_positions.size:
             top_axis.scatter(
-                truth_positions[:, 0], truth_positions[:, 1], marker="*", s=85,
-                color=color, label=f"true {isotope}", zorder=7,
+                truth_positions[:, 0],
+                truth_positions[:, 1],
+                marker="*",
+                s=85,
+                color=color,
+                label=f"true {isotope}",
+                zorder=7,
             )
             elevation_axis.scatter(
-                truth_positions[:, 0], truth_positions[:, 2], marker="*", s=85,
-                color=color, label=f"true {isotope}", zorder=7,
+                truth_positions[:, 0],
+                truth_positions[:, 2],
+                marker="*",
+                s=85,
+                color=color,
+                label=f"true {isotope}",
+                zorder=7,
             )
         if hotspots.size:
             top_axis.scatter(
-                hotspots[:, 0], hotspots[:, 1], marker="x", s=145,
-                linewidths=2.2, color=color, label=f"MLE {isotope}", zorder=8,
+                hotspots[:, 0],
+                hotspots[:, 1],
+                marker="x",
+                s=145,
+                linewidths=2.2,
+                color=color,
+                label=f"MLE {isotope}",
+                zorder=8,
             )
             elevation_axis.scatter(
-                hotspots[:, 0], hotspots[:, 2], marker="x", s=145,
-                linewidths=2.2, color=color, label=f"MLE {isotope}", zorder=8,
+                hotspots[:, 0],
+                hotspots[:, 2],
+                marker="x",
+                s=145,
+                linewidths=2.2,
+                color=color,
+                label=f"MLE {isotope}",
+                zorder=8,
             )
     top_axis.set(xlim=(0.0, x_max), ylim=(0.0, y_max), xlabel="x [m]", ylabel="y [m]")
     elevation_axis.set(
         xlim=(0.0, x_max), ylim=(0.0, z_max), xlabel="x [m]", ylabel="z [m]"
     )
+    stations, _ = _measurement_stations(payload)
+    if stations.size:
+        elevation_axis.scatter(
+            stations[:, 0],
+            stations[:, 2],
+            s=28,
+            color="cyan",
+            edgecolor="black",
+            linewidth=0.4,
+            alpha=0.55,
+            label="station height",
+            zorder=6,
+        )
+    elevation_axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.45)
+    elevation_axis.axhline(z_max, color="black", linewidth=0.8, alpha=0.25)
     top_axis.set_title("Top-down map: obstacles, path, truth, and MLE")
     elevation_axis.set_title("Elevation projection: height ambiguity")
-    for axis in axes:
+    for axis, x_limits, y_limits in (
+        (top_axis, (0.0, x_max), (0.0, y_max)),
+        (elevation_axis, (0.0, x_max), (0.0, z_max)),
+    ):
+        _apply_metric_ticks_2d(axis, xlim=x_limits, ylim=y_limits)
         axis.grid(alpha=0.25)
         axis.set_aspect("equal", adjustable="box")
     handles, labels = top_axis.get_legend_handles_labels()
-    if handles:
-        overview.legend(handles, labels, loc="lower center", ncol=3, fontsize=8)
-    overview.suptitle(
-        f"RA-L experiment overview — Surface MLE\n{progress}",
-        fontweight="bold",
+    elevation_handles, elevation_labels = elevation_axis.get_legend_handles_labels()
+    legend_by_label = dict(zip(labels + elevation_labels, handles + elevation_handles))
+    if legend_by_label:
+        info_axis.legend(
+            legend_by_label.values(),
+            legend_by_label.keys(),
+            loc="upper left",
+            fontsize=7,
+            frameon=True,
+        )
+    summary = payload.get("summary")
+    summary_mapping = summary if isinstance(summary, Mapping) else {}
+    info_axis.text(
+        0.0,
+        0.02,
+        "\n".join(
+            (
+                progress,
+                f"status: {payload.get('status', 'starting')}",
+                f"converged: {summary_mapping.get('converged', '—')}",
+                f"iterations: {summary_mapping.get('iterations', '—')}",
+                f"Poisson deviance: {summary_mapping.get('poisson_deviance', '—')}",
+                f"surface patches: {summary_mapping.get('patch_count', '—')}",
+                "truth markers are evaluation overlay only",
+            )
+        ),
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        transform=info_axis.transAxes,
     )
-    overview.tight_layout(rect=(0.0, 0.08, 1.0, 0.91))
+    overview.suptitle("RA-L experiment overview", fontsize=13, fontweight="bold")
+    overview.subplots_adjust(
+        left=0.06,
+        right=0.98,
+        top=0.90,
+        bottom=0.08,
+        wspace=0.25,
+        hspace=0.32,
+    )
     _save_figure_atomic(overview, output_dir / OVERVIEW_IMAGE_FILENAME)
 
     robot, robot_axis = plt.subplots(figsize=(8.4, 7.2))
     _draw_obstacles(robot_axis, environment)
-    _draw_path(robot_axis, payload, three_d=False)
+    _draw_path(
+        robot_axis,
+        payload,
+        three_d=False,
+        show_station_labels=True,
+    )
     for isotope in isotopes:
         color = _ISOTOPE_COLORS.get(isotope, "#9467bd")
         truth_positions, _ = _truth_arrays(cui_overlay, isotope)
         hotspots, _ = _hotspot_arrays(estimate, isotope)
         if truth_positions.size:
             robot_axis.scatter(
-                truth_positions[:, 0], truth_positions[:, 1], marker="*", s=95,
-                color=color, label=f"true {isotope}", zorder=7,
+                truth_positions[:, 0],
+                truth_positions[:, 1],
+                marker="*",
+                s=95,
+                color=color,
+                label=f"true {isotope}",
+                zorder=7,
             )
         if hotspots.size:
             robot_axis.scatter(
-                hotspots[:, 0], hotspots[:, 1], marker="x", s=170,
-                linewidths=2.4, color=color, label=f"MLE {isotope}", zorder=8,
+                hotspots[:, 0],
+                hotspots[:, 1],
+                marker="x",
+                s=170,
+                linewidths=2.4,
+                color=color,
+                label=f"MLE {isotope}",
+                zorder=8,
             )
-    robot_axis.set(
-        xlim=(0.0, x_max), ylim=(0.0, y_max), xlabel="x [m]", ylabel="y [m]"
+    robot_axis.set(xlim=(0.0, x_max), ylim=(0.0, y_max), xlabel="x [m]", ylabel="y [m]")
+    _apply_metric_ticks_2d(
+        robot_axis,
+        xlim=(0.0, x_max),
+        ylim=(0.0, y_max),
     )
     robot_axis.set_aspect("equal", adjustable="box")
     robot_axis.grid(alpha=0.25)
@@ -493,6 +799,15 @@ def _render_dashboard_images(
     mle_figure = plt.figure(figsize=(14.0, 6.2))
     density_axis = mle_figure.add_subplot(1, 2, 1, projection="3d")
     hotspot_axis = mle_figure.add_subplot(1, 2, 2, projection="3d")
+    _draw_obstacles_3d(density_axis, environment)
+    _draw_obstacles_3d(hotspot_axis, environment)
+    _draw_path(density_axis, payload, three_d=True)
+    _draw_path(
+        hotspot_axis,
+        payload,
+        three_d=True,
+        show_legend_context=False,
+    )
     if estimate is not None:
         patch_points = np.asarray(
             [patch.centroid_xyz for patch in estimate.patches], dtype=np.float64
@@ -500,42 +815,58 @@ def _render_dashboard_images(
         for isotope_index, isotope in enumerate(isotopes):
             if isotope_index >= estimate.density_by_isotope.shape[0]:
                 continue
-            density = np.asarray(estimate.density_by_isotope[isotope_index], dtype=float)
+            density = np.asarray(
+                estimate.density_by_isotope[isotope_index], dtype=float
+            )
             peak = max(float(np.max(density, initial=0.0)), 1.0e-12)
             active = density > peak * 1.0e-4
             if np.any(active):
                 density_axis.scatter(
-                    patch_points[active, 0], patch_points[active, 1], patch_points[active, 2],
-                    s=4.0 + 34.0 * np.sqrt(density[active] / peak), alpha=0.38,
-                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"), label=isotope,
+                    patch_points[active, 0],
+                    patch_points[active, 1],
+                    patch_points[active, 2],
+                    s=4.0 + 34.0 * np.sqrt(density[active] / peak),
+                    alpha=0.38,
+                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
+                    label=isotope,
                 )
             hotspots, strengths = _hotspot_arrays(estimate, isotope)
             if hotspots.size:
-                sizes = 90.0 + 120.0 * strengths / max(float(np.max(strengths)), 1.0e-12)
-                hotspot_axis.scatter(
-                    hotspots[:, 0], hotspots[:, 1], hotspots[:, 2], marker="x",
-                    s=sizes, linewidths=2.5,
-                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"), label=f"MLE {isotope}",
+                sizes = 90.0 + 120.0 * strengths / max(
+                    float(np.max(strengths)), 1.0e-12
                 )
-    _draw_path(hotspot_axis, payload, three_d=True)
+                hotspot_axis.scatter(
+                    hotspots[:, 0],
+                    hotspots[:, 1],
+                    hotspots[:, 2],
+                    marker="x",
+                    s=sizes,
+                    linewidths=2.5,
+                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
+                    label=f"MLE {isotope}",
+                )
     for isotope in isotopes:
         truth_positions, _ = _truth_arrays(cui_overlay, isotope)
         if truth_positions.size:
-            hotspot_axis.scatter(
-                truth_positions[:, 0], truth_positions[:, 1], truth_positions[:, 2],
-                marker="*", s=100, color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
-                label=f"true {isotope}",
-            )
+            for axis in (density_axis, hotspot_axis):
+                axis.scatter(
+                    truth_positions[:, 0],
+                    truth_positions[:, 1],
+                    truth_positions[:, 2],
+                    marker="*",
+                    s=100,
+                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
+                    label=f"true {isotope}",
+                )
     for axis, title in (
         (density_axis, "Surface-patch intensity"),
         (hotspot_axis, "MLE hotspot centroids"),
     ):
-        axis.set(xlim=(0.0, x_max), ylim=(0.0, y_max), zlim=(0.0, z_max))
-        axis.set_xlabel("x [m]")
-        axis.set_ylabel("y [m]")
-        axis.set_zlabel("z [m]")
-        axis.set_title(title)
-        axis.view_init(elev=27.0, azim=-58.0)
+        _format_3d_axis(
+            axis,
+            bounds=(x_max, y_max, z_max),
+            title=title,
+        )
         handles, labels = axis.get_legend_handles_labels()
         if handles:
             axis.legend(handles, labels, fontsize=8)
@@ -589,15 +920,17 @@ def _render_dashboard_images(
         spectrum_axis.set_yscale("symlog", linthresh=1.0)
         spectrum_axis.set_ylabel("counts per measurement")
         spectrum_axis.set_xlabel(
-            "energy [keV]"
-            if energy_edges.size == observed.size + 1
-            else "spectrum bin"
+            "energy [keV]" if energy_edges.size == observed.size + 1 else "spectrum bin"
         )
         spectrum_axis.legend()
     else:
         spectrum_axis.text(
-            0.5, 0.5, "Predicted spectrum appears after the first completed fit",
-            ha="center", va="center", transform=spectrum_axis.transAxes,
+            0.5,
+            0.5,
+            "Predicted spectrum appears after the first completed fit",
+            ha="center",
+            va="center",
+            transform=spectrum_axis.transAxes,
         )
     spectrum_axis.grid(alpha=0.25)
     spectrum_axis.set_title(f"Latest observed and predicted spectrum — {progress}")
@@ -629,6 +962,9 @@ def _dashboard_payload(
         "patches": [],
         "density_by_isotope": {},
         "detector_positions_xyz": [],
+        "travel_path_segments_xyz": list(state.get("travel_path_segments_xyz", [])),
+        "measurement_stations": list(state.get("measurement_stations", [])),
+        "current_detector_position_xyz": state.get("current_detector_position_xyz"),
         "hotspots": [],
         "latest_observed_spectrum_counts": list(
             state.get("latest_observed_spectrum_counts", [])

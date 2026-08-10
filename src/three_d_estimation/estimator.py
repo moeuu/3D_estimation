@@ -541,15 +541,79 @@ def _warm_start_refined(
 def _refinement_patch_ids(
     state: _FitState,
     fraction: float,
+    maximum_patches: int,
 ) -> tuple[int, ...]:
-    """Select strongest active patches for the next coarse-to-fine level."""
-    integrated = np.sum(state.result.integrated_strengths_cps_1m, axis=1)
-    positive = np.flatnonzero(integrated > 0.0)
-    if positive.size == 0 or float(fraction) <= 0.0:
+    """Select bounded isotope-balanced support for local surface refinement."""
+    strengths = np.asarray(
+        state.result.integrated_strengths_cps_1m,
+        dtype=np.float64,
+    )
+    if not np.any(strengths > 0.0) or float(fraction) <= 0.0:
         return ()
-    selected_count = max(1, int(np.ceil(float(fraction) * positive.size)))
-    order = positive[np.argsort(integrated[positive])[::-1][:selected_count]]
-    return tuple(state.patches.patches[int(index)].patch_id for index in order)
+    normalized = strengths / np.maximum(
+        np.max(strengths, axis=0, keepdims=True),
+        1.0e-30,
+    )
+    selected: set[int] = set()
+    for isotope_index in range(strengths.shape[1]):
+        positive = np.flatnonzero(strengths[:, isotope_index] > 0.0)
+        if not positive.size:
+            continue
+        selected_count = max(1, int(np.ceil(float(fraction) * positive.size)))
+        order = positive[
+            np.argsort(normalized[positive, isotope_index], kind="stable")[::-1][
+                :selected_count
+            ]
+        ]
+        selected.update(int(index) for index in order)
+    ranked = sorted(
+        selected,
+        key=lambda index: (
+            -float(np.max(normalized[index])),
+            int(state.patches.patches[index].patch_id),
+        ),
+    )[: int(maximum_patches)]
+    return tuple(state.patches.patches[index].patch_id for index in ranked)
+
+
+def _bounded_debias_support(
+    state: _FitState,
+    config: MLEConfig,
+) -> NDArray[np.bool_]:
+    """Return a bounded isotope-balanced support mask for shrinkage removal."""
+    strengths = np.asarray(
+        state.result.integrated_strengths_cps_1m,
+        dtype=np.float64,
+    )
+    maxima = np.max(strengths, axis=0, keepdims=True)
+    relative = strengths / np.maximum(maxima, 1.0e-30)
+    eligible = (
+        (strengths > 0.0)
+        & (relative >= float(config.support_threshold_fraction))
+        & (maxima > 0.0)
+    )
+    flat_eligible = np.flatnonzero(eligible.reshape(-1))
+    limit = int(config.debias_max_active_parameters)
+    if flat_eligible.size <= limit:
+        return eligible
+
+    selected: set[int] = set()
+    for isotope_index in range(strengths.shape[1]):
+        candidates = np.flatnonzero(eligible[:, isotope_index])
+        if candidates.size:
+            strongest = int(candidates[np.argmax(relative[candidates, isotope_index])])
+            selected.add(strongest * strengths.shape[1] + isotope_index)
+    ranked = sorted(
+        (int(index) for index in flat_eligible if int(index) not in selected),
+        key=lambda index: (
+            -float(relative.reshape(-1)[index]),
+            index,
+        ),
+    )
+    selected.update(ranked[: max(limit - len(selected), 0)])
+    support = np.zeros(strengths.size, dtype=bool)
+    support[list(selected)] = True
+    return support.reshape(strengths.shape)
 
 
 def _debias_state(
@@ -567,10 +631,38 @@ def _debias_state(
         # The count-covariance path is diagnostic and must never be silently
         # replaced by a Poisson support refit.
         return state
+    if bool(config.debias_requires_convergence) and not state.result.converged:
+        return replace(
+            state,
+            likelihood_diagnostics={
+                **state.likelihood_diagnostics,
+                "debias_applied": False,
+                "debias_skip_reason": "regularized_fit_not_converged",
+            },
+        )
+    fitted_prediction = _full_prediction(state)[state.fit_indices]
+    fitted_observed = np.asarray(observed[state.fit_indices], dtype=np.float64)
+    pearson_dispersion = float(
+        np.mean(
+            np.square(fitted_observed - fitted_prediction)
+            / np.maximum(fitted_prediction, 1.0)
+        )
+    )
+    if pearson_dispersion > float(config.debias_max_pearson_dispersion):
+        return replace(
+            state,
+            likelihood_diagnostics={
+                **state.likelihood_diagnostics,
+                "debias_applied": False,
+                "debias_skip_reason": "pearson_dispersion_exceeds_limit",
+                "pearson_dispersion": pearson_dispersion,
+                "debias_max_pearson_dispersion": float(
+                    config.debias_max_pearson_dispersion
+                ),
+            },
+        )
     densities = state.result.densities_cps_1m_m2
-    maxima = np.max(densities, axis=0, keepdims=True)
-    support = densities >= maxima * float(config.support_threshold_fraction)
-    support &= maxima > 0.0
+    support = _bounded_debias_support(state, config)
     if not np.any(support):
         return state
     if isinstance(state.response, ResponseOperator):
@@ -599,7 +691,26 @@ def _debias_state(
             progress_hook=progress_hook,
             progress_phase="mle_solver_iterations:debias",
         )
-        return replace(state, response=masked_response, result=result)
+        if bool(config.debias_requires_convergence) and not result.converged:
+            return replace(
+                state,
+                likelihood_diagnostics={
+                    **state.likelihood_diagnostics,
+                    "debias_applied": False,
+                    "debias_skip_reason": "debias_fit_not_converged",
+                    "debias_active_parameter_count": int(np.count_nonzero(support)),
+                },
+            )
+        return replace(
+            state,
+            response=masked_response,
+            result=result,
+            likelihood_diagnostics={
+                **state.likelihood_diagnostics,
+                "debias_applied": True,
+                "debias_active_parameter_count": int(np.count_nonzero(support)),
+            },
+        )
     if state.response.ndim == 4:
         masked_response = state.response * support[None, None, :, :]
     else:  # pragma: no cover - all production response tensors are rank four
@@ -623,7 +734,26 @@ def _debias_state(
         progress_hook=progress_hook,
         progress_phase="mle_solver_iterations:debias",
     )
-    return replace(state, response=masked_response, result=result)
+    if bool(config.debias_requires_convergence) and not result.converged:
+        return replace(
+            state,
+            likelihood_diagnostics={
+                **state.likelihood_diagnostics,
+                "debias_applied": False,
+                "debias_skip_reason": "debias_fit_not_converged",
+                "debias_active_parameter_count": int(np.count_nonzero(support)),
+            },
+        )
+    return replace(
+        state,
+        response=masked_response,
+        result=result,
+        likelihood_diagnostics={
+            **state.likelihood_diagnostics,
+            "debias_applied": True,
+            "debias_active_parameter_count": int(np.count_nonzero(support)),
+        },
+    )
 
 
 def _full_prediction(state: _FitState) -> NDArray[np.float64]:
@@ -1059,7 +1189,11 @@ class SurfaceMLEEstimator:
             progress_label="base",
         )
         for level in range(int(self.config.coarse_to_fine_levels)):
-            selected = _refinement_patch_ids(state, self.config.refinement_fraction)
+            selected = _refinement_patch_ids(
+                state,
+                self.config.refinement_fraction,
+                self.config.refinement_max_patches,
+            )
             if not selected:
                 break
             refined = refine_surface_patches(
@@ -1137,6 +1271,12 @@ class SurfaceMLEEstimator:
             )
             response_shape = [int(value) for value in state.response.shape]
         residual = observed - predicted
+        pearson_dispersion = float(
+            np.mean(
+                np.square(residual[state.fit_indices])
+                / np.maximum(predicted[state.fit_indices], 1.0)
+            )
+        )
         diagnostics: dict[str, object] = {
             "provenance": estimator_provenance(variant=self.config.mode),
             "estimator_family": "surface_mle",
@@ -1175,6 +1315,9 @@ class SurfaceMLEEstimator:
             ),
             "held_out_poisson_deviance": held_out_deviance,
             "residual_l2": float(np.linalg.norm(residual)),
+            "pearson_dispersion": pearson_dispersion,
+            "deviance_per_fitted_channel": float(state.result.deviance)
+            / max(int(observed[state.fit_indices].size), 1),
             "residual_by_observation": np.asarray(residual, dtype=float).tolist(),
             "objective_history": _json_floats(
                 np.asarray(state.result.objective_history, dtype=float)

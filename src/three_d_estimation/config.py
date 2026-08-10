@@ -43,9 +43,9 @@ class MLEConfig:
     fit_background_nuisance: bool = True
     fit_scatter_nuisance: bool = True
     discrepancy_calibration_path: str | None = None
-    fit_shield_leakage_nuisance: bool = True
-    fit_station_rate_nuisance: bool = True
-    fit_low_rank_residual_nuisance: bool = True
+    fit_shield_leakage_nuisance: bool = False
+    fit_station_rate_nuisance: bool = False
+    fit_low_rank_residual_nuisance: bool = False
     fit_gain_resolution_drift: bool = False
     spectral_likelihood: Literal["poisson", "calibrated_overdispersed"] = "poisson"
     count_likelihood: Literal[
@@ -81,8 +81,12 @@ class MLEConfig:
     backscatter_fraction: float = 0.03
     support_threshold_fraction: float = 1.0e-3
     debias_refit: bool = True
+    debias_requires_convergence: bool = True
+    debias_max_active_parameters: int = 256
+    debias_max_pearson_dispersion: float = 10.0
     coarse_to_fine_levels: int = 0
     refinement_fraction: float = 0.1
+    refinement_max_patches: int = 64
     response_correlation_threshold: float = 0.995
     cluster_threshold_fraction: float = 0.1
     cluster_min_strength_cps_1m: float = 0.0
@@ -169,6 +173,23 @@ class MLEConfig:
             raise ValueError(
                 "Calibrated overdispersion requires discrepancy_calibration_path."
             )
+        calibrated_nuisance_requested = any(
+            (
+                bool(self.fit_shield_leakage_nuisance),
+                bool(self.fit_station_rate_nuisance),
+                bool(self.fit_low_rank_residual_nuisance),
+                bool(self.fit_gain_resolution_drift),
+            )
+        )
+        if (
+            self.mode == "spectral"
+            and calibrated_nuisance_requested
+            and self.discrepancy_calibration_path is None
+        ):
+            raise ValueError(
+                "Structured spectral nuisance terms require "
+                "discrepancy_calibration_path."
+            )
         if (
             self.spectral_likelihood == "calibrated_overdispersed"
             and self.spectral_response_mode != "matrix_free"
@@ -223,6 +244,7 @@ class MLEConfig:
                 self.laplace_support_threshold_fraction
             ),
             "laplace_ridge": self.laplace_ridge,
+            "debias_max_pearson_dispersion": (self.debias_max_pearson_dispersion),
         }
         if any(not np.isfinite(value) or value < 0.0 for value in nonnegative.values()):
             raise ValueError(
@@ -302,6 +324,25 @@ class MLEConfig:
             or int(self.online_coarse_to_fine_levels) < 0
         ):
             raise ValueError("online_coarse_to_fine_levels must be non-negative.")
+        if not isinstance(self.debias_requires_convergence, (bool, np.bool_)):
+            raise TypeError("debias_requires_convergence must be boolean.")
+        if (
+            isinstance(self.debias_max_active_parameters, bool)
+            or int(self.debias_max_active_parameters) < 1
+        ):
+            raise ValueError("debias_max_active_parameters must be positive.")
+        if (
+            not np.isfinite(self.debias_max_pearson_dispersion)
+            or float(self.debias_max_pearson_dispersion) <= 0.0
+        ):
+            raise ValueError(
+                "debias_max_pearson_dispersion must be finite and positive."
+            )
+        if (
+            isinstance(self.refinement_max_patches, bool)
+            or int(self.refinement_max_patches) < 1
+        ):
+            raise ValueError("refinement_max_patches must be positive.")
         if (
             isinstance(self.laplace_max_active_parameters, bool)
             or int(self.laplace_max_active_parameters) < 1

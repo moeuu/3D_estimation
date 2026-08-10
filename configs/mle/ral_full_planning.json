@@ -1,7 +1,7 @@
 {
   "active_strength_fraction": 0.001,
   "candidate_pose_chunk_size": 4,
-  "elevation_diversity_weight": 0.5,
+  "elevation_diversity_weight": 1.0,
   "exact_candidate_max": 8,
   "exact_candidate_min": 4,
   "exact_diversity_weight": 0.15,
@@ -30,6 +30,7 @@
   "screening_source_parameter_limit": 24,
   "source_strength_scale_floor_cps_1m": 1.0,
   "support_hypothesis_separation_weight": 0.5,
+  "surface_coverage_weight": 2.0,
   "two_stage_screening": true,
   "z_fisher_weight": 0.75
 }

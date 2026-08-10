@@ -17,7 +17,11 @@ from three_d_estimation.information_planner import (
     MLEPlanningConfig,
     MLEPlanningResult,
 )
-from three_d_estimation.online import ONLINE_STATE_FILENAME, OnlineMLESession
+from three_d_estimation.online import (
+    ONLINE_STATE_FILENAME,
+    OnlineMLESession,
+    _dashboard_trajectory,
+)
 from three_d_estimation.reporting import load_mle_estimate
 from three_d_estimation.types import MLEEstimate, SurfacePatch
 
@@ -47,6 +51,8 @@ def _record(
     station_id: int,
     *,
     station_complete: bool,
+    detector_pose_xyz: tuple[float, float, float] = (0.5, 0.5, 1.0),
+    travel_waypoints_xyz: list[list[float]] | None = None,
 ) -> MeasurementRecord:
     """Return one finalized shared-runtime record."""
     metadata: dict[str, object] = {
@@ -54,11 +60,13 @@ def _record(
     }
     if station_complete:
         metadata["station_complete"] = True
+    if travel_waypoints_xyz is not None:
+        metadata["travel_waypoints_xyz"] = travel_waypoints_xyz
     return MeasurementRecord(
         step_id=step_id,
         action_id=step_id,
         station_id=station_id,
-        detector_pose_xyz=(0.5, 0.5, 1.0),
+        detector_pose_xyz=detector_pose_xyz,
         detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
         fe_orientation_index=step_id % 8,
         pb_orientation_index=(step_id + 1) % 8,
@@ -69,6 +77,49 @@ def _record(
         energy_bin_edges_keV=np.asarray([0.0, 400.0, 800.0]),
         metadata=metadata,
     )
+
+
+def test_dashboard_trajectory_preserves_runtime_route_and_station_visits() -> None:
+    """The MLE CUI must use runtime waypoints instead of obstacle-crossing chords."""
+    segment = [
+        [0.5, 0.5, 1.0],
+        [0.5, 1.5, 0.25],
+        [1.5, 1.5, 0.25],
+        [1.5, 2.5, 1.0],
+    ]
+    records = (
+        _record(0, 0, station_complete=True),
+        _record(
+            1,
+            1,
+            station_complete=False,
+            detector_pose_xyz=(1.5, 2.5, 1.0),
+            travel_waypoints_xyz=segment,
+        ),
+        _record(
+            2,
+            1,
+            station_complete=True,
+            detector_pose_xyz=(1.5, 2.5, 1.0),
+        ),
+    )
+
+    payload = _dashboard_trajectory(records)
+
+    assert payload["travel_path_segments_xyz"] == [segment]
+    assert payload["measurement_stations"] == [
+        {
+            "station_id": 0,
+            "position_xyz": [0.5, 0.5, 1.0],
+            "visit_count": 1,
+        },
+        {
+            "station_id": 1,
+            "position_xyz": [1.5, 2.5, 1.0],
+            "visit_count": 2,
+        },
+    ]
+    assert payload["current_detector_position_xyz"] == [1.5, 2.5, 1.0]
 
 
 def _patch() -> SurfacePatch:
@@ -248,9 +299,7 @@ def test_online_session_publishes_each_causal_station_and_final_report(
     assert dashboard["density_by_isotope"]["Cs-137"] == [3.0]
     assert dashboard["detector_positions_xyz"] == []
     assert dashboard["planning"]["selected_action"]["shield_pair_ids"] == [3]
-    assert dashboard["cui"]["truth"]["true_sources"]["Cs-137"] == [
-        [0.5, 0.5, 0.0]
-    ]
+    assert dashboard["cui"]["truth"]["true_sources"]["Cs-137"] == [[0.5, 0.5, 0.0]]
     assert "truth" not in state
     assert "cui" not in state
     planning_path = output_dir / "planning" / "after_step_00000002.json"

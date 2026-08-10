@@ -140,8 +140,8 @@ Run a private physical scenario under live MLE control and publish the dashboard
 
 ```bash
 uv run estimate-radiation-mle ral-full-simulation \
-  --scenario /secure/runtime/ral-mix9-scenario.json \
-  --output-dir /home/moeu/research/ral-runs/ral-mix9-mle \
+  --scenario .local/private-scenarios/ral-mix9-scenario.json \
+  --output-dir results/ral-runs/ral-mix9-mle \
   --json
 ```
 

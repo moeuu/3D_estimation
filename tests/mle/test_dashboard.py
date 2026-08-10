@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from three_d_estimation import dashboard
@@ -78,10 +79,76 @@ def test_dashboard_publishes_pf_style_scientific_images(tmp_path: Path) -> None:
         dashboard.MLE_IMAGE_FILENAME,
         dashboard.SPECTRUM_IMAGE_FILENAME,
     )
-    html = (tmp_path / dashboard.DASHBOARD_INDEX_FILENAME).read_text(
-        encoding="utf-8"
-    )
+    html = (tmp_path / dashboard.DASHBOARD_INDEX_FILENAME).read_text(encoding="utf-8")
     for filename in expected:
         payload = (tmp_path / filename).read_bytes()
         assert payload.startswith(b"\x89PNG\r\n\x1a\n")
         assert filename in html
+
+
+def test_dashboard_draws_runtime_waypoints_stations_and_robot() -> None:
+    """Scene rendering must not replace an obstacle-aware route with a chord."""
+    payload = {
+        "travel_path_segments_xyz": [
+            [
+                [0.5, 0.5, 1.0],
+                [0.5, 1.5, 0.25],
+                [1.5, 1.5, 0.25],
+                [1.5, 2.5, 1.0],
+            ]
+        ],
+        "measurement_stations": [
+            {
+                "station_id": 0,
+                "position_xyz": [0.5, 0.5, 1.0],
+                "visit_count": 1,
+            },
+            {
+                "station_id": 1,
+                "position_xyz": [1.5, 2.5, 1.0],
+                "visit_count": 8,
+            },
+        ],
+        "current_detector_position_xyz": [1.5, 2.5, 1.0],
+        "detector_positions_xyz": [
+            [0.5, 0.5, 1.0],
+            [1.5, 2.5, 1.0],
+        ],
+    }
+    figure, axis = dashboard.plt.subplots()
+    try:
+        dashboard._draw_path(
+            axis,
+            payload,
+            three_d=False,
+            show_station_labels=True,
+        )
+
+        assert len(axis.lines) == 1
+        assert np.array_equal(axis.lines[0].get_xdata(), [0.5, 0.5, 1.5, 1.5])
+        assert np.array_equal(axis.lines[0].get_ydata(), [0.5, 1.5, 1.5, 2.5])
+        assert [text.get_text() for text in axis.texts] == ["0", "1(8)"]
+    finally:
+        dashboard.plt.close(figure)
+
+
+def test_dashboard_draws_runtime_obstacle_grid_in_2d_and_3d() -> None:
+    """Blocked runtime cells must be visible in every spatial scene."""
+    environment = {
+        "obstacle_grid": {
+            "cell_size": 1.0,
+            "origin": [0.0, 0.0],
+            "blocked_cells": [[2, 3], [3, 3]],
+        }
+    }
+    figure = dashboard.plt.figure()
+    axis_2d = figure.add_subplot(1, 2, 1)
+    axis_3d = figure.add_subplot(1, 2, 2, projection="3d")
+    try:
+        dashboard._draw_obstacles(axis_2d, environment)
+        dashboard._draw_obstacles_3d(axis_3d, environment)
+
+        assert len(axis_2d.patches) == 2
+        assert len(axis_3d.collections) == 1
+    finally:
+        dashboard.plt.close(figure)

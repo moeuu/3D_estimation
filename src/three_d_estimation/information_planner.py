@@ -48,6 +48,7 @@ class MLEPlanningConfig:
     response_correlation_reduction_weight: float = 0.25
     elevation_diversity_weight: float = 0.25
     geometry_exploration_weight: float = 0.5
+    surface_coverage_weight: float = 1.0
     geometry_bootstrap_measurements: int = 6
     local_refinement_top_k: int = 8
     two_stage_screening: bool = True
@@ -75,9 +76,7 @@ class MLEPlanningConfig:
             "screening_energy_bin_count": self.screening_energy_bin_count,
             "screening_pair_limit": self.screening_pair_limit,
             "screening_pose_chunk_size": self.screening_pose_chunk_size,
-            "screening_source_parameter_limit": (
-                self.screening_source_parameter_limit
-            ),
+            "screening_source_parameter_limit": (self.screening_source_parameter_limit),
             "screening_points_per_mode": self.screening_points_per_mode,
             "exact_candidate_min": self.exact_candidate_min,
             "exact_candidate_max": self.exact_candidate_max,
@@ -104,15 +103,11 @@ class MLEPlanningConfig:
         if self.two_stage_screening and int(self.ranked_action_limit) < int(
             self.exact_candidate_max
         ):
-            raise ValueError(
-                "ranked_action_limit must cover exact_candidate_max."
-            )
+            raise ValueError("ranked_action_limit must cover exact_candidate_max.")
         if self.two_stage_screening and int(self.screening_pair_limit) < int(
             self.shield_program_length
         ):
-            raise ValueError(
-                "screening_pair_limit must cover shield_program_length."
-            )
+            raise ValueError("screening_pair_limit must cover shield_program_length.")
         positive_fields = {
             "live_time_s": self.live_time_s,
             "source_strength_scale_floor_cps_1m": (
@@ -143,6 +138,7 @@ class MLEPlanningConfig:
             ),
             "elevation_diversity_weight": self.elevation_diversity_weight,
             "geometry_exploration_weight": self.geometry_exploration_weight,
+            "surface_coverage_weight": self.surface_coverage_weight,
             "exact_score_margin_fraction": self.exact_score_margin_fraction,
             "exact_diversity_weight": self.exact_diversity_weight,
         }
@@ -196,6 +192,7 @@ class MLEPlanningAction:
     response_correlation_reduction: float = 0.0
     elevation_diversity: float = 0.0
     geometry_exploration: float = 0.0
+    surface_coverage: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate that the recommendation is a complete executable program."""
@@ -234,6 +231,7 @@ class MLEPlanningAction:
             self.response_correlation_reduction,
             self.elevation_diversity,
             self.geometry_exploration,
+            self.surface_coverage,
         )
         if any(not np.isfinite(float(value)) for value in finite_values):
             raise ValueError("Planning action numerical values must be finite.")
@@ -286,6 +284,7 @@ class MLEPlanningAction:
             ),
             "elevation_diversity": float(self.elevation_diversity),
             "geometry_exploration": float(self.geometry_exploration),
+            "surface_coverage": float(self.surface_coverage),
             "measurement_program": program,
         }
 
@@ -625,8 +624,7 @@ def _screening_background_rate(
 ) -> NDArray[np.float64]:
     """Aggregate the non-source historical rate into coarse Poisson groups."""
     full_centers = 0.5 * (
-        observations.energy_bin_edges_keV[:-1]
-        + observations.energy_bin_edges_keV[1:]
+        observations.energy_bin_edges_keV[:-1] + observations.energy_bin_edges_keV[1:]
     )
     indices = np.searchsorted(edges, full_centers, side="right") - 1
     indices = np.clip(indices, 0, edges.size - 2)
@@ -636,7 +634,9 @@ def _screening_background_rate(
     else:
         predicted = np.asarray(predicted_source_counts, dtype=np.float64)
         if predicted.shape != observed.shape or np.any(~np.isfinite(predicted)):
-            raise ValueError("Predicted screening source counts must align with history.")
+            raise ValueError(
+                "Predicted screening source counts must align with history."
+            )
         residual = np.maximum(observed - predicted, 0.0)
     total_counts = np.sum(residual, axis=0, dtype=np.float64)
     grouped = np.bincount(
@@ -1519,6 +1519,47 @@ def _ambiguity_metrics(
             )
             / scale,
         )
+    patch_points = np.vstack(
+        [np.asarray(patch.centroid_xyz, dtype=np.float64) for patch in estimate.patches]
+    )
+    patch_areas = np.asarray(
+        [float(patch.area_m2) for patch in estimate.patches],
+        dtype=np.float64,
+    )
+    surface_kinds = np.asarray(
+        [str(patch.surface_kind) for patch in estimate.patches],
+        dtype=object,
+    )
+    coverage_weights = np.zeros(patch_points.shape[0], dtype=np.float64)
+    unique_kinds = tuple(sorted(set(surface_kinds.tolist())))
+    for kind in unique_kinds:
+        mask = surface_kinds == kind
+        kind_areas = patch_areas[mask]
+        coverage_weights[mask] = kind_areas / max(float(np.sum(kind_areas)), 1.0e-30)
+    coverage_weights /= max(float(len(unique_kinds)), 1.0)
+    historical_distances = np.min(
+        np.linalg.norm(
+            historical.detector_positions_xyz[:, None, :] - patch_points[None, :, :],
+            axis=2,
+        ),
+        axis=0,
+    )
+    surface_scale = max(
+        float(np.linalg.norm(np.ptp(patch_points, axis=0))),
+        1.0,
+    )
+    surface_coverage = np.zeros(pose_count, dtype=np.float64)
+    for pose_index, pose in enumerate(poses):
+        candidate_distances = np.linalg.norm(patch_points - pose[None, :], axis=1)
+        improvement = np.maximum(
+            np.minimum(historical_distances, surface_scale)
+            - np.minimum(candidate_distances, historical_distances),
+            0.0,
+        )
+        surface_coverage[pose_index] = min(
+            1.0,
+            float(np.sum(coverage_weights * improvement)) / surface_scale,
+        )
     return {
         "floor_ceiling": floor_ceiling,
         "support": support_separation,
@@ -1526,6 +1567,10 @@ def _ambiguity_metrics(
         "correlation": correlation_reduction,
         "elevation": np.repeat(elevation_diversity, action_count // pose_count),
         "geometry": np.repeat(geometry_exploration, action_count // pose_count),
+        "surface_coverage": np.repeat(
+            surface_coverage,
+            action_count // pose_count,
+        ),
     }
 
 
@@ -2463,7 +2508,10 @@ def _screen_candidate_measurements(
         if historical_response_cache is None
         else historical_response_cache.get("candidate_screening")
     )
-    if not isinstance(cache_entry, dict) or cache_entry.get("identity") != cache_identity:
+    if (
+        not isinstance(cache_entry, dict)
+        or cache_entry.get("identity") != cache_identity
+    ):
         cache_entry = {"identity": cache_identity, "actions_by_pose": {}}
         if historical_response_cache is not None:
             historical_response_cache["candidate_screening"] = cache_entry
@@ -2886,6 +2934,8 @@ def _plan_next_measurement_exact(
             + bootstrap_multiplier
             * float(resolved.geometry_exploration_weight)
             * ambiguity_by_pose["geometry"]
+            + float(resolved.surface_coverage_weight)
+            * ambiguity_by_pose["surface_coverage"]
         )
         beam_started = perf_counter()
         if mle_config.use_gpu and parameter_count >= 24 and local_count > 1:
@@ -2967,6 +3017,7 @@ def _plan_next_measurement_exact(
             correlation = selected_mean("correlation")
             elevation = selected_mean("elevation")
             geometry = selected_mean("geometry")
+            surface_coverage = selected_mean("surface_coverage")
             actions.append(
                 replace(
                     action,
@@ -2976,6 +3027,7 @@ def _plan_next_measurement_exact(
                     response_correlation_reduction=correlation,
                     elevation_diversity=elevation,
                     geometry_exploration=geometry,
+                    surface_coverage=surface_coverage,
                 )
             )
         if progress_hook is not None:

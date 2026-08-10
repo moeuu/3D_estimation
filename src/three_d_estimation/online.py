@@ -11,6 +11,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from runtime.measurement_log import MeasurementLog, load_measurement_log
 from runtime.prefix import measurement_records_sha256
 from runtime.records import MeasurementRecord, RunContext, canonical_json_sha256
@@ -207,6 +208,49 @@ def _station_boundary(
             "the final record of every station."
         )
     return expected
+
+
+def _dashboard_trajectory(
+    records: Sequence[MeasurementRecord],
+) -> dict[str, object]:
+    """Return PF-compatible route and station history from runtime records."""
+    path_segments: list[list[list[float]]] = []
+    measurement_stations: list[dict[str, object]] = []
+    for record in records:
+        raw_waypoints = record.metadata.get("travel_waypoints_xyz")
+        if raw_waypoints is not None:
+            waypoints = np.asarray(raw_waypoints, dtype=np.float64)
+            if (
+                waypoints.ndim == 2
+                and waypoints.shape[1] == 3
+                and waypoints.shape[0] >= 2
+                and np.all(np.isfinite(waypoints))
+            ):
+                segment = waypoints.tolist()
+                if not path_segments or segment != path_segments[-1]:
+                    path_segments.append(segment)
+
+        point = np.asarray(record.detector_pose_xyz, dtype=np.float64).reshape(3)
+        if measurement_stations:
+            latest = measurement_stations[-1]
+            latest_point = np.asarray(latest["position_xyz"], dtype=np.float64)
+            if float(np.linalg.norm(point - latest_point)) <= 1.0e-6:
+                latest["visit_count"] = int(latest["visit_count"]) + 1
+                continue
+        measurement_stations.append(
+            {
+                "station_id": int(record.station_id),
+                "position_xyz": point.tolist(),
+                "visit_count": 1,
+            }
+        )
+    return {
+        "travel_path_segments_xyz": path_segments,
+        "measurement_stations": measurement_stations,
+        "current_detector_position_xyz": (
+            None if not records else list(map(float, records[-1].detector_pose_xyz))
+        ),
+    }
 
 
 class OnlineMLESession:
@@ -447,13 +491,14 @@ class OnlineMLESession:
         if self.dashboard is not None:
             dashboard_payload = dict(payload)
             records = self.records
+            dashboard_payload.update(_dashboard_trajectory(records))
             if records:
-                dashboard_payload["latest_observed_spectrum_counts"] = (
-                    records[-1].spectrum_counts.tolist()
-                )
-                dashboard_payload["energy_bin_edges_keV"] = (
-                    records[-1].energy_bin_edges_keV.tolist()
-                )
+                dashboard_payload["latest_observed_spectrum_counts"] = records[
+                    -1
+                ].spectrum_counts.tolist()
+                dashboard_payload["energy_bin_edges_keV"] = records[
+                    -1
+                ].energy_bin_edges_keV.tolist()
             self.dashboard.publish(
                 self._latest_published_estimate,
                 dashboard_payload,
