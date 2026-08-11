@@ -950,6 +950,32 @@ def _initial_nuisance_from_estimate(
     )
 
 
+def _patch_set_from_estimate(estimate: MLEEstimate) -> SurfacePatchSet:
+    """Rebuild the exact dense adjacency graph stored on estimate patches."""
+    patches = tuple(estimate.patches)
+    index_by_id = {int(patch.patch_id): index for index, patch in enumerate(patches)}
+    edges: list[tuple[int, int]] = []
+    lengths: list[float] = []
+    for first_index, patch in enumerate(patches):
+        for neighbor_id, length in zip(
+            patch.neighbor_patch_ids,
+            patch.neighbor_shared_edge_lengths_m,
+        ):
+            second_index = index_by_id.get(int(neighbor_id))
+            if second_index is None:
+                raise ValueError(
+                    f"Estimate patch {patch.patch_id} references a missing neighbor."
+                )
+            if first_index < second_index:
+                edges.append((first_index, second_index))
+                lengths.append(float(length))
+    return SurfacePatchSet(
+        patches=patches,
+        adjacency_edges=np.asarray(edges, dtype=np.int64).reshape((-1, 2)),
+        shared_edge_lengths_m=np.asarray(lengths, dtype=np.float64),
+    )
+
+
 def _held_out_likelihood_score(
     observed: NDArray[np.float64],
     predicted: NDArray[np.float64],
@@ -1114,8 +1140,9 @@ class SurfaceMLEEstimator:
         *,
         obstacle_grid: ObstacleGrid | None = None,
         initial_estimate: MLEEstimate | None = None,
+        fixed_patches: SurfacePatchSet | None = None,
     ) -> MLEEstimate:
-        """Fit all history, optionally warm-starting from a prior surface map."""
+        """Fit all history with optional warm start and fixed patch dictionary."""
         if tuple(batch.isotope_names) != tuple(self.config.isotope_names):
             raise ValueError(
                 "Observation isotope order must match MLEConfig.isotope_names."
@@ -1160,13 +1187,21 @@ class SurfaceMLEEstimator:
             )
         kernel.use_gpu = bool(self.config.use_gpu)
         kernel.gpu_device = str(self.config.gpu_device)
-        kernel.gpu_dtype = str(self.config.gpu_dtype)
-        patches = build_surface_patches(
-            environment,
-            obstacle_grid,
-            self.config.patch_spacing_m,
-            obstacle_height_m=float(self.config.obstacle_height_m),
-            quadrature_points_per_patch=int(self.config.quadrature_order),
+        # Runtime-owned attenuation and spectral transport contracts require
+        # float64.  ``gpu_dtype`` controls only the downstream optimization
+        # tensors, so bootstrap refits may use float32 without changing the
+        # physical response values produced here.
+        kernel.gpu_dtype = "float64"
+        patches = (
+            build_surface_patches(
+                environment,
+                obstacle_grid,
+                self.config.patch_spacing_m,
+                obstacle_height_m=float(self.config.obstacle_height_m),
+                quadrature_points_per_patch=int(self.config.quadrature_order),
+            )
+            if fixed_patches is None
+            else fixed_patches
         )
         base_patch_ids = patches.patch_ids.astype(int).tolist()
         base_patch_count = patches.patch_count
@@ -1196,7 +1231,12 @@ class SurfaceMLEEstimator:
             progress_hook=self._progress_hook,
             progress_label="base",
         )
-        for level in range(int(self.config.coarse_to_fine_levels)):
+        refinement_levels = (
+            int(self.config.coarse_to_fine_levels)
+            if fixed_patches is None
+            else 0
+        )
+        for level in range(refinement_levels):
             selected = _refinement_patch_ids(
                 state,
                 self.config.refinement_fraction,
@@ -1300,6 +1340,7 @@ class SurfaceMLEEstimator:
             "base_surface_dictionary_patch_count": base_patch_count,
             "base_surface_dictionary_patch_ids": base_patch_ids,
             "full_surface_dictionary_used": True,
+            "fixed_patch_dictionary": fixed_patches is not None,
             "response_shape": response_shape,
             "spectral_response_mode": self.config.spectral_response_mode,
             "observation_step_ids": batch.step_ids.astype(int).tolist(),
@@ -1468,6 +1509,26 @@ class SurfaceMLEEstimator:
                 station_bootstrap_replicates=0,
                 regularization_selection="fixed",
                 held_out_fraction=0.0,
+                max_iterations=(
+                    int(self.config.max_iterations)
+                    if self.config.bootstrap_max_iterations is None
+                    else int(self.config.bootstrap_max_iterations)
+                ),
+                gpu_dtype=(
+                    self.config.gpu_dtype
+                    if self.config.bootstrap_gpu_dtype == "inherit"
+                    else self.config.bootstrap_gpu_dtype
+                ),
+                coarse_to_fine_levels=(
+                    0
+                    if self.config.bootstrap_refit_mode == "fixed_final_grid"
+                    else self.config.coarse_to_fine_levels
+                ),
+            )
+            fixed_bootstrap_patches = (
+                _patch_set_from_estimate(estimate)
+                if self.config.bootstrap_refit_mode == "fixed_final_grid"
+                else None
             )
             replicate_batches = tuple(
                 station_bootstrap_batch(batch, rng)
@@ -1493,6 +1554,8 @@ class SurfaceMLEEstimator:
                             environment,
                             kernel,
                             obstacle_grid=obstacle_grid,
+                            initial_estimate=estimate,
+                            fixed_patches=fixed_bootstrap_patches,
                         )
                     )
                     self._report_bootstrap_progress(
@@ -1521,6 +1584,8 @@ class SurfaceMLEEstimator:
                             environment,
                             kernel,
                             obstacle_grid=obstacle_grid,
+                            initial_estimate=estimate,
+                            fixed_patches=fixed_bootstrap_patches,
                         )
                     import torch
 
@@ -1532,6 +1597,8 @@ class SurfaceMLEEstimator:
                             environment,
                             kernel,
                             obstacle_grid=obstacle_grid,
+                            initial_estimate=estimate,
+                            fixed_patches=fixed_bootstrap_patches,
                         )
                     stream.synchronize()
                     return result
@@ -1563,6 +1630,15 @@ class SurfaceMLEEstimator:
                         self.config.use_gpu and configured_batch_size > 1
                     ),
                     "shared_response_cache": True,
+                    "warm_started_from_full_estimate": True,
+                    "refit_mode": self.config.bootstrap_refit_mode,
+                    "conditional_on_final_patch_dictionary": bool(
+                        fixed_bootstrap_patches is not None
+                    ),
+                    "max_iterations_per_replicate": int(
+                        bootstrap_config.max_iterations
+                    ),
+                    "gpu_dtype": bootstrap_config.gpu_dtype,
                     "elapsed_seconds": bootstrap_seconds,
                 },
             }

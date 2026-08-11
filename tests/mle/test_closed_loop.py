@@ -309,6 +309,8 @@ class _FakeRuntimeClient:
         del args
         type(self).instance = self
         self.private_scene_profile = kwargs.get("private_scene_profile")
+        self.resume_stage_path = kwargs.get("resume_stage_path")
+        self.resume_compatibility_path = kwargs.get("resume_compatibility_path")
         self.requests: list[dict[str, object]] = []
         self.refinement_requests: list[dict[str, object]] = []
         self.cui_overlay_requests: list[bool] = []
@@ -383,6 +385,49 @@ class _FakeRuntimeClient:
 
     def abort(self) -> None:
         """Provide the client cleanup surface."""
+
+
+class _FakeResumeRuntimeClient(_FakeRuntimeClient):
+    """Return a one-station prefix before accepting continued acquisition."""
+
+    def read_event(self) -> dict[str, object]:
+        """Return one schema-v2 resumed runtime event."""
+        prefix = _record_payload(0, 0, station_complete=True)
+        return {
+            "type": "ready",
+            "schema_version": 2,
+            "context": self.context,
+            "candidates": self.candidates,
+            "resume": {
+                "record_count": 1,
+                "records": [prefix],
+                "next_station_id": 1,
+            },
+        }
+
+    def request(self, request: dict[str, object]) -> dict[str, object]:
+        """Continue record identifiers after the resumed prefix."""
+        if request.get("type") == "refine":
+            return super().request(request)
+        self.requests.append(dict(request))
+        step_id = len(self.requests)
+        return {
+            "type": "record",
+            "record": _record_payload(
+                step_id,
+                int(request["station_id"]),
+                station_complete=bool(request["station_complete"]),
+            ),
+            "candidates": self.candidates,
+        }
+
+    def finalize(self) -> dict[str, object]:
+        """Return a published count including the resumed prefix."""
+        return {
+            "type": "published",
+            "path": "/tmp/adaptive-log",
+            "record_count": 1 + len(self.requests),
+        }
 
 
 class _FakeOnlineSession:
@@ -557,6 +602,71 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
         "40/100",
         "100/100",
     ]
+
+
+def test_closed_loop_replays_resume_prefix_then_plans_next_station(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A resumed controller must rebuild state before requesting a new record."""
+    from three_d_estimation import closed_loop
+
+    mle_path = tmp_path / "mle.json"
+    planning_path = tmp_path / "planning.json"
+    mle_path.write_text("{}\n", encoding="utf-8")
+    planning_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        closed_loop,
+        "AdaptiveRuntimeClient",
+        _FakeResumeRuntimeClient,
+    )
+    monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
+    monkeypatch.setattr(
+        closed_loop.MLEConfig,
+        "load",
+        lambda path: SimpleNamespace(
+            isotope_names=("Co-60", "Cs-137", "Eu-154")
+        ),
+    )
+    monkeypatch.setattr(
+        closed_loop.MLEPlanningConfig,
+        "load",
+        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
+    )
+    fake_log = SimpleNamespace(
+        path=Path("/tmp/adaptive-log"),
+        run_id="adaptive-test",
+        records=(SimpleNamespace(station_id=0), SimpleNamespace(station_id=1)),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "validate_ral_measurement_log",
+        lambda path: fake_log,
+    )
+    stage = tmp_path / ".measurement-log.stream-17"
+    compatibility = tmp_path / "resume-compatibility.json"
+
+    result = run_ral_closed_loop(
+        tmp_path / "private-scenario.json",
+        runtime_root=tmp_path,
+        mle_config_path=mle_path,
+        planning_config_path=planning_path,
+        output_dir=tmp_path / "output",
+        resume_stage_path=stage,
+        resume_compatibility_path=compatibility,
+        max_measurements=2,
+    )
+
+    client = _FakeResumeRuntimeClient.instance
+    session = _FakeOnlineSession.last_instance
+    assert client is not None
+    assert session is not None
+    assert client.resume_stage_path == stage
+    assert client.resume_compatibility_path == compatibility
+    assert len(client.requests) == 1
+    assert client.requests[0]["station_id"] == 1
+    assert len(session.records) == 2
+    assert result.record_count == 2
 
 
 def test_two_stage_closed_loop_screens_before_runtime_refinement(

@@ -15,6 +15,7 @@ from runtime.adaptive_client import (
     adaptive_step_request,
     candidate_index_for_pose,
     parse_adaptive_record,
+    parse_adaptive_resume_prefix,
     parse_candidate_snapshot,
     parse_run_context,
 )
@@ -384,6 +385,8 @@ def run_ral_closed_loop(
     planning_config_path: str | Path,
     output_dir: str | Path,
     private_scene_profile: str = "ral-mix9",
+    resume_stage_path: str | Path | None = None,
+    resume_compatibility_path: str | Path | None = None,
     max_measurements: int = 256,
     minimum_information_gain_nats: float = 1.0e-3,
     low_information_patience: int = 3,
@@ -422,6 +425,8 @@ def run_ral_closed_loop(
         scenario_path,
         runtime_root=runtime_root,
         private_scene_profile=private_scene_profile,
+        resume_stage_path=resume_stage_path,
+        resume_compatibility_path=resume_compatibility_path,
         output_hook=output_hook,
     )
     online: OnlineMLESession | None = None
@@ -452,25 +457,36 @@ def run_ral_closed_loop(
 
     try:
         ready = client.read_event()
-        _strict_fields(
-            ready,
-            {"type", "schema_version", "context", "candidates", "bootstrap"},
-            name="adaptive ready event",
-        )
-        if ready.get("type") != "ready" or ready.get("schema_version") != 1:
+        ready_schema = ready.get("schema_version")
+        if ready.get("type") != "ready" or ready_schema not in {1, 2}:
             raise ValueError(
                 "Shared runtime returned an incompatible adaptive handshake."
             )
+        if ready_schema == 1:
+            _strict_fields(
+                ready,
+                {"type", "schema_version", "context", "candidates", "bootstrap"},
+                name="adaptive ready event",
+            )
+            resume_prefix = None
+        else:
+            _strict_fields(
+                ready,
+                {"type", "schema_version", "context", "candidates", "resume"},
+                name="adaptive resume ready event",
+            )
+            resume_prefix = parse_adaptive_resume_prefix(ready["resume"])
         context = parse_run_context(ready["context"])
         candidates = parse_candidate_snapshot(ready["candidates"])
-        bootstrap = ready["bootstrap"]
-        if not isinstance(bootstrap, dict):
-            raise TypeError("Runtime bootstrap selection must be an object.")
-        _strict_fields(
-            bootstrap,
-            {"candidate_index", "fe_orientation_index", "pb_orientation_index"},
-            name="adaptive bootstrap",
-        )
+        bootstrap = ready.get("bootstrap")
+        if resume_prefix is None:
+            if not isinstance(bootstrap, dict):
+                raise TypeError("Runtime bootstrap selection must be an object.")
+            _strict_fields(
+                bootstrap,
+                {"candidate_index", "fe_orientation_index", "pb_orientation_index"},
+                name="adaptive bootstrap",
+            )
         if tuple(mle_config.isotope_names) != tuple(context.isotopes):
             raise ValueError(
                 "RAL MLE isotopes must match the adaptive runtime scenario."
@@ -498,53 +514,28 @@ def run_ral_closed_loop(
         )
         if online.dashboard_url is not None and dashboard_url_hook is not None:
             dashboard_url_hook(online.dashboard_url)
-        request = adaptive_step_request(
-            candidate_index=bootstrap["candidate_index"],
-            fe_orientation_index=bootstrap["fe_orientation_index"],
-            pb_orientation_index=bootstrap["pb_orientation_index"],
-            dwell_time_s=planning_config.live_time_s,
-            station_id=0,
-            station_complete=True,
-        )
         pending_program: list[tuple[int, int, float]] = []
         pending_pose: tuple[float, float, float] | None = None
         pending_station_id: int | None = None
         plan_history: list[MLEPlanningResult] = []
         stop_reason = "maximum_measurement_safety_bound"
-        while True:
-            event = client.request(request)
-            _strict_fields(event, {"type", "record", "candidates"}, name="record event")
-            if event.get("type") != "record":
-                raise ValueError("Shared runtime did not return a record event.")
-            record = parse_adaptive_record(event["record"])
-            candidates = parse_candidate_snapshot(event["candidates"])
-            station_complete = record.metadata.get("station_complete") is True
-            online.receive_persisted(record, station_complete=station_complete)
-            if len(online.records) >= int(max_measurements):
-                break
-            if pending_program:
-                if pending_pose is None or pending_station_id is None:
-                    raise RuntimeError(
-                        "Pending station program lost its pose metadata."
-                    )
-                fe_index, pb_index, dwell_time = pending_program.pop(0)
-                request = adaptive_step_request(
-                    candidate_index=candidate_index_for_pose(candidates, pending_pose),
-                    fe_orientation_index=fe_index,
-                    pb_orientation_index=pb_index,
-                    dwell_time_s=dwell_time,
-                    station_id=pending_station_id,
-                    station_complete=not pending_program,
-                )
-                continue
-            if not station_complete:
-                raise RuntimeError("A runtime station ended without its final marker.")
+
+        def plan_next_station(
+            record: Any,
+            snapshot: dict[str, object],
+        ) -> dict[str, object] | None:
+            """Plan one station after a durable boundary and return its first view."""
+            nonlocal candidates
+            nonlocal pending_pose
+            nonlocal pending_program
+            nonlocal pending_station_id
+            nonlocal stop_reason
             plan = online.plan_next_action(
-                candidates["candidate_poses_xyz"],
+                snapshot["candidate_poses_xyz"],
                 planning_config=planning_config,
-                allowed_pair_ids=candidates["allowed_pair_ids"],
-                travel_costs=candidates["travel_costs"],
-                current_pair_id=candidates["current_pair_id"],
+                allowed_pair_ids=snapshot["allowed_pair_ids"],
+                travel_costs=snapshot["travel_costs"],
+                current_pair_id=snapshot["current_pair_id"],
                 progress_hook=relay_progress,
                 screening_only=(
                     bool(getattr(planning_config, "two_stage_screening", False))
@@ -575,12 +566,13 @@ def run_ral_closed_loop(
                         "Shared runtime did not return refined candidates."
                     )
                 candidates = parse_candidate_snapshot(refined_event["candidates"])
+                snapshot = candidates
                 plan = online.plan_next_action(
-                    candidates["candidate_poses_xyz"],
+                    snapshot["candidate_poses_xyz"],
                     planning_config=planning_config,
-                    allowed_pair_ids=candidates["allowed_pair_ids"],
-                    travel_costs=candidates["travel_costs"],
-                    current_pair_id=candidates["current_pair_id"],
+                    allowed_pair_ids=snapshot["allowed_pair_ids"],
+                    travel_costs=snapshot["travel_costs"],
+                    current_pair_id=snapshot["current_pair_id"],
                     overwrite=True,
                     progress_hook=relay_progress,
                 )
@@ -595,11 +587,11 @@ def run_ral_closed_loop(
             )
             if decision.should_stop:
                 stop_reason = "compound_mle_stop_satisfied"
-                break
+                return None
             remaining = int(max_measurements) - len(online.records)
             program_length = min(len(selected.shield_pair_ids), remaining)
             if program_length < 1:
-                break
+                return None
             pending_program = [
                 (
                     int(selected.fe_orientation_indices[index]),
@@ -611,7 +603,7 @@ def run_ral_closed_loop(
             pending_pose = selected.detector_pose_xyz
             pending_station_id = int(record.station_id) + 1
             fe_index, pb_index, dwell_time = pending_program.pop(0)
-            request = adaptive_step_request(
+            return adaptive_step_request(
                 candidate_index=selected.candidate_index,
                 fe_orientation_index=fe_index,
                 pb_orientation_index=pb_index,
@@ -619,6 +611,61 @@ def run_ral_closed_loop(
                 station_id=pending_station_id,
                 station_complete=not pending_program,
             )
+
+        if resume_prefix is None:
+            assert isinstance(bootstrap, dict)
+            request: dict[str, object] | None = adaptive_step_request(
+                candidate_index=bootstrap["candidate_index"],
+                fe_orientation_index=bootstrap["fe_orientation_index"],
+                pb_orientation_index=bootstrap["pb_orientation_index"],
+                dwell_time_s=planning_config.live_time_s,
+                station_id=0,
+                station_complete=True,
+            )
+        else:
+            for prefix_record in resume_prefix.records:
+                station_complete = (
+                    prefix_record.metadata.get("station_complete") is True
+                )
+                online.receive_persisted(
+                    prefix_record,
+                    station_complete=station_complete,
+                )
+            request = (
+                None
+                if len(online.records) >= int(max_measurements)
+                else plan_next_station(resume_prefix.records[-1], candidates)
+            )
+
+        while request is not None:
+            event = client.request(request)
+            _strict_fields(event, {"type", "record", "candidates"}, name="record event")
+            if event.get("type") != "record":
+                raise ValueError("Shared runtime did not return a record event.")
+            record = parse_adaptive_record(event["record"])
+            candidates = parse_candidate_snapshot(event["candidates"])
+            station_complete = record.metadata.get("station_complete") is True
+            online.receive_persisted(record, station_complete=station_complete)
+            if len(online.records) >= int(max_measurements):
+                break
+            if pending_program:
+                if pending_pose is None or pending_station_id is None:
+                    raise RuntimeError(
+                        "Pending station program lost its pose metadata."
+                    )
+                fe_index, pb_index, dwell_time = pending_program.pop(0)
+                request = adaptive_step_request(
+                    candidate_index=candidate_index_for_pose(candidates, pending_pose),
+                    fe_orientation_index=fe_index,
+                    pb_orientation_index=pb_index,
+                    dwell_time_s=dwell_time,
+                    station_id=pending_station_id,
+                    station_complete=not pending_program,
+                )
+                continue
+            if not station_complete:
+                raise RuntimeError("A runtime station ended without its final marker.")
+            request = plan_next_station(record, candidates)
         published = client.finalize()
         _strict_fields(
             published, {"type", "path", "record_count"}, name="published event"

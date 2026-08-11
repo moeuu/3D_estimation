@@ -1060,6 +1060,65 @@ def _prepare_dense_torch_response(
                 and row_keys[: len(previous_keys)] == previous_keys
             ):
                 previous = candidate
+        if reusable is None and isinstance(entries, dict):
+            alternate = next(
+                (
+                    entry
+                    for identity, entry in reversed(tuple(entries.items()))
+                    if isinstance(identity, tuple)
+                    and len(identity) == 3
+                    and identity[0] == str(device)
+                    and identity[2] == str(cache_key)
+                    and identity != persistent_identity
+                    and isinstance(entry, dict)
+                    and int(entry.get("source_count", -1))
+                    == operator.source_count
+                ),
+                None,
+            )
+            if alternate is not None:
+                alternate_matrix = alternate.get("matrix")
+                alternate_keys = alternate.get("row_keys")
+                if (
+                    alternate_matrix is not None
+                    and isinstance(alternate_keys, tuple)
+                    and all(key in alternate_keys for key in row_keys)
+                ):
+                    torch.cuda.empty_cache()
+                    free_bytes, _ = torch.cuda.mem_get_info(device)
+                    converted_bytes = int(alternate_matrix.numel()) * int(
+                        torch.empty((), dtype=dtype).element_size()
+                    )
+                    if converted_bytes <= int(float(cache_fraction) * free_bytes):
+                        converted_started = perf_counter()
+                        try:
+                            converted_matrix = alternate_matrix.to(dtype=dtype)
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                        else:
+                            converted = {
+                                **alternate,
+                                "identity": persistent_identity,
+                                "matrix": converted_matrix,
+                            }
+                            entries[persistent_identity] = converted
+                            reusable = converted
+                            if row_keys[: len(alternate_keys)] == alternate_keys:
+                                previous = converted
+                            diagnostics.update(
+                                {
+                                    "cross_dtype_cache_reused": True,
+                                    "cross_dtype_source": str(
+                                        alternate_matrix.dtype
+                                    ),
+                                    "cross_dtype_conversion_bytes": (
+                                        converted_bytes
+                                    ),
+                                    "cross_dtype_conversion_seconds": (
+                                        perf_counter() - converted_started
+                                    ),
+                                }
+                            )
     if previous is not None and previous.get("row_keys") == row_keys:
         cached_matrix = previous.get("matrix")
         cached_rows = previous.get("row_sums")

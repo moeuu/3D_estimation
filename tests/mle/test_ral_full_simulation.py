@@ -132,6 +132,10 @@ def test_ral_full_simulation_cli_supports_scenario_and_existing_log() -> None:
             "/private/ral-scenario.json",
             "--private-scene-profile",
             "ral-cs4-co3-eu0",
+            "--resume-stage",
+            "/tmp/.measurement-log.stream-17",
+            "--resume-compatibility",
+            "/tmp/resume-compatibility.json",
             "--output-dir",
             "/tmp/ral-mle",
         ]
@@ -150,6 +154,10 @@ def test_ral_full_simulation_cli_supports_scenario_and_existing_log() -> None:
     assert preflight.preflight_only is True
     assert adaptive.scenario == Path("/private/ral-scenario.json")
     assert adaptive.private_scene_profile == "ral-cs4-co3-eu0"
+    assert adaptive.resume_stage == Path("/tmp/.measurement-log.stream-17")
+    assert adaptive.resume_compatibility == Path(
+        "/tmp/resume-compatibility.json"
+    )
     assert not hasattr(adaptive, "plan")
     assert adaptive.max_measurements == 256
     assert adaptive.minimum_information_gain_nats is None
@@ -168,6 +176,12 @@ def test_mle_config_rejects_invalid_online_and_laplace_controls() -> None:
         MLEConfig(laplace_support_threshold_fraction=1.1)
     with pytest.raises(ValueError, match="bootstrap_batch_size"):
         MLEConfig(bootstrap_batch_size=True)
+    with pytest.raises(ValueError, match="bootstrap_refit_mode"):
+        MLEConfig(bootstrap_refit_mode="approximate")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bootstrap_max_iterations"):
+        MLEConfig(bootstrap_max_iterations=0)
+    with pytest.raises(ValueError, match="bootstrap_gpu_dtype"):
+        MLEConfig(bootstrap_gpu_dtype="float16")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="debias_max_active_parameters"):
         MLEConfig(debias_max_active_parameters=0)
     with pytest.raises(TypeError, match="debias_requires_convergence"):

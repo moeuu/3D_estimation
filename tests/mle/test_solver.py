@@ -534,7 +534,7 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
 
 
 def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:
-    """Online prefixes and bootstrap resamples must reuse resident float64 rows."""
+    """Prefixes, resamples, and solver dtypes must reuse resident CUDA rows."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
@@ -623,6 +623,38 @@ def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:
         cpu.densities_cps_1m_m2,
         rtol=2.0e-12,
         atol=2.0e-12,
+    )
+
+    converted = fit_surface_map_poisson_operator(
+        np.asarray([[4.0, 6.0], [7.0, 5.0], [4.0, 6.0]]),
+        resampled,
+        areas,
+        config=config,
+        use_gpu=True,
+        gpu_dtype="float32",
+        persistent_response_cache=cache,
+    )
+    uncached = fit_surface_map_poisson_operator(
+        np.asarray([[4.0, 6.0], [7.0, 5.0], [4.0, 6.0]]),
+        resampled,
+        areas,
+        config=config,
+        use_gpu=True,
+        gpu_dtype="float32",
+        persistent_response_cache={},
+    )
+    converted_cache = resampled.diagnostics["performance"]["solver_calls"][-2][
+        "response_cache"
+    ]
+
+    assert converted_cache["mode"] == "persistent_cuda_row_gather"
+    assert converted_cache["cross_dtype_cache_reused"] is True
+    assert converted_cache["host_to_device_bytes"] == 0
+    np.testing.assert_allclose(
+        converted.densities_cps_1m_m2,
+        uncached.densities_cps_1m_m2,
+        rtol=2.0e-6,
+        atol=2.0e-6,
     )
 
 

@@ -216,6 +216,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "scenario validation."
         ),
     )
+    ral_parser.add_argument(
+        "--resume-stage",
+        type=Path,
+        default=None,
+        help=(
+            "Resume live adaptive acquisition after the last verified completed "
+            "station in a shared-runtime stream stage."
+        ),
+    )
+    ral_parser.add_argument(
+        "--resume-compatibility",
+        type=Path,
+        default=None,
+        help=(
+            "Runtime compatibility provenance required for a cross-commit "
+            "adaptive resume."
+        ),
+    )
     ral_source.add_argument(
         "--run-dir",
         type=Path,
@@ -635,6 +653,10 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
         )
     if args.scenario is not None and args.final_only:
         raise ValueError("Live MLE closed-loop acquisition cannot use --final-only.")
+    if args.resume_stage is not None and args.scenario is None:
+        raise ValueError("--resume-stage requires a private --scenario.")
+    if args.resume_compatibility is not None and args.resume_stage is None:
+        raise ValueError("--resume-compatibility requires --resume-stage.")
 
     def announce_dashboard(url: str) -> None:
         """Relay the MLE dashboard URL as soon as its server starts."""
@@ -663,6 +685,8 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
             args.scenario,
             runtime_root=preflight.runtime_root,
             private_scene_profile=args.private_scene_profile,
+            resume_stage_path=args.resume_stage,
+            resume_compatibility_path=args.resume_compatibility,
             mle_config_path=args.mle_config,
             planning_config_path=args.planning_config,
             output_dir=args.output_dir,

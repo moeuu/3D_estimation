@@ -40,6 +40,9 @@ class MLEConfig:
     bootstrap_batch_size: int = 1
     bootstrap_confidence_level: float = 0.95
     bootstrap_seed: int = 173
+    bootstrap_refit_mode: Literal["full", "fixed_final_grid"] = "full"
+    bootstrap_max_iterations: int | None = None
+    bootstrap_gpu_dtype: Literal["inherit", "float32", "float64"] = "inherit"
     fit_background_nuisance: bool = True
     fit_scatter_nuisance: bool = True
     discrepancy_calibration_path: str | None = None
@@ -358,6 +361,21 @@ class MLEConfig:
             or int(self.bootstrap_batch_size) < 1
         ):
             raise ValueError("bootstrap_batch_size must be a positive integer.")
+        if self.bootstrap_refit_mode not in {"full", "fixed_final_grid"}:
+            raise ValueError(
+                "bootstrap_refit_mode must be full or fixed_final_grid."
+            )
+        if self.bootstrap_max_iterations is not None and (
+            isinstance(self.bootstrap_max_iterations, bool)
+            or int(self.bootstrap_max_iterations) < 1
+        ):
+            raise ValueError(
+                "bootstrap_max_iterations must be null or a positive integer."
+            )
+        if self.bootstrap_gpu_dtype not in {"inherit", "float32", "float64"}:
+            raise ValueError(
+                "bootstrap_gpu_dtype must be inherit, float32, or float64."
+            )
         if not 0.0 < float(self.bootstrap_confidence_level) < 1.0:
             raise ValueError("bootstrap_confidence_level must lie in (0, 1).")
         if not 0.0 <= float(self.laplace_support_threshold_fraction) <= 1.0:
