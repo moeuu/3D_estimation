@@ -38,14 +38,15 @@ from .response_operator import (
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedSpectralLine:
-    """Store one position-independent pulse and its line-specific kernel."""
+class _PreparedSpectralIsotope:
+    """Store one isotope's jointly evaluated transport lines and pulses."""
 
     isotope_index: int
     isotope: str
-    weight: float
+    weights: NDArray[np.float64]
+    positive_line_indices: NDArray[np.int64]
     kernel: ContinuousKernel
-    pulse: NDArray[np.float64]
+    pulses: NDArray[np.float64]
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +61,7 @@ class _SpectralProcessContext:
     quadrature_points: NDArray[np.float64]
     quadrature_weights: NDArray[np.float64]
     isotope_count: int
-    prepared_lines: tuple[_PreparedSpectralLine, ...]
+    prepared_isotopes: tuple[_PreparedSpectralIsotope, ...]
     kernel_chunk_size: int
 
 
@@ -94,49 +95,52 @@ def _calculate_spectral_context_task(
     response = np.zeros(
         (
             selected_measurements.size,
-            context.prepared_lines[0].pulse.size,
+            context.prepared_isotopes[0].pulses.shape[1],
             patch_stop - patch_start,
             context.isotope_count,
         ),
         dtype=np.float64,
     )
-    for prepared in context.prepared_lines:
-        raw = np.asarray(
-            prepared.kernel.kernel_values_selected_pairs_for_detectors(
-                isotope=prepared.isotope,
-                detector_positions=context.detector_positions[selected_measurements],
-                sources=source_points,
-                fe_indices=context.fe_indices[selected_measurements],
-                pb_indices=context.pb_indices[selected_measurements],
-                chunk_size=context.kernel_chunk_size,
-            ),
-            dtype=np.float64,
+    for prepared in context.prepared_isotopes:
+        raw = _joint_line_kernel_values(
+            prepared.kernel,
+            prepared.isotope,
+            detector_positions=context.detector_positions[selected_measurements],
+            sources=source_points,
+            fe_indices=context.fe_indices[selected_measurements],
+            pb_indices=context.pb_indices[selected_measurements],
+            positive_line_indices=prepared.positive_line_indices,
+            chunk_size=context.kernel_chunk_size,
         )
         expected_shape = (
             selected_measurements.size,
             (patch_stop - patch_start) * quadrature_count,
+            prepared.positive_line_indices.size,
         )
         if raw.shape != expected_shape:
             raise ValueError(
-                f"Selected-pair kernel returned {raw.shape}, expected {expected_shape}."
+                "Selected-pair line kernel returned "
+                f"{raw.shape}, expected {expected_shape}."
             )
         values = raw.reshape(
             selected_measurements.size,
             patch_stop - patch_start,
             quadrature_count,
+            prepared.positive_line_indices.size,
         )
-        spatial = context.live_times[selected_measurements, None] * np.einsum(
-            "mgq,gq->mg",
+        spatial = context.live_times[selected_measurements, None, None] * np.einsum(
+            "mgql,gq->mgl",
             values,
             selected_weights,
             optimize=True,
         )
-        response[:, :, :, prepared.isotope_index] += (
-            prepared.weight
-            * prepared.pulse[None, :, None]
-            * spatial[:, None, :]
-            * selected_areas[None, None, :]
-        )
+        for line_index, weight in enumerate(prepared.weights):
+            response[:, :, :, prepared.isotope_index] += (
+                float(weight)
+                * prepared.pulses[line_index][None, :, None]
+                * spatial[:, None, :, line_index]
+                * selected_areas[None, None, :]
+            )
     return response
 
 
@@ -539,6 +543,84 @@ def _kernel_for_line(
     )
 
 
+def _positive_line_indices(
+    kernel: ContinuousKernel,
+    isotope: str,
+    lines: Sequence[Mapping[str, float]],
+    *,
+    require_line_resolved: bool,
+) -> NDArray[np.int64]:
+    """Return the shared runtime's exact positive-line indices after validation."""
+    for line_index, line in enumerate(lines):
+        _kernel_for_line(
+            kernel,
+            isotope,
+            line,
+            int(line.get("transport_line_index", float(line_index))),
+            require_line_resolved=require_line_resolved,
+        )
+    indices = np.asarray(
+        kernel.positive_line_indices(isotope),
+        dtype=np.int64,
+    )
+    if indices.shape != (len(lines),):
+        raise ValueError(
+            f"Shared runtime positive-line count for {isotope} does not match "
+            "the spectral response table."
+        )
+    shared_weights = np.asarray(
+        kernel.line_branching_weights(isotope, indices),
+        dtype=np.float64,
+    )
+    expected_weights = np.asarray(
+        [float(line["weight"]) for line in lines],
+        dtype=np.float64,
+    )
+    if not np.allclose(
+        shared_weights,
+        expected_weights,
+        rtol=1.0e-13,
+        atol=1.0e-15,
+    ):
+        raise ValueError(
+            f"Shared runtime branching weights for {isotope} do not match "
+            "the spectral response table."
+        )
+    return np.ascontiguousarray(indices)
+
+
+def _joint_line_kernel_values(
+    kernel: ContinuousKernel,
+    isotope: str,
+    *,
+    detector_positions: NDArray[np.float64],
+    sources: NDArray[np.float64],
+    fe_indices: NDArray[np.int64],
+    pb_indices: NDArray[np.int64],
+    positive_line_indices: NDArray[np.int64],
+    chunk_size: int,
+) -> NDArray[np.float64]:
+    """Evaluate all requested lines while sharing geometry and obstacle rays."""
+    values = np.asarray(
+        kernel.kernel_values_selected_pairs_for_detectors_by_line(
+            isotope=isotope,
+            detector_positions=detector_positions,
+            sources=sources,
+            fe_indices=fe_indices,
+            pb_indices=pb_indices,
+            positive_line_indices=positive_line_indices,
+            chunk_size=chunk_size,
+        ),
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError(
+            "Batched selected-pair line kernel must return finite non-negative "
+            "values."
+        )
+    return values
+
+
 def build_spectral_nuisance_response(
     live_times_s: NDArray[np.float64],
     energy_bin_edges_keV: NDArray[np.float64],
@@ -759,53 +841,49 @@ def build_spectral_response(
             isotope,
             require_line_resolved=require_line_resolved,
         )
+        positive_line_indices = _positive_line_indices(
+            kernel,
+            isotope,
+            lines,
+            require_line_resolved=require_line_resolved,
+        )
         energies_by_isotope[isotope] = tuple(
             float(line["energy_keV"]) for line in lines
         )
         weights_by_isotope[isotope] = tuple(float(line["weight"]) for line in lines)
+        raw_values = _joint_line_kernel_values(
+            kernel,
+            isotope,
+            detector_positions=detector_positions,
+            sources=sources,
+            fe_indices=fe_indices,
+            pb_indices=pb_indices,
+            positive_line_indices=positive_line_indices,
+            chunk_size=kernel_chunk_size,
+        )
+        expected_shape = (
+            measurement_count,
+            patch_count * quadrature_count,
+            len(lines),
+        )
+        if raw_values.shape != expected_shape:
+            raise ValueError(
+                "Batched selected-pair line kernel returned shape "
+                f"{raw_values.shape}, expected {expected_shape}."
+            )
+        values = raw_values.reshape(
+            measurement_count,
+            patch_count,
+            quadrature_count,
+            len(lines),
+        )
+        spatial = live_times[:, None, None] * np.einsum(
+            "mgql,gq->mgl",
+            values,
+            quadrature_weights,
+            optimize=True,
+        )
         for line_index, line in enumerate(lines):
-            transport_line_index = int(
-                line.get("transport_line_index", float(line_index))
-            )
-            line_kernel = _kernel_for_line(
-                kernel,
-                isotope,
-                line,
-                transport_line_index,
-                require_line_resolved=require_line_resolved,
-            )
-            raw_values = np.asarray(
-                line_kernel.kernel_values_selected_pairs_for_detectors(
-                    isotope=isotope,
-                    detector_positions=detector_positions,
-                    sources=sources,
-                    fe_indices=fe_indices,
-                    pb_indices=pb_indices,
-                    chunk_size=kernel_chunk_size,
-                ),
-                dtype=np.float64,
-            )
-            expected_shape = (
-                measurement_count,
-                patch_count * quadrature_count,
-            )
-            if raw_values.shape != expected_shape:
-                raise ValueError(
-                    "Batched selected-pair kernel returned shape "
-                    f"{raw_values.shape}, expected {expected_shape}."
-                )
-            if not np.all(np.isfinite(raw_values)) or np.any(raw_values < 0.0):
-                raise ValueError(
-                    "Batched selected-pair kernel must return finite non-negative values."
-                )
-            values = raw_values.reshape(
-                measurement_count,
-                patch_count,
-                quadrature_count,
-            )
-            spatial = live_times[:, None] * np.einsum(
-                "mgq,gq->mg", values, quadrature_weights, optimize=True
-            )
             pulse = detector_response_kernel_for_incident_gamma(
                 centers,
                 float(line["energy_keV"]),
@@ -824,7 +902,9 @@ def build_spectral_response(
                     "Detector response must contain finite non-negative values."
                 )
             response[:, :, :, isotope_index] += (
-                float(line["weight"]) * spatial[:, None, :] * pulse[None, :, None]
+                float(line["weight"])
+                * spatial[:, None, :, line_index]
+                * pulse[None, :, None]
             )
 
     if discrepancy_calibration is None:
@@ -999,31 +1079,42 @@ def build_spectral_response_operator(
         )
         for isotope in names
     }
-    prepared_lines = tuple(
-        _PreparedSpectralLine(
-            isotope_index=isotope_index,
-            isotope=isotope,
-            weight=float(line["weight"]),
-            kernel=_kernel_for_line(
-                kernel,
-                isotope,
-                line,
-                int(line.get("transport_line_index", float(line_index))),
-                require_line_resolved=require_line_resolved,
-            ),
-            pulse=detector_response_kernel_for_incident_gamma(
-                centers,
-                float(line["energy_keV"]),
-                resolution,
-                cebr3_efficiency,
-                bin_width,
-                continuum_to_peak=float(continuum_to_peak),
-                backscatter_fraction=float(backscatter_fraction),
-            ),
+    prepared_isotopes: list[_PreparedSpectralIsotope] = []
+    for isotope_index, isotope in enumerate(names):
+        lines = lines_by_isotope[isotope]
+        positive_line_indices = _positive_line_indices(
+            kernel,
+            isotope,
+            lines,
+            require_line_resolved=require_line_resolved,
         )
-        for isotope_index, isotope in enumerate(names)
-        for line_index, line in enumerate(lines_by_isotope[isotope])
-    )
+        pulses = np.vstack(
+            [
+                detector_response_kernel_for_incident_gamma(
+                    centers,
+                    float(line["energy_keV"]),
+                    resolution,
+                    cebr3_efficiency,
+                    bin_width,
+                    continuum_to_peak=float(continuum_to_peak),
+                    backscatter_fraction=float(backscatter_fraction),
+                )
+                for line in lines
+            ]
+        )
+        prepared_isotopes.append(
+            _PreparedSpectralIsotope(
+                isotope_index=isotope_index,
+                isotope=isotope,
+                weights=np.asarray(
+                    [float(line["weight"]) for line in lines],
+                    dtype=np.float64,
+                ),
+                positive_line_indices=positive_line_indices,
+                kernel=kernel,
+                pulses=np.ascontiguousarray(pulses, dtype=np.float64),
+            )
+        )
     work_items = (
         measurement_count
         * patch_count
@@ -1115,7 +1206,7 @@ def build_spectral_response_operator(
         quadrature_points=quadrature_points,
         quadrature_weights=quadrature_weights,
         isotope_count=len(names),
-        prepared_lines=prepared_lines,
+        prepared_isotopes=tuple(prepared_isotopes),
         kernel_chunk_size=kernel_chunk_size,
     )
 

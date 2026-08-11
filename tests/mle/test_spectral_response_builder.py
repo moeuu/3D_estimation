@@ -746,7 +746,7 @@ def test_matrix_free_cpu_workers_preserve_exact_response() -> None:
 def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Eight rows must share one kernel call and one pulse per gamma line."""
+    """Eight rows and both gamma lines must share one joint transport call."""
     edges = np.arange(0.0, 1505.0, 10.0)
     positions = np.zeros((8, 3), dtype=np.float64)
     positions[:, 0] = np.linspace(0.0, 0.7, 8)
@@ -764,7 +764,13 @@ def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
     )
     scalar_values = scalar.operator.materialize()
     original_pulse = spectral_builder.detector_response_kernel_for_incident_gamma
+    original_joint = (
+        ContinuousKernel.kernel_values_selected_pairs_for_detectors_by_line
+    )
+    original_scalar = ContinuousKernel.kernel_values_selected_pairs_for_detectors
     pulse_energies: list[float] = []
+    joint_calls: list[tuple[str, int]] = []
+    scalar_calls: list[str] = []
 
     def counted_pulse(*args: object, **kwargs: object) -> NDArray[np.float64]:
         """Record one position-independent gamma-line pulse construction."""
@@ -773,10 +779,41 @@ def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
         pulse_energies.append(float(energy))
         return original_pulse(*args, **kwargs)
 
+    def counted_joint(
+        self: ContinuousKernel,
+        *args: object,
+        **kwargs: object,
+    ) -> NDArray[np.float64]:
+        """Record one geometry-sharing line transport call."""
+        isotope = str(kwargs.get("isotope", args[0] if args else ""))
+        indices = np.asarray(kwargs["positive_line_indices"])
+        joint_calls.append((isotope, int(indices.size)))
+        return original_joint(self, *args, **kwargs)
+
+    def counted_scalar(
+        self: ContinuousKernel,
+        *args: object,
+        **kwargs: object,
+    ) -> NDArray[np.float64]:
+        """Record an obsolete scalar-line transport call."""
+        isotope = str(kwargs.get("isotope", args[0] if args else ""))
+        scalar_calls.append(isotope)
+        return original_scalar(self, *args, **kwargs)
+
     monkeypatch.setattr(
         spectral_builder,
         "detector_response_kernel_for_incident_gamma",
         counted_pulse,
+    )
+    monkeypatch.setattr(
+        ContinuousKernel,
+        "kernel_values_selected_pairs_for_detectors_by_line",
+        counted_joint,
+    )
+    monkeypatch.setattr(
+        ContinuousKernel,
+        "kernel_values_selected_pairs_for_detectors",
+        counted_scalar,
     )
     batched = build_spectral_response_operator(
         observations,
@@ -792,6 +829,8 @@ def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
 
     np.testing.assert_array_equal(batched_values, scalar_values)
     assert pulse_energies == [1173.2, 1332.5]
+    assert joint_calls == [("Co-60", 2)]
+    assert scalar_calls == []
     assert construction["kernel_batch_calls"] == 1
     assert construction["kernel_batched_measurements"] == 8
 
