@@ -71,6 +71,14 @@ class _FitState:
     likelihood_diagnostics: dict[str, object]
 
 
+def _bootstrap_worker_count(config: MLEConfig, replicate_count: int) -> int:
+    """Return safe bootstrap concurrency for the configured solver device."""
+    configured = min(int(config.bootstrap_batch_size), int(replicate_count))
+    if bool(config.use_gpu):
+        return 1
+    return configured
+
+
 def _surface_map_config(
     config: MLEConfig,
     *,
@@ -1465,10 +1473,11 @@ class SurfaceMLEEstimator:
                 station_bootstrap_batch(batch, rng)
                 for _replicate in range(replicate_count)
             )
-            batch_size = min(
+            configured_batch_size = min(
                 int(self.config.bootstrap_batch_size),
                 replicate_count,
             )
+            batch_size = _bootstrap_worker_count(self.config, replicate_count)
             if batch_size == 1:
                 bootstrap_estimator = SurfaceMLEEstimator(
                     bootstrap_config,
@@ -1548,9 +1557,10 @@ class SurfaceMLEEstimator:
             bootstrap = {
                 **bootstrap,
                 "execution": {
-                    "batch_size": min(
-                        int(self.config.bootstrap_batch_size),
-                        replicate_count,
+                    "batch_size": batch_size,
+                    "configured_batch_size": configured_batch_size,
+                    "gpu_concurrency_disabled": bool(
+                        self.config.use_gpu and configured_batch_size > 1
                     ),
                     "shared_response_cache": True,
                     "elapsed_seconds": bootstrap_seconds,

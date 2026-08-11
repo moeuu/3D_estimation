@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from three_d_estimation.config import MLEConfig
+from three_d_estimation.estimator import _bootstrap_worker_count
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
 from three_d_estimation.response_operator import BlockResponseOperator, ResponseBlock
 from three_d_estimation.uncertainty import (
@@ -142,6 +144,18 @@ def test_station_bootstrap_preserves_complete_station_blocks() -> None:
         np.count_nonzero(result.station_ids == station) == 2 for station in (0, 1)
     )
     assert np.array_equal(result.step_ids, np.arange(4))
+
+
+def test_gpu_bootstrap_serializes_sparse_solver_replicates() -> None:
+    """CUDA bootstrap must not run sparse TV kernels on concurrent streams."""
+    assert _bootstrap_worker_count(
+        MLEConfig(use_gpu=True, bootstrap_batch_size=4),
+        32,
+    ) == 1
+    assert _bootstrap_worker_count(
+        MLEConfig(use_gpu=False, bootstrap_batch_size=4),
+        32,
+    ) == 4
 
 
 def test_bootstrap_summary_adds_cluster_and_surface_intervals() -> None:
