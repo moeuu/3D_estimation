@@ -857,6 +857,14 @@ def fit_surface_map_poisson(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _IndexedCudaResponse:
+    """Reuse immutable CUDA rows through an index view without copying them."""
+
+    matrix: object
+    row_indices: object
+
+
 def _torch_response_product(
     operator: ResponseOperator,
     values: object,
@@ -868,6 +876,18 @@ def _torch_response_product(
     """Apply a streamed response operator while retaining state on one device."""
     torch = torch_module
     vector = values
+    if isinstance(dense_response, _IndexedCudaResponse):
+        matrix = dense_response.matrix
+        row_indices = dense_response.row_indices
+        if transpose:
+            original_rows = torch.zeros(
+                int(matrix.shape[0]),
+                dtype=vector.dtype,
+                device=vector.device,
+            )
+            original_rows.index_add_(0, row_indices, vector)
+            return matrix.T @ original_rows
+        return (matrix @ vector).index_select(0, row_indices)
     if dense_response is not None:
         return dense_response.T @ vector if transpose else dense_response @ vector
     if transpose:
@@ -1081,14 +1101,13 @@ def _prepare_dense_torch_response(
                 device=device,
             )
             trailing = int(np.prod(operator.observation_shape[1:], dtype=np.int64))
-            gathered = reusable_matrix.reshape(
-                len(reusable_keys),
-                trailing,
-                operator.source_count,
-            ).index_select(0, selected_t)
-            gathered = gathered.reshape(
-                operator.observation_count,
-                operator.source_count,
+            row_indices = (
+                selected_t[:, None] * trailing
+                + torch.arange(trailing, dtype=torch.long, device=device)[None, :]
+            ).reshape(-1)
+            indexed = _IndexedCudaResponse(
+                matrix=reusable_matrix,
+                row_indices=row_indices,
             )
             row_sums = np.asarray(reusable_rows[selected], dtype=np.float64).reshape(-1)
             column_sums = np.sum(
@@ -1103,9 +1122,10 @@ def _prepare_dense_torch_response(
                     "mode": "persistent_cuda_row_gather",
                     "cached_bytes": required_bytes,
                     "persistent_reused_measurements": len(row_keys),
+                    "materialized_row_gather_bytes": 0,
                 }
             )
-            return gathered, diagnostics, row_sums, column_sums
+            return indexed, diagnostics, row_sums, column_sums
 
     # Candidate planning can leave large, unreferenced blocks in PyTorch's
     # CUDA caching allocator.  The driver reports those reserved blocks as

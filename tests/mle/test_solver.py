@@ -616,6 +616,7 @@ def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:
 
     assert gathered_cache["mode"] == "persistent_cuda_row_gather"
     assert gathered_cache["host_to_device_bytes"] == 0
+    assert gathered_cache["materialized_row_gather_bytes"] == 0
     np.testing.assert_allclose(
         gpu.densities_cps_1m_m2,
         cpu.densities_cps_1m_m2,
