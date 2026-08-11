@@ -624,6 +624,53 @@ def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:
     )
 
 
+def test_cuda_response_cache_evicts_stale_patch_layouts() -> None:
+    """Online refinement caches must stay bounded as patch layouts change."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    areas = np.asarray([1.0, 1.5])
+    response = np.asarray(
+        [[[[1.0], [0.2]], [[0.7], [0.4]]]],
+        dtype=np.float64,
+    )
+    observed = np.asarray([[7.0, 5.0]])
+    cache: dict[str, object] = {}
+    config = SurfaceMapConfig(max_iterations=20, check_interval=10)
+
+    operators = []
+    for layout_index in range(3):
+        operator = _dense_density_operator(
+            response,
+            areas,
+            isotope_count=1,
+            diagnostics={
+                "device_cache_key": f"patch-layout-{layout_index}",
+                "measurement_row_keys": ["a"],
+            },
+        )
+        operators.append(operator)
+        fit_surface_map_poisson_operator(
+            observed,
+            operator,
+            areas,
+            config=config,
+            use_gpu=True,
+            persistent_response_cache=cache,
+        )
+
+    entries = cache.get("entries")
+    assert isinstance(entries, dict)
+    assert len(entries) == 2
+    keys = {identity[2] for identity in entries}
+    assert keys == {"patch-layout-1", "patch-layout-2"}
+    diagnostics = operators[-1].diagnostics["performance"]["solver"][
+        "response_cache"
+    ]
+    assert diagnostics["persistent_cache_entry_limit"] == 2
+    assert diagnostics["persistent_cache_evicted_entries"] == 1
+
+
 def test_calibrated_negative_binomial_operator_fit_is_finite() -> None:
     """Calibrated overdispersion must enter fitting rather than diagnostics only."""
     response = np.asarray(

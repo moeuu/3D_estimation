@@ -919,6 +919,42 @@ def _torch_response_product(
     return result
 
 
+def _prune_persistent_cuda_responses(
+    persistent_cache: dict[str, object],
+    active_identity: tuple[str, str, str],
+    *,
+    torch_module: object,
+    maximum_entries: int = 2,
+) -> int:
+    """Evict stale dense CUDA responses before another layout is cached.
+
+    Online coarse-to-fine fitting reuses one stable base layout while refined
+    patch layouts can change at every station.  Keeping every refined matrix
+    resident exhausts VRAM and forces later response kernels into very small
+    chunks.  Two LRU entries retain the active base/refinement pair without
+    allowing station-by-station growth.
+    """
+    entries = persistent_cache.get("entries")
+    if not isinstance(entries, dict):
+        return 0
+    if maximum_entries < 1:
+        raise ValueError("maximum_entries must be positive.")
+    if active_identity in entries:
+        active = entries.pop(active_identity)
+        entries[active_identity] = active
+        retained_before_prepare = maximum_entries
+    else:
+        retained_before_prepare = maximum_entries - 1
+    evicted = 0
+    while len(entries) > retained_before_prepare:
+        oldest_identity = next(iter(entries))
+        del entries[oldest_identity]
+        evicted += 1
+    if evicted:
+        torch_module.cuda.empty_cache()
+    return evicted
+
+
 def _prepare_dense_torch_response(
     operator: ResponseOperator,
     *,
@@ -980,6 +1016,14 @@ def _prepare_dense_torch_response(
     previous: dict[str, object] | None = None
     reusable: dict[str, object] | None = None
     if persistent_eligible:
+        diagnostics["persistent_cache_entry_limit"] = 2
+        diagnostics["persistent_cache_evicted_entries"] = (
+            _prune_persistent_cuda_responses(
+                persistent_cache,
+                persistent_identity,
+                torch_module=torch,
+            )
+        )
         entries = persistent_cache.get("entries")
         candidate = (
             entries.get(persistent_identity) if isinstance(entries, dict) else None
