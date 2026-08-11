@@ -1069,11 +1069,13 @@ def _prepare_dense_torch_response(
             and isinstance(cached_columns, np.ndarray)
             and cached_matrix is not None
         ):
+            torch.cuda.empty_cache()
             diagnostics.update(
                 {
                     "mode": "persistent_cuda_cache_hit",
                     "cached_bytes": required_bytes,
                     "persistent_prefix_measurements": len(row_keys),
+                    "allocator_cache_cleared_before_reuse": True,
                 }
             )
             return cached_matrix, diagnostics, cached_rows, cached_columns
@@ -1090,6 +1092,7 @@ def _prepare_dense_torch_response(
             and isinstance(reusable_columns, np.ndarray)
             and all(key in reusable_keys for key in row_keys)
         ):
+            torch.cuda.empty_cache()
             key_to_index = {key: index for index, key in enumerate(reusable_keys)}
             selected = np.asarray(
                 [key_to_index[key] for key in row_keys],
@@ -1123,6 +1126,7 @@ def _prepare_dense_torch_response(
                     "cached_bytes": required_bytes,
                     "persistent_reused_measurements": len(row_keys),
                     "materialized_row_gather_bytes": 0,
+                    "allocator_cache_cleared_before_reuse": True,
                 }
             )
             return indexed, diagnostics, row_sums, column_sums
