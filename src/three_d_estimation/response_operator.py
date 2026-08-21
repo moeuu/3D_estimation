@@ -2,13 +2,51 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+
+
+def _integer_vector(values: ArrayLike, *, name: str) -> NDArray[np.int64]:
+    """Return an owned, unique, non-empty one-dimensional index vector."""
+    raw = np.asarray(values)
+    if raw.ndim != 1 or raw.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional vector.")
+    if not np.issubdtype(raw.dtype, np.integer) or np.issubdtype(
+        raw.dtype,
+        np.bool_,
+    ):
+        raise TypeError(f"{name} must contain integer indices.")
+    if np.issubdtype(raw.dtype, np.unsignedinteger) and np.any(
+        raw > np.iinfo(np.int64).max
+    ):
+        raise ValueError(f"{name} entries exceed the supported integer range.")
+    result = np.array(raw, dtype=np.int64, copy=True)
+    if np.unique(result).size != result.size:
+        raise ValueError(f"{name} must not contain duplicate indices.")
+    result.setflags(write=False)
+    return result
+
+
+def _integer(value: object, *, name: str, minimum: int) -> int:
+    """Return an exact built-in integer no smaller than ``minimum``."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, np.integer),
+    ):
+        raise TypeError(f"{name} must be an integer.")
+    result = int(value)
+    if result < minimum:
+        qualifier = "positive" if minimum == 1 else f"at least {minimum}"
+        raise ValueError(f"{name} must be {qualifier}.")
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,8 +59,11 @@ class ResponseBlock:
 
     def __post_init__(self) -> None:
         """Validate an immutable finite non-negative block."""
-        rows = np.asarray(self.observation_indices, dtype=np.int64).reshape(-1)
-        columns = np.asarray(self.source_indices, dtype=np.int64).reshape(-1)
+        rows = _integer_vector(
+            self.observation_indices,
+            name="observation_indices",
+        )
+        columns = _integer_vector(self.source_indices, name="source_indices")
         values = np.asarray(self.values, dtype=np.float64)
         if values.shape != (rows.size, columns.size):
             raise ValueError(
@@ -32,11 +73,10 @@ class ResponseBlock:
             raise ValueError("ResponseBlock indices must be non-negative.")
         if np.any(~np.isfinite(values)) or np.any(values < -1.0e-12):
             raise ValueError("ResponseBlock values must be finite and non-negative.")
-        rows = np.array(rows, dtype=np.int64, copy=True)
-        columns = np.array(columns, dtype=np.int64, copy=True)
-        values = np.maximum(np.array(values, dtype=np.float64, copy=True), 0.0)
-        rows.setflags(write=False)
-        columns.setflags(write=False)
+        values = np.maximum(
+            np.array(values, dtype=np.float64, order="C", copy=True),
+            0.0,
+        )
         values.setflags(write=False)
         object.__setattr__(self, "observation_indices", rows)
         object.__setattr__(self, "source_indices", columns)
@@ -79,10 +119,10 @@ class ResponseOperator(Protocol):
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Return row and column sums from one shared traversal."""
 
-    def select_measurements(self, indices: Sequence[int]) -> "ResponseOperator":
+    def select_measurements(self, indices: Sequence[int]) -> ResponseOperator:
         """Return a view containing complete selected measurement rows."""
 
-    def masked_sources(self, mask: ArrayLike) -> "ResponseOperator":
+    def masked_sources(self, mask: ArrayLike) -> ResponseOperator:
         """Return an operator with excluded source columns set to zero."""
 
 
@@ -99,16 +139,28 @@ class BlockResponseOperator:
         diagnostics: dict[str, object] | None = None,
     ) -> None:
         """Store validated dimensions and a deterministic block factory."""
-        shape = tuple(int(value) for value in observation_shape)
-        if not shape or any(value < 1 for value in shape):
+        shape_values = tuple(observation_shape)
+        if not shape_values:
             raise ValueError("observation_shape must contain positive dimensions.")
-        if int(patch_count) < 1 or int(isotope_count) < 1:
-            raise ValueError("patch_count and isotope_count must be positive.")
+        shape = tuple(
+            _integer(value, name=f"observation_shape[{index}]", minimum=1)
+            for index, value in enumerate(shape_values)
+        )
+        validated_patch_count = _integer(
+            patch_count,
+            name="patch_count",
+            minimum=1,
+        )
+        validated_isotope_count = _integer(
+            isotope_count,
+            name="isotope_count",
+            minimum=1,
+        )
         if not callable(block_factory):
             raise TypeError("block_factory must be callable.")
         self.observation_shape = shape
-        self.patch_count = int(patch_count)
-        self.isotope_count = int(isotope_count)
+        self.patch_count = validated_patch_count
+        self.isotope_count = validated_isotope_count
         self._block_factory = block_factory
         self.diagnostics = {} if diagnostics is None else dict(diagnostics)
         self._row_sums: NDArray[np.float64] | None = None
@@ -117,7 +169,7 @@ class BlockResponseOperator:
     @property
     def observation_count(self) -> int:
         """Return the flattened observation count."""
-        return int(np.prod(self.observation_shape, dtype=np.int64))
+        return prod(self.observation_shape)
 
     @property
     def source_count(self) -> int:
@@ -137,7 +189,7 @@ class BlockResponseOperator:
 
     def matvec(self, values: ArrayLike) -> NDArray[np.float64]:
         """Return a streamed forward product."""
-        vector = np.asarray(values, dtype=np.float64).reshape(-1)
+        vector = np.asarray(values, dtype=np.float64)
         if vector.shape != (self.source_count,) or np.any(~np.isfinite(vector)):
             raise ValueError("matvec values must be one finite value per source.")
         result = np.zeros(self.observation_count, dtype=np.float64)
@@ -149,7 +201,7 @@ class BlockResponseOperator:
 
     def rmatvec(self, values: ArrayLike) -> NDArray[np.float64]:
         """Return a streamed transpose product."""
-        vector = np.asarray(values, dtype=np.float64).reshape(-1)
+        vector = np.asarray(values, dtype=np.float64)
         if vector.shape != (self.observation_count,) or np.any(~np.isfinite(vector)):
             raise ValueError("rmatvec values must be one finite value per observation.")
         result = np.zeros(self.source_count, dtype=np.float64)
@@ -190,10 +242,12 @@ class BlockResponseOperator:
     def materialize(self, *, maximum_bytes: int | None = None) -> NDArray[np.float64]:
         """Materialize the operator for tests and bounded diagnostics only."""
         required = self.observation_count * self.source_count * 8
-        if maximum_bytes is not None and required > int(maximum_bytes):
-            raise MemoryError(
-                f"Materialized response requires {required} bytes, above the limit."
-            )
+        if maximum_bytes is not None:
+            limit = _integer(maximum_bytes, name="maximum_bytes", minimum=0)
+            if required > limit:
+                raise MemoryError(
+                    f"Materialized response requires {required} bytes, above the limit."
+                )
         matrix = np.zeros(
             (self.observation_count, self.source_count),
             dtype=np.float64,
@@ -206,22 +260,20 @@ class BlockResponseOperator:
             *self.observation_shape, self.patch_count, self.isotope_count
         )
 
-    def select_measurements(self, indices: Sequence[int]) -> "BlockResponseOperator":
+    def select_measurements(self, indices: Sequence[int]) -> BlockResponseOperator:
         """Return a compact operator over complete selected measurement rows."""
         if len(self.observation_shape) < 2:
             raise ValueError(
                 "Measurement selection requires measurement-first responses."
             )
-        selected = np.asarray(tuple(indices), dtype=np.int64).reshape(-1)
+        selected = _integer_vector(
+            np.asarray(tuple(indices)),
+            name="measurement indices",
+        )
         measurement_count = self.observation_shape[0]
-        if (
-            selected.size == 0
-            or np.any(selected < 0)
-            or np.any(selected >= measurement_count)
-            or np.unique(selected).size != selected.size
-        ):
+        if np.any(selected < 0) or np.any(selected >= measurement_count):
             raise ValueError("Measurement indices must be unique and in range.")
-        trailing = int(np.prod(self.observation_shape[1:], dtype=np.int64))
+        trailing = prod(self.observation_shape[1:])
         global_rows = np.concatenate(
             [np.arange(index * trailing, (index + 1) * trailing) for index in selected]
         ).astype(np.int64, copy=False)
@@ -251,15 +303,19 @@ class BlockResponseOperator:
             },
         )
 
-    def masked_sources(self, mask: ArrayLike) -> "BlockResponseOperator":
+    def masked_sources(self, mask: ArrayLike) -> BlockResponseOperator:
         """Return an operator whose excluded columns are exactly zero."""
-        values = np.asarray(mask, dtype=bool)
+        values = np.asarray(mask)
+        if not np.issubdtype(values.dtype, np.bool_):
+            raise TypeError("Source mask must contain boolean values.")
         if values.shape == (self.patch_count, self.isotope_count):
             vector = values.reshape(-1)
         elif values.shape == (self.source_count,):
             vector = values
         else:
             raise ValueError("Source mask must match patches by isotopes.")
+        vector = np.array(vector, dtype=bool, copy=True)
+        vector.setflags(write=False)
 
         def factory() -> Iterator[ResponseBlock]:
             """Yield source-masked response blocks."""
@@ -283,18 +339,35 @@ class BlockResponseOperator:
 
 
 def atomic_save_npy(path: str | Path, values: ArrayLike) -> None:
-    """Atomically publish one NumPy cache block without replacing valid data."""
+    """Atomically publish one durable NumPy cache block without replacement."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         return
-    temporary = target.with_name(f".{target.name}.tmp")
-    with temporary.open("wb") as handle:
-        np.save(handle, np.asarray(values, dtype=np.float64), allow_pickle=False)
+    temporary: Path | None = None
     try:
-        temporary.replace(target)
+        with NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            np.save(
+                handle,
+                np.asarray(values, dtype=np.float64),
+                allow_pickle=False,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            pass
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 __all__ = [
