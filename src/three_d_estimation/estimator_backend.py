@@ -477,15 +477,8 @@ class SurfaceMLEBackend:
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in fit_signature.parameters.values()
         )
-        warm_start_compatible = not (
-            fit_kind == "final"
-            and self.config.online_patch_spacing_m is not None
-            and tuple(self.config.online_patch_spacing_m)
-            != tuple(self.config.patch_spacing_m)
-        )
         if (
             self._latest_estimate is not None
-            and warm_start_compatible
             and ("initial_estimate" in fit_signature.parameters or accepts_kwargs)
         ):
             fit_kwargs["initial_estimate"] = self._latest_estimate

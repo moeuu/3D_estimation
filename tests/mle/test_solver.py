@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from three_d_estimation.solver import (
+    _enforce_cuda_response_cache_requirement,
     _prepare_dense_torch_response,
     SurfaceMapConfig,
     evaluate_surface_map_objective,
@@ -243,6 +244,26 @@ def test_solver_reports_iteration_progress_and_eta() -> None:
     assert checked == sorted(checked)
     assert all(event["phase"] == "test_solver" for event in events)
     assert all(float(event["eta_seconds"]) >= 0.0 for event in events[1:])
+
+
+def test_required_cuda_response_cache_fails_before_streaming() -> None:
+    """A required exact GPU cache must reject a potentially multi-day fallback."""
+    diagnostics = {
+        "fallback_reason": "response_exceeds_device_cache_budget",
+        "required_bytes": 6_394_509_312,
+        "free_device_bytes_at_prepare": 4_000_000_000,
+        "budget_bytes": 2_400_000_000,
+    }
+
+    with pytest.raises(RuntimeError, match="streamed host blocks were not started"):
+        _enforce_cuda_response_cache_requirement(
+            None,
+            diagnostics,
+            required=True,
+        )
+
+    _enforce_cuda_response_cache_requirement(None, diagnostics, required=False)
+    _enforce_cuda_response_cache_requirement(object(), diagnostics, required=True)
 
 
 def test_surface_map_area_semantics_separate_density_and_strength() -> None:
@@ -490,6 +511,120 @@ def test_matrix_free_solver_matches_materialized_tensor() -> None:
     )
 
 
+def test_poisson_em_warm_start_accelerates_large_zero_initialized_fit() -> None:
+    """EM initialization should remove the slow scale-up from the zero boundary."""
+    response = np.asarray(
+        [
+            [[1.0], [0.05]],
+            [[0.8], [0.1]],
+            [[0.1], [0.9]],
+            [[0.05], [1.0]],
+        ],
+        dtype=float,
+    )
+    areas = np.ones(2, dtype=float)
+    truth = np.asarray([[1_000_000.0], [500_000.0]])
+    observed = np.einsum("mgi,gi->m", response, truth)
+    cold = fit_surface_map_poisson(
+        observed,
+        response,
+        areas,
+        config=SurfaceMapConfig(max_iterations=40, check_interval=10),
+    )
+    config = SurfaceMapConfig(
+        max_iterations=40,
+        check_interval=10,
+        poisson_em_warm_start_iterations=20,
+    )
+    materialized = fit_surface_map_poisson(
+        observed,
+        response,
+        areas,
+        config=config,
+    )
+    operator = _dense_density_operator(response, areas, isotope_count=1)
+    streamed = fit_surface_map_poisson_operator(
+        observed,
+        operator,
+        areas,
+        config=config,
+    )
+
+    assert materialized.deviance < cold.deviance * 1.0e-3
+    np.testing.assert_allclose(
+        streamed.densities_cps_1m_m2,
+        materialized.densities_cps_1m_m2,
+        rtol=1.0e-9,
+        atol=1.0e-6,
+    )
+    assert operator.diagnostics["performance"]["solver"][
+        "poisson_em_warm_start_iterations"
+    ] == 20
+
+
+def test_poisson_em_polishes_nonzero_warm_start() -> None:
+    """EM initialization must remain active after refinement or explicit resume."""
+    observed = np.asarray([900.0, 650.0, 400.0], dtype=float)
+    response = np.asarray(
+        [
+            [[1.0], [0.2]],
+            [[0.4], [0.8]],
+            [[0.1], [1.1]],
+        ],
+        dtype=float,
+    )
+    initial = np.asarray([[1.0], [1.0]], dtype=float)
+    config = SurfaceMapConfig(
+        max_iterations=1,
+        check_interval=1,
+        poisson_em_warm_start_iterations=20,
+    )
+
+    result = fit_surface_map_poisson(
+        observed,
+        response,
+        np.ones(2, dtype=float),
+        config=config,
+        initial_densities_cps_1m_m2=initial,
+    )
+
+    initial_expected = np.einsum("mgi,gi->m", response, initial)
+    initial_deviance = 2.0 * np.sum(
+        observed * np.log(observed / initial_expected)
+        - (observed - initial_expected)
+    )
+    assert result.deviance < initial_deviance * 0.1
+
+
+def test_kkt_gate_prevents_relative_change_false_convergence() -> None:
+    """Small state changes cannot declare convergence while KKT still fails."""
+    observed = np.asarray([100.0, 30.0], dtype=float)
+    response = np.asarray([[[1.0]], [[0.1]]], dtype=float)
+    common = {
+        "max_iterations": 2,
+        "check_interval": 1,
+        "tolerance": 1.0,
+        "objective_tolerance": 1.0,
+    }
+
+    relative_only = fit_surface_map_poisson(
+        observed,
+        response,
+        np.ones(1, dtype=float),
+        config=SurfaceMapConfig(**common),
+    )
+    kkt_gated = fit_surface_map_poisson(
+        observed,
+        response,
+        np.ones(1, dtype=float),
+        config=SurfaceMapConfig(**common, kkt_tolerance=0.0),
+    )
+
+    assert relative_only.converged is True
+    assert kkt_gated.converged is False
+    assert kkt_gated.kkt_residual > 0.0
+
+
 def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
     """CUDA and CPU must execute equivalent streamed primal-dual updates."""
     torch = pytest.importorskip("torch")
@@ -503,7 +638,12 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
     truth = np.asarray([[10.0], [3.0]])
     observed = np.einsum("mgi,gi->m", response, truth * areas[:, None])
     operator = _dense_density_operator(response, areas, isotope_count=1)
-    config = SurfaceMapConfig(max_iterations=1500, tolerance=1.0e-8)
+    config = SurfaceMapConfig(
+        max_iterations=1500,
+        poisson_em_warm_start_iterations=20,
+        tolerance=1.0e-8,
+        kkt_tolerance=0.0,
+    )
 
     cpu = fit_surface_map_poisson_operator(
         observed,
@@ -512,6 +652,7 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
         config=config,
         gpu_dtype="float64",
     )
+    progress_events: list[dict[str, object]] = []
     gpu = fit_surface_map_poisson_operator(
         observed,
         operator,
@@ -520,6 +661,7 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
         use_gpu=True,
         gpu_device="cuda",
         gpu_dtype="float64",
+        progress_hook=lambda event: progress_events.append(dict(event)),
     )
 
     np.testing.assert_allclose(
@@ -531,6 +673,13 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
     solver_performance = operator.diagnostics["performance"]["solver"]
     assert solver_performance["response_cache"]["mode"] == "dense_cuda_cache"
     assert solver_performance["response_product_calls"] > 0
+    cache_events = [
+        event
+        for event in progress_events
+        if str(event["phase"]).endswith(":cuda_response_cache")
+    ]
+    assert cache_events
+    assert cache_events[-1]["completed"] == cache_events[-1]["total"]
 
 
 def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:

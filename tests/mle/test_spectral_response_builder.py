@@ -697,6 +697,70 @@ def test_matrix_free_cache_appends_only_new_measurement_rows(tmp_path: Path) -> 
     )
 
 
+def test_matrix_free_cache_io_scales_with_patch_tasks_not_energy_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cached traversal performs one file load per row/patch task."""
+    edges = np.arange(0.0, 805.0, 10.0)
+    observations = _observations(
+        np.asarray([[0.0, 0.0, 0.5], [0.25, 0.0, 1.0]]),
+        edges,
+    )
+    points = np.zeros((3, 1, 3), dtype=float)
+    points[:, 0, 0] = np.asarray([1.0, 1.5, 2.0])
+    points[:, 0, 2] = 0.5
+    patches = _patches(points)
+    cache = tmp_path / "cache"
+    options = {
+        "energy_chunk_size": 7,
+        "patch_chunk_size": 2,
+        "cache_directory": cache,
+    }
+    first = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        **options,
+    )
+    first.operator.row_sums()
+
+    expected_task_count = observations.detector_positions_xyz.shape[0] * 2
+    assert len(tuple(cache.rglob("*.npy"))) == expected_task_count
+    assert (
+        first.operator.diagnostics["cache_file_layout"]
+        == "measurement_patch_full_energy_v2"
+    )
+
+    load_count = 0
+    original_load = spectral_builder.np.load
+
+    def counted_load(*args: object, **kwargs: object) -> object:
+        """Count cache loads while preserving NumPy behavior."""
+        nonlocal load_count
+        load_count += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(spectral_builder.np, "load", counted_load)
+    cached = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        **options,
+    )
+    cached.operator.row_sums()
+
+    assert load_count == expected_task_count
+    assert cached.operator.diagnostics["cache_stats"] == {
+        "hits": expected_task_count,
+        "misses": 0,
+        "files": expected_task_count,
+        "blocks": expected_task_count * 12,
+    }
+
+
 def test_matrix_free_cpu_workers_preserve_exact_response() -> None:
     """Parallel CPU patch tasks must preserve deterministic float64 blocks."""
     edges = np.arange(0.0, 805.0, 10.0)

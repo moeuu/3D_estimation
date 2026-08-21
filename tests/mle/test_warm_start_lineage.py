@@ -108,3 +108,68 @@ def test_rebuilt_base_warm_start_aggregates_all_active_descendant_levels() -> No
             axis=1,
         ),
     )
+
+
+def test_coarse_online_density_seeds_independently_built_fine_dictionary() -> None:
+    """A cold final grid inherits density from containing online patches."""
+    environment = EnvironmentConfig(size_x=2.0, size_y=3.0, size_z=4.0)
+    coarse = build_surface_patches(
+        environment,
+        None,
+        spacing=10.0,
+        quadrature_points_per_patch=1,
+    )
+    fine = build_surface_patches(
+        environment,
+        None,
+        spacing=1.0,
+        quadrature_points_per_patch=1,
+    )
+    isotope_names = ("Cs-137", "Co-60")
+    coarse_density = np.zeros((len(isotope_names), coarse.patch_count), dtype=float)
+    coarse_floor_indices = [
+        index
+        for index, patch in enumerate(coarse.patches)
+        if patch.surface_kind == "floor"
+    ]
+    coarse_density[:, coarse_floor_indices] = np.asarray([[4.0], [7.0]])
+    prior = MLEEstimate(
+        isotope_names=isotope_names,
+        patches=coarse.patches,
+        density_by_isotope=coarse_density,
+        patch_strength_by_isotope=coarse_density * coarse.areas_m2[None, :],
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.zeros(0),
+        nuisance_parameters=np.zeros(0),
+        objective_value=0.0,
+        poisson_deviance=0.0,
+        iterations=0,
+        converged=True,
+        diagnostics={},
+    )
+
+    mapped = _initial_density_for_patches(prior, fine, isotope_names)
+
+    assert mapped is not None
+    fine_floor_indices = [
+        index
+        for index, patch in enumerate(fine.patches)
+        if patch.surface_kind == "floor"
+    ]
+    np.testing.assert_allclose(
+        mapped[np.asarray(fine_floor_indices)],
+        np.broadcast_to([4.0, 7.0], (len(fine_floor_indices), 2)),
+    )
+    np.testing.assert_allclose(
+        np.sum(
+            mapped[np.asarray(fine_floor_indices)]
+            * fine.areas_m2[np.asarray(fine_floor_indices), None],
+            axis=0,
+        ),
+        np.sum(
+            coarse_density[:, np.asarray(coarse_floor_indices)]
+            * coarse.areas_m2[np.asarray(coarse_floor_indices)][None, :],
+            axis=1,
+        ),
+    )

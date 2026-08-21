@@ -60,8 +60,10 @@ class MLEConfig:
     count_covariance_regularization: float = 1.0e-6
     count_covariance_max_condition_number: float = 1.0e10
     max_iterations: int = 4000
+    poisson_em_warm_start_iterations: int = 0
     tolerance: float = 1.0e-6
     objective_tolerance: float = 1.0e-7
+    kkt_tolerance: float | None = None
     check_interval: int = 20
     step_safety: float = 0.95
     over_relaxation: float = 1.0
@@ -74,6 +76,7 @@ class MLEConfig:
     response_worker_count: int = 0
     response_cache_dir: str | None = None
     response_device_cache_fraction: float = 0.6
+    require_gpu_response_cache: bool = False
     online_fit_scope: Literal["station_complete"] = "station_complete"
     online_patch_spacing_m: tuple[float, float, float] | None = None
     online_coarse_to_fine_levels: int = 0
@@ -255,6 +258,20 @@ class MLEConfig:
             )
         if int(self.max_iterations) < 1 or int(self.check_interval) < 1:
             raise ValueError("Iteration counts must be positive.")
+        if (
+            isinstance(self.poisson_em_warm_start_iterations, (bool, np.bool_))
+            or int(self.poisson_em_warm_start_iterations)
+            != self.poisson_em_warm_start_iterations
+            or int(self.poisson_em_warm_start_iterations) < 0
+        ):
+            raise ValueError(
+                "poisson_em_warm_start_iterations must be a nonnegative integer."
+            )
+        if self.kkt_tolerance is not None and (
+            not np.isfinite(self.kkt_tolerance)
+            or float(self.kkt_tolerance) < 0.0
+        ):
+            raise ValueError("kkt_tolerance must be null or finite and nonnegative.")
         if int(self.response_chunk_size) < 1:
             raise ValueError("response_chunk_size must be positive.")
         if self.spectral_response_mode not in {"materialized", "matrix_free"}:
@@ -329,6 +346,8 @@ class MLEConfig:
             raise ValueError("online_coarse_to_fine_levels must be non-negative.")
         if not isinstance(self.debias_requires_convergence, (bool, np.bool_)):
             raise TypeError("debias_requires_convergence must be boolean.")
+        if not isinstance(self.require_gpu_response_cache, (bool, np.bool_)):
+            raise TypeError("require_gpu_response_cache must be boolean.")
         if (
             isinstance(self.debias_max_active_parameters, bool)
             or int(self.debias_max_active_parameters) < 1

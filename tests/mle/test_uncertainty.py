@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from three_d_estimation.config import MLEConfig
-from three_d_estimation.estimator import _bootstrap_worker_count
+from three_d_estimation.estimator import (
+    _bootstrap_worker_count,
+    _uncertainty_invalid_reasons,
+)
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
 from three_d_estimation.response_operator import BlockResponseOperator, ResponseBlock
 from three_d_estimation.uncertainty import (
@@ -78,6 +83,7 @@ def _estimate(offset: float) -> MLEEstimate:
                     "isotope": "Cs-137",
                     "centroid_xyz": [0.5 + offset, 0.5, 0.0],
                     "integrated_strength_cps_1m": 2.0 + offset,
+                    "patch_ids": [0],
                 }
             ]
         },
@@ -158,6 +164,50 @@ def test_gpu_bootstrap_serializes_sparse_solver_replicates() -> None:
     ) == 4
 
 
+def test_uncertainty_quality_gates_fail_closed() -> None:
+    """Nonconvergence, KKT failure, and mismatch invalidate uncertainty."""
+    config = MLEConfig(
+        kkt_tolerance=1.0e-3,
+        debias_max_pearson_dispersion=5.0,
+    )
+    valid = replace(
+        _estimate(0.0),
+        diagnostics={
+            **_estimate(0.0).diagnostics,
+            "kkt_residual": 1.0e-4,
+            "pearson_dispersion": 1.2,
+        },
+    )
+    invalid = replace(
+        valid,
+        converged=False,
+        diagnostics={
+            **valid.diagnostics,
+            "kkt_residual": 0.1,
+            "pearson_dispersion": 20.0,
+        },
+    )
+    nonfinite = replace(
+        valid,
+        diagnostics={
+            **valid.diagnostics,
+            "kkt_residual": float("nan"),
+            "pearson_dispersion": float("nan"),
+        },
+    )
+
+    assert _uncertainty_invalid_reasons(valid, config) == ()
+    assert _uncertainty_invalid_reasons(invalid, config) == (
+        "optimizer_not_converged",
+        "kkt_tolerance_not_met",
+        "pearson_dispersion_exceeds_model_adequacy_limit",
+    )
+    assert _uncertainty_invalid_reasons(nonfinite, config) == (
+        "kkt_tolerance_not_met",
+        "pearson_dispersion_exceeds_model_adequacy_limit",
+    )
+
+
 def test_bootstrap_summary_adds_cluster_and_surface_intervals() -> None:
     """Bootstrap reports should expose position, strength, z, and surface mass."""
     summary, clusters = bootstrap_uncertainty_summary(
@@ -172,6 +222,35 @@ def test_bootstrap_summary_adds_cluster_and_surface_intervals() -> None:
     assert "surface_mass_probability" in isotope
     assert clusters[0]["bootstrap_selection_frequency"] == 1.0
     assert np.asarray(clusters[0]["centroid_covariance_xyz_m2"]).shape == (3, 3)
+
+
+def test_bootstrap_cluster_matching_is_one_to_one_per_replicate() -> None:
+    """One replicate cluster cannot make two base clusters look selected."""
+    base = _estimate(0.0)
+    base = replace(
+        base,
+        diagnostics={
+            **base.diagnostics,
+            "hotspot_clusters": [
+                *base.diagnostics["hotspot_clusters"],
+                {
+                    "isotope": "Cs-137",
+                    "centroid_xyz": [1.5, 0.5, 0.0],
+                    "integrated_strength_cps_1m": 1.0,
+                },
+            ],
+        },
+    )
+
+    _summary, clusters = bootstrap_uncertainty_summary(
+        base,
+        (_estimate(0.05),),
+        confidence_level=0.95,
+    )
+
+    assert sorted(
+        float(cluster["bootstrap_selection_frequency"]) for cluster in clusters
+    ) == [0.0, 1.0]
 
 
 def test_laplace_covariance_is_attached_to_cluster_source_modes() -> None:
@@ -196,3 +275,40 @@ def test_laplace_covariance_is_attached_to_cluster_source_modes() -> None:
 
     assert np.asarray(clusters[0]["centroid_covariance_xyz_m2"]).shape == (3, 3)
     assert clusters[0]["uncertainty_method"] == "active_support_laplace_delta"
+
+
+def test_laplace_skips_cluster_interval_when_support_is_partial() -> None:
+    """A capped Fisher support must not yield an overconfident cluster CI."""
+    base = _estimate(0.0)
+    base = replace(
+        base,
+        diagnostics={
+            **base.diagnostics,
+            "hotspot_clusters": [
+                {
+                    **base.diagnostics["hotspot_clusters"][0],
+                    "patch_ids": [0, 1],
+                }
+            ],
+        },
+    )
+    laplace = active_support_laplace(
+        np.asarray([[[[1.0], [0.5]]], [[[0.5], [1.0]]]]),
+        np.asarray([[2.0], [2.0]]),
+        np.asarray([[2.0], [2.0]]),
+        np.asarray([[2.0], [1.0]]),
+        np.ones(2),
+        np.asarray([0, 1]),
+        support_threshold_fraction=0.01,
+        maximum_active_parameters=1,
+        ridge=1.0e-6,
+    )
+
+    clusters = augment_clusters_with_laplace(
+        base,
+        laplace,
+        confidence_level=0.95,
+    )
+
+    assert clusters[0]["laplace_interval_status"] == "skipped_partial_support"
+    assert "integrated_strength_interval_cps_1m" not in clusters[0]

@@ -223,11 +223,13 @@ def augment_clusters_with_laplace(
             laplace.active_source_indices.size,
             dtype=float,
         )
+        cluster_source_indices: list[int] = []
         for patch_id in patch_ids:
             patch_index = patch_by_id.get(int(patch_id))
             if patch_index is None:
                 continue
             source_index = patch_index * isotope_count + isotope_index
+            cluster_source_indices.append(source_index)
             local_index = active_lookup.get(source_index)
             if local_index is None:
                 continue
@@ -238,6 +240,16 @@ def augment_clusters_with_laplace(
                 centroid_jacobian[local_index] = (
                     area * (patch.centroid_xyz - centroid) / total_strength
                 )
+        unsupported = [
+            source_index
+            for source_index in cluster_source_indices
+            if source_index not in active_lookup
+        ]
+        if not cluster_source_indices or unsupported:
+            enriched["laplace_interval_status"] = "skipped_partial_support"
+            enriched["laplace_unsupported_source_indices"] = unsupported
+            result.append(enriched)
+            continue
         centroid_covariance = (
             centroid_jacobian.T @ laplace.covariance @ centroid_jacobian
         )
@@ -255,6 +267,7 @@ def augment_clusters_with_laplace(
             total_strength + critical * strength_sd,
         ]
         enriched["uncertainty_method"] = "active_support_laplace_delta"
+        enriched["laplace_interval_status"] = "complete_support"
         result.append(enriched)
     return result
 
@@ -357,34 +370,76 @@ def bootstrap_uncertainty_summary(
             "ceiling_source_probability": float(np.mean(ceiling_dominant)),
         }
 
-    augmented_clusters: list[dict[str, object]] = []
-    for base_cluster in _clusters(base):
-        isotope = str(base_cluster.get("isotope", ""))
-        centroid = np.asarray(base_cluster.get("centroid_xyz"), dtype=float)
-        matched_centroids: list[NDArray[np.float64]] = []
-        matched_strengths: list[float] = []
-        for estimate in estimates:
-            candidates = [
-                cluster
-                for cluster in _clusters(estimate)
+    base_clusters = _clusters(base)
+    centroid_samples: list[list[NDArray[np.float64]]] = [
+        [] for _cluster in base_clusters
+    ]
+    strength_samples_by_cluster: list[list[float]] = [
+        [] for _cluster in base_clusters
+    ]
+    from scipy.optimize import linear_sum_assignment
+
+    for estimate in estimates:
+        replicate_clusters = _clusters(estimate)
+        isotopes = {
+            str(cluster.get("isotope", "")) for cluster in base_clusters
+        }
+        for isotope in isotopes:
+            base_indices = [
+                index
+                for index, cluster in enumerate(base_clusters)
                 if str(cluster.get("isotope", "")) == isotope
             ]
-            if not candidates:
+            candidate_indices = [
+                index
+                for index, cluster in enumerate(replicate_clusters)
+                if str(cluster.get("isotope", "")) == isotope
+            ]
+            if not base_indices or not candidate_indices:
                 continue
-            nearest = min(
-                candidates,
-                key=lambda cluster: float(
-                    np.linalg.norm(
-                        np.asarray(cluster.get("centroid_xyz"), dtype=float) - centroid
+            base_points = np.vstack(
+                [
+                    np.asarray(base_clusters[index].get("centroid_xyz"), dtype=float)
+                    for index in base_indices
+                ]
+            )
+            candidate_points = np.vstack(
+                [
+                    np.asarray(
+                        replicate_clusters[index].get("centroid_xyz"),
+                        dtype=float,
                     )
-                ),
+                    for index in candidate_indices
+                ]
             )
-            matched_centroids.append(
-                np.asarray(nearest.get("centroid_xyz"), dtype=float)
+            distances = np.linalg.norm(
+                base_points[:, None, :] - candidate_points[None, :, :],
+                axis=2,
             )
-            matched_strengths.append(
-                float(nearest.get("integrated_strength_cps_1m", 0.0))
-            )
+            matched_base, matched_candidate = linear_sum_assignment(distances)
+            for base_local, candidate_local in zip(
+                matched_base,
+                matched_candidate,
+                strict=True,
+            ):
+                base_index = base_indices[int(base_local)]
+                candidate_index = candidate_indices[int(candidate_local)]
+                centroid_samples[base_index].append(
+                    candidate_points[int(candidate_local)]
+                )
+                strength_samples_by_cluster[base_index].append(
+                    float(
+                        replicate_clusters[candidate_index].get(
+                            "integrated_strength_cps_1m",
+                            0.0,
+                        )
+                    )
+                )
+
+    augmented_clusters: list[dict[str, object]] = []
+    for cluster_index, base_cluster in enumerate(base_clusters):
+        matched_centroids = centroid_samples[cluster_index]
+        matched_strengths = strength_samples_by_cluster[cluster_index]
         enriched = dict(base_cluster)
         enriched["bootstrap_selection_frequency"] = len(matched_centroids) / len(
             estimates

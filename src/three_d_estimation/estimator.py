@@ -79,6 +79,53 @@ def _bootstrap_worker_count(config: MLEConfig, replicate_count: int) -> int:
     return configured
 
 
+def _uncertainty_invalid_reasons(
+    estimate: MLEEstimate,
+    config: MLEConfig,
+) -> tuple[str, ...]:
+    """Return fail-closed quality gates for physical uncertainty reporting."""
+    reasons: list[str] = []
+    if not estimate.converged:
+        reasons.append("optimizer_not_converged")
+    kkt = float(estimate.diagnostics.get("kkt_residual", float("inf")))
+    if config.kkt_tolerance is not None and (
+        not np.isfinite(kkt) or kkt > float(config.kkt_tolerance)
+    ):
+        reasons.append("kkt_tolerance_not_met")
+    pearson = float(estimate.diagnostics.get("pearson_dispersion", float("inf")))
+    if not np.isfinite(pearson) or pearson > float(
+        config.debias_max_pearson_dispersion
+    ):
+        reasons.append("pearson_dispersion_exceeds_model_adequacy_limit")
+    return tuple(reasons)
+
+
+def _uncertainty_interpretation(
+    estimate: MLEEstimate,
+    config: MLEConfig,
+    reasons: Sequence[str],
+) -> dict[str, object]:
+    """Return one consistent uncertainty-interpretation diagnostics payload."""
+    return {
+        "valid_for_physical_interpretation": not reasons,
+        "invalid_reasons": list(reasons),
+        "kkt_residual": float(
+            estimate.diagnostics.get("kkt_residual", float("inf"))
+        ),
+        "kkt_tolerance": (
+            None
+            if config.kkt_tolerance is None
+            else float(config.kkt_tolerance)
+        ),
+        "pearson_dispersion": float(
+            estimate.diagnostics.get("pearson_dispersion", float("inf"))
+        ),
+        "pearson_dispersion_limit": float(
+            config.debias_max_pearson_dispersion
+        ),
+    }
+
+
 def _surface_map_config(
     config: MLEConfig,
     *,
@@ -117,8 +164,16 @@ def _surface_map_config(
             )
         ),
         max_iterations=int(config.max_iterations),
+        poisson_em_warm_start_iterations=int(
+            config.poisson_em_warm_start_iterations
+        ),
         tolerance=float(config.tolerance),
         objective_tolerance=float(config.objective_tolerance),
+        kkt_tolerance=(
+            None
+            if config.kkt_tolerance is None
+            else float(config.kkt_tolerance)
+        ),
         check_interval=int(config.check_interval),
         step_safety=float(config.step_safety),
         over_relaxation=float(config.over_relaxation),
@@ -477,6 +532,7 @@ def _fit_problem(
             gpu_device=str(config.gpu_device),
             gpu_dtype=str(config.gpu_dtype),
             response_device_cache_fraction=float(config.response_device_cache_fraction),
+            require_gpu_response_cache=bool(config.require_gpu_response_cache),
             persistent_response_cache=persistent_response_cache,
             progress_hook=progress_hook,
             progress_phase=f"mle_solver_iterations:{progress_label}",
@@ -695,6 +751,7 @@ def _debias_state(
             gpu_device=str(config.gpu_device),
             gpu_dtype=str(config.gpu_dtype),
             response_device_cache_fraction=float(config.response_device_cache_fraction),
+            require_gpu_response_cache=bool(config.require_gpu_response_cache),
             persistent_response_cache=persistent_response_cache,
             progress_hook=progress_hook,
             progress_phase="mle_solver_iterations:debias",
@@ -873,10 +930,9 @@ def _initial_density_for_patches(
         if candidate.parent_patch_id == ancestor.patch_id:
             return True
         if (
-            candidate.parent_patch_id is None
-            or candidate.refinement_level <= ancestor.refinement_level
-            or candidate.surface_kind != ancestor.surface_kind
+            candidate.surface_kind != ancestor.surface_kind
             or candidate.object_id != ancestor.object_id
+            or candidate.area_m2 >= ancestor.area_m2 * (1.0 - 1.0e-12)
             or not np.allclose(
                 candidate.normal_xyz,
                 ancestor.normal_xyz,
@@ -913,15 +969,12 @@ def _initial_density_for_patches(
         previous = old_by_id.get(patch.patch_id)
         if previous is not None:
             previous_patch, density = previous
-            if not np.isclose(previous_patch.area_m2, patch.area_m2) or not np.allclose(
+            if np.isclose(previous_patch.area_m2, patch.area_m2) and np.allclose(
                 previous_patch.vertices_xyz,
                 patch.vertices_xyz,
             ):
-                raise ValueError(
-                    f"Warm-start patch {patch.patch_id} geometry does not match."
-                )
-            result[index] = density
-            continue
+                result[index] = density
+                continue
         descendants = [
             (candidate, old_density[candidate_index])
             for candidate_index, candidate in enumerate(initial_estimate.patches)
@@ -933,6 +986,18 @@ def _initial_density_for_patches(
                 axis=0,
             )
             result[index] = integrated / patch.area_m2
+            continue
+        ancestors = [
+            (candidate, old_density[candidate_index])
+            for candidate_index, candidate in enumerate(initial_estimate.patches)
+            if is_descendant(patch, candidate)
+        ]
+        if ancestors:
+            _ancestor, density = min(
+                ancestors,
+                key=lambda item: float(item[0].area_m2),
+            )
+            result[index] = density
     return result
 
 
@@ -1458,6 +1523,37 @@ class SurfaceMLEEstimator:
         )
         if not bool(self.config.uncertainty_enable):
             return estimate
+        base_uncertainty_reasons = _uncertainty_invalid_reasons(
+            estimate,
+            self.config,
+        )
+        if base_uncertainty_reasons:
+            skipped_uncertainty = {
+                "laplace": {
+                    "status": "skipped",
+                    "reason": "base_estimate_failed_quality_gates",
+                },
+                "station_bootstrap": {
+                    "status": "skipped",
+                    "reason": "base_estimate_failed_quality_gates",
+                    "requested_replicate_count": int(
+                        self.config.station_bootstrap_replicates
+                    ),
+                    "replicate_count": 0,
+                },
+                "interpretation": _uncertainty_interpretation(
+                    estimate,
+                    self.config,
+                    base_uncertainty_reasons,
+                ),
+            }
+            return replace(
+                estimate,
+                diagnostics={
+                    **estimate.diagnostics,
+                    "uncertainty": skipped_uncertainty,
+                },
+            )
         laplace = active_support_laplace(
             state.response,
             observed,
@@ -1488,8 +1584,21 @@ class SurfaceMLEEstimator:
             },
         )
         bootstrap_estimates: list[MLEEstimate] = []
+        bootstrap_rejections: dict[str, int] = {}
         replicate_count = int(self.config.station_bootstrap_replicates)
         bootstrap_seconds = 0.0
+
+        def record_bootstrap_estimate(candidate: MLEEstimate) -> None:
+            """Accept only replicates that pass the same physical quality gates."""
+            reasons = _uncertainty_invalid_reasons(candidate, bootstrap_config)
+            if reasons:
+                for reason in reasons:
+                    bootstrap_rejections[reason] = (
+                        bootstrap_rejections.get(reason, 0) + 1
+                    )
+                return
+            bootstrap_estimates.append(candidate)
+
         if replicate_count:
             bootstrap_started = perf_counter()
             if self._progress_hook is not None:
@@ -1548,7 +1657,7 @@ class SurfaceMLEEstimator:
                     replicate_batches,
                     start=1,
                 ):
-                    bootstrap_estimates.append(
+                    record_bootstrap_estimate(
                         bootstrap_estimator.fit(
                             replicate_batch,
                             environment,
@@ -1608,21 +1717,36 @@ class SurfaceMLEEstimator:
                         executor.map(fit_replicate, replicate_batches),
                         start=1,
                     ):
-                        bootstrap_estimates.append(result)
+                        record_bootstrap_estimate(result)
                         self._report_bootstrap_progress(
                             replicate_index,
                             replicate_count,
                             bootstrap_started,
                         )
             bootstrap_seconds = perf_counter() - bootstrap_started
+        minimum_valid_replicates = (
+            0
+            if replicate_count == 0
+            else min(replicate_count, max(20, (4 * replicate_count + 4) // 5))
+        )
+        bootstrap_sample_valid = (
+            replicate_count == 0
+            or len(bootstrap_estimates) >= minimum_valid_replicates
+        )
         bootstrap, augmented_clusters = bootstrap_uncertainty_summary(
             estimate,
-            bootstrap_estimates,
+            bootstrap_estimates if bootstrap_sample_valid else (),
             confidence_level=float(self.config.bootstrap_confidence_level),
         )
         if replicate_count:
             bootstrap = {
                 **bootstrap,
+                "status": (
+                    "complete"
+                    if bootstrap_sample_valid
+                    else "insufficient_valid_replicates"
+                ),
+                "minimum_valid_replicates": minimum_valid_replicates,
                 "execution": {
                     "batch_size": batch_size,
                     "configured_batch_size": configured_batch_size,
@@ -1640,6 +1764,12 @@ class SurfaceMLEEstimator:
                     ),
                     "gpu_dtype": bootstrap_config.gpu_dtype,
                     "elapsed_seconds": bootstrap_seconds,
+                    "requested_replicate_count": replicate_count,
+                    "accepted_replicate_count": len(bootstrap_estimates),
+                    "rejected_replicate_count": (
+                        replicate_count - len(bootstrap_estimates)
+                    ),
+                    "rejection_reasons": dict(sorted(bootstrap_rejections.items())),
                 },
             }
         uncertainty = {
@@ -1649,6 +1779,16 @@ class SurfaceMLEEstimator:
             ),
             "station_bootstrap": bootstrap,
         }
+        uncertainty_reasons = list(
+            _uncertainty_invalid_reasons(estimate, self.config)
+        )
+        if replicate_count and not bootstrap_sample_valid:
+            uncertainty_reasons.append("insufficient_valid_bootstrap_replicates")
+        uncertainty["interpretation"] = _uncertainty_interpretation(
+            estimate,
+            self.config,
+            uncertainty_reasons,
+        )
         return replace(
             estimate,
             diagnostics={

@@ -272,6 +272,31 @@ class SurfaceMLEBackendTests(unittest.TestCase):
             result.final_snapshot.predicted_spectrum, [3.0, 4.0]
         )
 
+    def test_final_fit_warm_starts_across_online_and_final_patch_spacings(self) -> None:
+        """The fine final dictionary should inherit the latest coarse estimate."""
+        recorder = _RecordingEstimator()
+        config = MLEConfig(
+            mode="spectral",
+            isotope_names=("Cs-137",),
+            patch_spacing_m=(1.0, 1.0, 1.0),
+            online_patch_spacing_m=(2.0, 2.0, 2.0),
+        )
+        backend = SurfaceMLEBackend(
+            config,
+            estimator_factory=lambda _config: recorder,
+        )
+        _initialize_with_test_kernel(backend, _context())
+        record = _record(0, 4)
+        backend.update(record)
+        backend.on_station_complete(4, (record,))
+        station_estimate = backend.latest_estimate
+
+        backend.finalize()
+
+        self.assertEqual(recorder.measurement_counts, [1, 1])
+        self.assertIsNone(recorder.initial_estimates[0])
+        self.assertIs(recorder.initial_estimates[1], station_estimate)
+
     def test_runtime_mapping_proxy_is_normalized_before_model_build(self) -> None:
         """A RunContext produced by MeasurementLog must initialize directly."""
         context = _context()

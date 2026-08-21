@@ -1038,9 +1038,11 @@ def build_spectral_response_operator(
 ) -> SpectralResponseOperatorResult:
     """Build a disk-cacheable streaming ``A @ q`` and ``A.T @ r`` operator.
 
-    Blocks are one measurement by an energy-bin chunk by a patch chunk.  Cache
-    keys are per acquired row, so extending a causal observation prefix writes
-    only blocks belonging to newly appended measurements.
+    Emitted blocks are one measurement by an energy-bin chunk by a patch chunk.
+    The disk cache stores the full energy axis for each measurement/patch pair
+    in one contiguous file.  Cache keys are per acquired row, so extending a
+    causal observation prefix writes only files belonging to newly appended
+    measurements without creating one filesystem entry per energy chunk.
     """
     kernel_chunk_size = _positive_integer(chunk_size, name="chunk_size")
     measurement_step = _positive_integer(
@@ -1146,7 +1148,16 @@ def build_spectral_response_operator(
         continuum_to_peak=continuum_to_peak,
         backscatter_fraction=backscatter_fraction,
     )
-    cache_stats = {"hits": 0, "misses": 0, "blocks": 0}
+    measurement_row_keys = tuple(
+        _measurement_cache_key(
+            detector_positions[index],
+            int(fe_indices[index]),
+            int(pb_indices[index]),
+            float(live_times[index]),
+        )
+        for index in range(measurement_count)
+    )
+    cache_stats = {"hits": 0, "misses": 0, "files": 0, "blocks": 0}
     performance: dict[str, object] = {
         "response_construction": {
             "worker_count": resolved_workers,
@@ -1159,26 +1170,18 @@ def build_spectral_response_operator(
         }
     }
 
-    def block_path(
+    def task_cache_path(
         measurement_index: int,
         patch_start: int,
         patch_stop: int,
-        energy_start: int,
-        energy_stop: int,
     ) -> Path | None:
-        """Return one immutable per-row cache block path."""
+        """Return one immutable full-energy cache path for a patch task."""
         if cache_root is None:
             return None
-        row_key = _measurement_cache_key(
-            detector_positions[measurement_index],
-            int(fe_indices[measurement_index]),
-            int(pb_indices[measurement_index]),
-            float(live_times[measurement_index]),
-        )
         return (
             cache_root
-            / row_key
-            / f"g{patch_start}-{patch_stop}_b{energy_start}-{energy_stop}.npy"
+            / measurement_row_keys[measurement_index]
+            / f"g{patch_start}-{patch_stop}_all.npy"
         )
 
     def calculate_patch_batch(
@@ -1211,21 +1214,14 @@ def build_spectral_response_operator(
     )
 
     def task_requires_calculation(task: tuple[int, int, int]) -> bool:
-        """Return whether any energy block for one patch task is absent."""
+        """Return whether the contiguous cache file for a task is absent."""
         measurement_index, patch_start, patch_stop = task
-        return any(
-            path is None or not path.exists()
-            for path in (
-                block_path(
-                    measurement_index,
-                    patch_start,
-                    patch_stop,
-                    energy_start,
-                    min(energy_start + energy_step, centers.size),
-                )
-                for energy_start in range(0, centers.size, energy_step)
-            )
+        path = task_cache_path(
+            measurement_index,
+            patch_start,
+            patch_stop,
         )
+        return path is None or not path.exists()
 
     def build_task(
         task: tuple[int, int, int],
@@ -1237,17 +1233,12 @@ def build_spectral_response_operator(
             (start, min(start + energy_step, centers.size))
             for start in range(0, centers.size, energy_step)
         )
-        paths = tuple(
-            block_path(
-                measurement_index,
-                patch_start,
-                patch_stop,
-                energy_start,
-                energy_stop,
-            )
-            for energy_start, energy_stop in energy_ranges
+        path = task_cache_path(
+            measurement_index,
+            patch_start,
+            patch_stop,
         )
-        missing = any(path is None or not path.exists() for path in paths)
+        missing = path is None or not path.exists()
         calculated = calculated_response
         if missing and calculated is None:
             calculated = calculate_patch_batch(
@@ -1255,31 +1246,35 @@ def build_spectral_response_operator(
                 patch_start,
                 patch_stop,
             )[0]
+        if missing:
+            assert calculated is not None
+            cached_values = calculated.reshape(centers.size, -1)
+            if path is not None:
+                atomic_save_npy(path, cached_values)
+            hits = 0
+            misses = 1
+        else:
+            assert path is not None
+            cached_values = np.load(path, allow_pickle=False, mmap_mode="r")
+            expected_cache_shape = (
+                centers.size,
+                (patch_stop - patch_start) * len(names),
+            )
+            if cached_values.shape != expected_cache_shape:
+                raise ValueError(
+                    "Cached spectral response has shape "
+                    f"{cached_values.shape}, expected {expected_cache_shape}."
+                )
+            hits = 1
+            misses = 0
         source_indices = np.arange(
             patch_start * len(names),
             patch_stop * len(names),
             dtype=np.int64,
         )
         blocks: list[ResponseBlock] = []
-        hits = 0
-        misses = 0
-        for (energy_start, energy_stop), path in zip(
-            energy_ranges,
-            paths,
-            strict=True,
-        ):
-            if path is not None and path.exists():
-                values = np.load(path, allow_pickle=False, mmap_mode="r")
-                hits += 1
-            else:
-                assert calculated is not None
-                values = calculated[energy_start:energy_stop].reshape(
-                    energy_stop - energy_start,
-                    -1,
-                )
-                if path is not None:
-                    atomic_save_npy(path, values)
-                misses += 1
+        for energy_start, energy_stop in energy_ranges:
+            values = cached_values[energy_start:energy_stop]
             observation_indices = measurement_index * centers.size + np.arange(
                 energy_start,
                 energy_stop,
@@ -1304,16 +1299,16 @@ def build_spectral_response_operator(
             blocks, hits, misses = result
             cache_stats["hits"] += hits
             cache_stats["misses"] += misses
+            cache_stats["files"] += hits + misses
             cache_stats["blocks"] += len(blocks)
             yield from blocks
 
         try:
-            missing_tasks = tuple(
-                task for task in tasks if task_requires_calculation(task)
+            task_states = tuple(
+                (task, task_requires_calculation(task)) for task in tasks
             )
-            cached_tasks = tuple(
-                task for task in tasks if not task_requires_calculation(task)
-            )
+            missing_tasks = tuple(task for task, missing in task_states if missing)
+            cached_tasks = tuple(task for task, missing in task_states if not missing)
             calculation_groups: list[tuple[tuple[int, ...], int, int]] = []
             for patch_start in range(0, patch_count, patch_step):
                 patch_stop = min(patch_start + patch_step, patch_count)
@@ -1415,17 +1410,10 @@ def build_spectral_response_operator(
             "energy_chunk_size": energy_step,
             "patch_chunk_size": patch_step,
             "cache_enabled": cache_root is not None,
+            "cache_file_layout": "measurement_patch_full_energy_v2",
             "cache_stats": cache_stats,
             "device_cache_key": (None if cache_root is None else cache_root.as_posix()),
-            "measurement_row_keys": [
-                _measurement_cache_key(
-                    detector_positions[index],
-                    int(fe_indices[index]),
-                    int(pb_indices[index]),
-                    float(live_times[index]),
-                )
-                for index in range(measurement_count)
-            ],
+            "measurement_row_keys": list(measurement_row_keys),
             "performance": performance,
         },
     )
