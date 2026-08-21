@@ -5,20 +5,37 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.estimator import (
+    _available_cpu_count,
     _bootstrap_worker_count,
+    _compact_bootstrap_estimate,
+    _operator_identifiability,
+    _surface_map_config,
     _uncertainty_invalid_reasons,
 )
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
 from three_d_estimation.response_operator import BlockResponseOperator, ResponseBlock
 from three_d_estimation.uncertainty import (
+    _project_patch_strengths_to_base,
     active_support_laplace,
     augment_clusters_with_laplace,
     bootstrap_uncertainty_summary,
     station_bootstrap_batch,
 )
+
+
+def test_poisson_solver_config_discards_calibrated_overdispersion() -> None:
+    """A supplied calibration artifact must not alter Poisson curvature."""
+    solver_config = _surface_map_config(
+        MLEConfig(mode="spectral", spectral_likelihood="poisson"),
+        overdispersion_alpha_by_bin=np.asarray([0.1, 0.2]),
+    )
+
+    assert solver_config.likelihood_family == "poisson"
+    assert solver_config.overdispersion_alpha == ()
 
 
 def _patch(patch_id: int, x: float, kind: str = "floor") -> SurfacePatch:
@@ -141,6 +158,28 @@ def test_matrix_free_laplace_preserves_cross_chunk_covariance() -> None:
     np.testing.assert_allclose(streamed.covariance, materialized.covariance)
 
 
+def test_matrix_free_identifiability_preserves_cross_chunk_correlation() -> None:
+    """Identifiability must retain source correlations across column blocks."""
+
+    def blocks():
+        """Yield perfectly correlated columns in separate source chunks."""
+        rows = np.asarray([0, 1], dtype=np.int64)
+        values = np.asarray([[1.0], [2.0]])
+        yield ResponseBlock(rows, np.asarray([0]), values)
+        yield ResponseBlock(rows, np.asarray([1]), values)
+
+    operator = BlockResponseOperator((2, 1), 2, 1, blocks)
+    diagnostics = _operator_identifiability(
+        operator,
+        np.ones((2, 1), dtype=np.float64),
+        np.asarray([0, 1], dtype=np.int64),
+        0.99,
+    )
+
+    assert np.isclose(diagnostics["maximum_column_correlation"], 1.0)
+    assert diagnostics["high_correlation_pairs"] == [[0, 1]]
+
+
 def test_station_bootstrap_preserves_complete_station_blocks() -> None:
     """Bootstrap rows must repeat whole station programs, never single views."""
     result = station_bootstrap_batch(_batch(), np.random.default_rng(4))
@@ -154,14 +193,64 @@ def test_station_bootstrap_preserves_complete_station_blocks() -> None:
 
 def test_gpu_bootstrap_serializes_sparse_solver_replicates() -> None:
     """CUDA bootstrap must not run sparse TV kernels on concurrent streams."""
-    assert _bootstrap_worker_count(
-        MLEConfig(use_gpu=True, bootstrap_batch_size=4),
-        32,
-    ) == 1
-    assert _bootstrap_worker_count(
-        MLEConfig(use_gpu=False, bootstrap_batch_size=4),
-        32,
-    ) == 4
+    assert (
+        _bootstrap_worker_count(
+            MLEConfig(use_gpu=True, bootstrap_batch_size=4),
+            32,
+        )
+        == 1
+    )
+    assert (
+        _bootstrap_worker_count(
+            MLEConfig(use_gpu=False, bootstrap_batch_size=4),
+            32,
+        )
+        == 4
+    )
+
+
+def test_bootstrap_retention_drops_observation_sized_predictions() -> None:
+    """Accepted replicates must retain only map and quality summary state."""
+    estimate = replace(
+        _estimate(0.0),
+        diagnostics={
+            **_estimate(0.0).diagnostics,
+            "kkt_residual": 1.0e-6,
+            "pearson_dispersion": 1.1,
+            "large_payload": list(range(100)),
+        },
+    )
+
+    compact = _compact_bootstrap_estimate(estimate)
+
+    assert compact.predicted_spectra is None
+    assert compact.predicted_isotope_counts is None
+    assert set(compact.diagnostics) == {
+        "hotspot_clusters",
+        "kkt_residual",
+        "pearson_dispersion",
+    }
+
+
+def test_available_cpu_count_falls_back_when_affinity_query_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU budgeting must survive unsupported affinity queries."""
+
+    def unavailable_affinity(_pid: int) -> set[int]:
+        """Represent an operating system without an affinity query."""
+        raise OSError("unsupported")
+
+    monkeypatch.setattr(
+        "three_d_estimation.estimator.os.sched_getaffinity",
+        unavailable_affinity,
+    )
+    monkeypatch.setattr(
+        "three_d_estimation.estimator.os.cpu_count",
+        lambda: 7,
+    )
+
+    assert _available_cpu_count() == 7
 
 
 def test_uncertainty_quality_gates_fail_closed() -> None:
@@ -251,6 +340,87 @@ def test_bootstrap_cluster_matching_is_one_to_one_per_replicate() -> None:
     assert sorted(
         float(cluster["bootstrap_selection_frequency"]) for cluster in clusters
     ) == [0.0, 1.0]
+
+
+def test_bootstrap_projection_preserves_mass_across_patch_grids() -> None:
+    """Coarse and refined bootstrap grids must map by physical overlap."""
+
+    def patch(patch_id: int, x0: float, x1: float) -> SurfacePatch:
+        """Return one rectangle on a common floor object."""
+        area = x1 - x0
+        return SurfacePatch(
+            patch_id=patch_id,
+            centroid_xyz=np.asarray([0.5 * (x0 + x1), 0.5, 0.0]),
+            normal_xyz=np.asarray([0.0, 0.0, 1.0]),
+            area_m2=area,
+            surface_kind="floor",
+            object_id="shared-floor",
+            vertices_xyz=np.asarray(
+                [
+                    [x0, 0.0, 0.0],
+                    [x1, 0.0, 0.0],
+                    [x1, 1.0, 0.0],
+                    [x0, 1.0, 0.0],
+                ]
+            ),
+            quadrature_points_xyz=np.asarray([[0.5 * (x0 + x1), 0.5, 0.0]]),
+            quadrature_weights=np.asarray([1.0]),
+        )
+
+    base_patches = (patch(1, 0.0, 0.5), patch(2, 0.5, 1.0))
+    replicate_patches = (patch(99, 0.0, 1.0),)
+    projection = _project_patch_strengths_to_base(
+        base_patches,
+        replicate_patches,
+    )
+
+    np.testing.assert_allclose(projection, [[0.5], [0.5]])
+    np.testing.assert_allclose(np.sum(projection, axis=0), 1.0)
+
+
+def test_bootstrap_rejects_remote_cluster_on_same_isotope() -> None:
+    """A remote invalid centroid must not match solely by isotope label."""
+    remote = _estimate(0.0)
+    remote = replace(
+        remote,
+        diagnostics={
+            **remote.diagnostics,
+            "hotspot_clusters": [
+                {
+                    **remote.diagnostics["hotspot_clusters"][0],
+                    "centroid_xyz": [100.0, 100.0, 100.0],
+                }
+            ],
+        },
+    )
+
+    _summary, clusters = bootstrap_uncertainty_summary(
+        _estimate(0.0),
+        (remote,),
+        confidence_level=0.95,
+    )
+
+    assert clusters[0]["bootstrap_selection_frequency"] == 0.0
+
+
+def test_zero_strength_bootstrap_reports_unavailable_z_without_nan() -> None:
+    """All-zero replicates must return an explicit JSON-safe z status."""
+    zero = replace(
+        _estimate(0.0),
+        density_by_isotope=np.zeros((1, 2)),
+        patch_strength_by_isotope=np.zeros((1, 2)),
+    )
+
+    summary, _clusters_result = bootstrap_uncertainty_summary(
+        _estimate(0.0),
+        (zero,),
+        confidence_level=0.95,
+    )
+    isotope = summary["isotopes"]["Cs-137"]
+
+    assert isotope["z_interval_m"] is None
+    assert isotope["z_interval_status"] == "unavailable_zero_strength"
+    assert isotope["patch_selection_frequency"] == [0.0, 0.0]
 
 
 def test_laplace_covariance_is_attached_to_cluster_source_modes() -> None:

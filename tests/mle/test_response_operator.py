@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from typing import BinaryIO
 
 import numpy as np
@@ -14,8 +15,11 @@ import pytest
 from three_d_estimation import response_operator
 from three_d_estimation.response_operator import (
     BlockResponseOperator,
+    LineFactorizedResponseOperator,
     ResponseBlock,
+    ResponseOperator,
     atomic_save_npy,
+    weighted_response_gram,
 )
 
 
@@ -38,6 +42,57 @@ def _operator() -> BlockResponseOperator:
             yield ResponseBlock(rows, np.arange(2, dtype=np.int64), matrix[rows])
 
     return BlockResponseOperator((2, 2), 2, 1, blocks)
+
+
+def _line_factorized_operator() -> LineFactorizedResponseOperator:
+    """Return a small exact response with three lines and two isotopes."""
+    spatial_factors = np.asarray(
+        [
+            [[1.0, 0.5, 0.2], [0.3, 1.2, 0.4], [0.7, 0.1, 0.9]],
+            [[0.8, 0.4, 0.6], [1.1, 0.2, 0.5], [0.2, 0.9, 0.3]],
+        ],
+        dtype=np.float64,
+    )
+    pulse_shapes = np.asarray(
+        [
+            [0.7, 0.2, 0.1, 0.0],
+            [0.0, 0.2, 0.5, 0.3],
+            [0.1, 0.3, 0.4, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    return LineFactorizedResponseOperator(
+        spatial_factors,
+        pulse_shapes,
+        np.asarray([0, 1, 0], dtype=np.int64),
+        2,
+        energy_chunk_size=2,
+        patch_chunk_size=2,
+    )
+
+
+def _dense_line_response(
+    operator: LineFactorizedResponseOperator,
+) -> np.ndarray:
+    """Expand line factors independently as a deterministic test oracle."""
+    measurement_count, energy_count = operator.observation_shape
+    dense = np.zeros(
+        (
+            measurement_count,
+            energy_count,
+            operator.patch_count,
+            operator.isotope_count,
+        ),
+        dtype=np.float64,
+    )
+    for line_index, isotope_index in enumerate(operator.line_isotope_indices.tolist()):
+        dense[:, :, :, isotope_index] += np.einsum(
+            "mg,b->mbg",
+            operator.spatial_factors[:, :, line_index],
+            operator.pulse_shapes[line_index],
+        )
+    dense *= operator.source_mask[None, None, :, :]
+    return dense
 
 
 @pytest.mark.parametrize(
@@ -127,6 +182,117 @@ def test_selection_and_masking_are_stable_views() -> None:
         operator.select_measurements([0, 0])
     with pytest.raises(TypeError, match="boolean"):
         operator.masked_sources([1, 0])
+
+
+def test_line_factorization_matches_dense_products_and_sums() -> None:
+    """Factorized products, sums, and blocks must equal dense line expansion."""
+    operator = _line_factorized_operator()
+    dense = _dense_line_response(operator)
+    matrix = dense.reshape(operator.observation_count, operator.source_count)
+    source = np.linspace(0.2, 1.3, operator.source_count)
+    observations = np.linspace(0.1, 0.8, operator.observation_count)
+
+    np.testing.assert_allclose(operator.materialize(), dense, rtol=1.0e-14)
+    np.testing.assert_allclose(operator.matvec(source), matrix @ source)
+    np.testing.assert_allclose(operator.rmatvec(observations), matrix.T @ observations)
+    np.testing.assert_allclose(operator.row_sums(), np.sum(matrix, axis=1))
+    np.testing.assert_allclose(operator.column_sums(), np.sum(matrix, axis=0))
+    np.testing.assert_allclose(
+        np.dot(operator.matvec(source), observations),
+        np.dot(source, operator.rmatvec(observations)),
+    )
+    assert operator.factor_storage_bytes < operator.dense_storage_bytes
+
+
+def test_line_factorization_accumulates_weighted_active_gram_exactly() -> None:
+    """Active Gram reduction must match dense weighted source correlations."""
+    operator = _line_factorized_operator().select_measurements([1, 0])
+    matrix = operator.materialize().reshape(
+        operator.observation_count,
+        operator.source_count,
+    )
+    active = np.asarray([0, 3, 5], dtype=np.int64)
+    weights = np.linspace(0.1, 1.2, operator.observation_count)
+    expected = matrix[:, active].T @ (weights[:, None] * matrix[:, active])
+
+    np.testing.assert_allclose(
+        operator.weighted_gram(active, weights),
+        expected,
+        rtol=1.0e-13,
+        atol=1.0e-14,
+    )
+
+
+def test_weighted_gram_keeps_legacy_structural_operators_compatible() -> None:
+    """The optional Gram accelerator must not expand the base protocol."""
+    delegate = _operator()
+    legacy = SimpleNamespace(
+        observation_shape=delegate.observation_shape,
+        patch_count=delegate.patch_count,
+        isotope_count=delegate.isotope_count,
+        observation_count=delegate.observation_count,
+        source_count=delegate.source_count,
+        iter_blocks=delegate.iter_blocks,
+        matvec=delegate.matvec,
+        rmatvec=delegate.rmatvec,
+        row_sums=delegate.row_sums,
+        column_sums=delegate.column_sums,
+        response_sums=delegate.response_sums,
+        select_measurements=delegate.select_measurements,
+        masked_sources=delegate.masked_sources,
+    )
+    active = np.asarray([0, 1], dtype=np.int64)
+    weights = np.linspace(0.25, 1.0, delegate.observation_count)
+    matrix = delegate.materialize().reshape(
+        delegate.observation_count,
+        delegate.source_count,
+    )
+
+    assert isinstance(legacy, ResponseOperator)
+    np.testing.assert_allclose(
+        weighted_response_gram(legacy, active, weights),
+        matrix.T @ (weights[:, None] * matrix),
+    )
+
+
+def test_line_factorization_preserves_selection_and_source_masks() -> None:
+    """Factorized views must preserve order and combine immutable masks."""
+    operator = _line_factorized_operator()
+    dense = _dense_line_response(operator)
+    selected = operator.select_measurements([1, 0])
+    mask = np.asarray(
+        [[True, False], [False, True], [True, True]],
+        dtype=bool,
+    )
+    masked = operator.masked_sources(mask)
+    mask[:] = True
+
+    assert selected.backing_spatial_factors is operator.backing_spatial_factors
+    assert masked.backing_spatial_factors is operator.backing_spatial_factors
+    np.testing.assert_allclose(selected.materialize(), dense[[1, 0]])
+    np.testing.assert_allclose(
+        masked.materialize(),
+        dense
+        * np.asarray(
+            [[True, False], [False, True], [True, True]],
+            dtype=bool,
+        )[None, None, :, :],
+    )
+    with pytest.raises(MemoryError, match="above the limit"):
+        operator.materialize(maximum_bytes=operator.dense_storage_bytes - 1)
+
+
+def test_line_factorized_selection_supports_bootstrap_duplicates() -> None:
+    """Replacement sampling must preserve duplicated measurement rows."""
+    operator = _line_factorized_operator()
+    selected = operator.select_measurements([1, 0, 1])
+    source = np.arange(1.0, operator.source_count + 1.0)
+    expected = operator.matvec(source).reshape(operator.observation_shape)[[1, 0, 1]]
+
+    np.testing.assert_allclose(
+        selected.matvec(source).reshape(selected.observation_shape),
+        expected,
+    )
 
 
 @pytest.mark.parametrize("maximum_bytes", [True, 64.0])

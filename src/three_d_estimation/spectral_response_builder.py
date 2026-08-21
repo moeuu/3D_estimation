@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from hashlib import sha256
+from importlib.metadata import PackageNotFoundError, distribution
 import json
 from multiprocessing import get_context
 import os
@@ -15,6 +16,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+from threadpoolctl import threadpool_limits
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
@@ -31,8 +33,7 @@ from spectrum.response_matrix import (
 )
 
 from .response_operator import (
-    BlockResponseOperator,
-    ResponseBlock,
+    LineFactorizedResponseOperator,
     atomic_save_npy,
 )
 
@@ -43,6 +44,7 @@ class _PreparedSpectralIsotope:
 
     isotope_index: int
     isotope: str
+    line_start: int
     weights: NDArray[np.float64]
     positive_line_indices: NDArray[np.int64]
     kernel: ContinuousKernel
@@ -60,18 +62,46 @@ class _SpectralProcessContext:
     areas: NDArray[np.float64]
     quadrature_points: NDArray[np.float64]
     quadrature_weights: NDArray[np.float64]
-    isotope_count: int
+    line_count: int
     prepared_isotopes: tuple[_PreparedSpectralIsotope, ...]
     kernel_chunk_size: int
 
 
 _SPECTRAL_PROCESS_CONTEXT: _SpectralProcessContext | None = None
+_SPECTRAL_THREADPOOL_LIMITER: object | None = None
+
+
+def _available_cpu_count() -> int:
+    """Return the process-affinity CPU count with a portable fallback."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def _fresh_spectral_process_context(
+    context: _SpectralProcessContext,
+) -> _SpectralProcessContext:
+    """Clone physical kernels without serializing parent execution caches."""
+    cloned_kernels: dict[int, ContinuousKernel] = {}
+    prepared_isotopes: list[_PreparedSpectralIsotope] = []
+    for prepared in context.prepared_isotopes:
+        identity = id(prepared.kernel)
+        fresh_kernel = cloned_kernels.get(identity)
+        if fresh_kernel is None:
+            fresh_kernel = replace(prepared.kernel)
+            cloned_kernels[identity] = fresh_kernel
+        prepared_isotopes.append(replace(prepared, kernel=fresh_kernel))
+    return replace(context, prepared_isotopes=tuple(prepared_isotopes))
 
 
 def _initialize_spectral_process(context: _SpectralProcessContext) -> None:
     """Initialize one CPU worker without nested Torch oversubscription."""
-    global _SPECTRAL_PROCESS_CONTEXT
+    global _SPECTRAL_PROCESS_CONTEXT, _SPECTRAL_THREADPOOL_LIMITER
     _SPECTRAL_PROCESS_CONTEXT = context
+    _SPECTRAL_THREADPOOL_LIMITER = threadpool_limits(limits=1)
     try:
         import torch
 
@@ -84,7 +114,7 @@ def _calculate_spectral_context_task(
     context: _SpectralProcessContext,
     task: tuple[tuple[int, ...], int, int],
 ) -> NDArray[np.float64]:
-    """Calculate one exact measurement-batched response chunk."""
+    """Calculate one exact measurement-batched spatial line-factor chunk."""
     measurement_indices, patch_start, patch_stop = task
     selected_measurements = np.asarray(measurement_indices, dtype=np.int64)
     selected_points = context.quadrature_points[patch_start:patch_stop]
@@ -92,12 +122,11 @@ def _calculate_spectral_context_task(
     selected_areas = context.areas[patch_start:patch_stop]
     quadrature_count = int(selected_points.shape[1])
     source_points = selected_points.reshape(-1, 3)
-    response = np.zeros(
+    factors = np.zeros(
         (
             selected_measurements.size,
-            context.prepared_isotopes[0].pulses.shape[1],
             patch_stop - patch_start,
-            context.isotope_count,
+            context.line_count,
         ),
         dtype=np.float64,
     )
@@ -134,14 +163,11 @@ def _calculate_spectral_context_task(
             selected_weights,
             optimize=True,
         )
-        for line_index, weight in enumerate(prepared.weights):
-            response[:, :, :, prepared.isotope_index] += (
-                float(weight)
-                * prepared.pulses[line_index][None, :, None]
-                * spatial[:, None, :, line_index]
-                * selected_areas[None, None, :]
-            )
-    return response
+        line_stop = prepared.line_start + prepared.weights.size
+        factors[:, :, prepared.line_start : line_stop] = (
+            spatial * prepared.weights[None, None, :] * selected_areas[None, :, None]
+        )
+    return factors
 
 
 def _calculate_spectral_process_task(
@@ -301,7 +327,7 @@ class SpectralResponseResult:
 class SpectralResponseOperatorResult:
     """Store a matrix-free density operator and compact nuisance responses."""
 
-    operator: BlockResponseOperator
+    operator: LineFactorizedResponseOperator
     nuisance_response: NDArray[np.float64]
     nuisance_names: tuple[str, ...]
     nuisance_l2_weights: NDArray[np.float64]
@@ -615,8 +641,7 @@ def _joint_line_kernel_values(
     )
     if not np.all(np.isfinite(values)) or np.any(values < 0.0):
         raise ValueError(
-            "Batched selected-pair line kernel must return finite non-negative "
-            "values."
+            "Batched selected-pair line kernel must return finite non-negative values."
         )
     return values
 
@@ -953,39 +978,116 @@ def _hash_array(digest: object, values: NDArray[np.generic]) -> None:
     digest.update(array.tobytes(order="C"))
 
 
-def _spectral_cache_root(
-    cache_directory: str | Path | None,
+def _hash_framed_bytes(digest: object, values: bytes) -> None:
+    """Hash one length-delimited byte sequence without concatenation ambiguity."""
+    digest.update(len(values).to_bytes(8, byteorder="big", signed=False))
+    digest.update(values)
+
+
+def _hash_canonical_value(digest: object, value: object) -> None:
+    """Hash nested physical configuration by value without address-based reprs."""
+    type_name = f"{type(value).__module__}.{type(value).__qualname__}".encode()
+    _hash_framed_bytes(digest, type_name)
+    if value is None:
+        return
+    if isinstance(value, (bool, np.bool_)):
+        digest.update(b"1" if bool(value) else b"0")
+        return
+    if isinstance(value, (int, np.integer)):
+        _hash_framed_bytes(digest, str(int(value)).encode("ascii"))
+        return
+    if isinstance(value, (float, np.floating)):
+        _hash_framed_bytes(digest, float(value).hex().encode("ascii"))
+        return
+    if isinstance(value, str):
+        _hash_framed_bytes(digest, value.encode("utf-8"))
+        return
+    if isinstance(value, bytes):
+        _hash_framed_bytes(digest, value)
+        return
+    if isinstance(value, np.ndarray):
+        _hash_array(digest, value)
+        return
+    if isinstance(value, Mapping):
+        digest.update(len(value).to_bytes(8, byteorder="big", signed=False))
+        keyed_digests: list[tuple[bytes, object]] = []
+        for key in value:
+            key_digest = sha256()
+            _hash_canonical_value(key_digest, key)
+            keyed_digests.append((key_digest.digest(), key))
+        for _, key in sorted(keyed_digests, key=lambda item: item[0]):
+            _hash_canonical_value(digest, key)
+            _hash_canonical_value(digest, value[key])
+        return
+    if isinstance(value, (tuple, list)):
+        digest.update(len(value).to_bytes(8, byteorder="big", signed=False))
+        for item in value:
+            _hash_canonical_value(digest, item)
+        return
+    if is_dataclass(value) and not isinstance(value, type):
+        selected_fields = tuple(field for field in fields(value) if field.init)
+        digest.update(len(selected_fields).to_bytes(8, byteorder="big", signed=False))
+        for field in selected_fields:
+            _hash_canonical_value(digest, field.name)
+            _hash_canonical_value(digest, getattr(value, field.name))
+        return
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, dict):
+        public_attributes = {
+            str(name): item
+            for name, item in attributes.items()
+            if not str(name).startswith("_")
+        }
+        _hash_canonical_value(digest, public_attributes)
+        return
+    raise TypeError(
+        "Physical response cache configuration contains an unsupported "
+        f"value of type {type(value).__qualname__}."
+    )
+
+
+def _spectral_spatial_cache_key(
     *,
     kernel: ContinuousKernel,
     areas: NDArray[np.float64],
     quadrature_points: NDArray[np.float64],
     quadrature_weights: NDArray[np.float64],
-    edges: NDArray[np.float64],
     isotope_lines: Mapping[str, Sequence[Mapping[str, float]]],
-    continuum_to_peak: float,
-    backscatter_fraction: float,
+) -> str:
+    """Return a stable physical-model and patch line-factor cache key."""
+    digest = sha256()
+    digest.update(b"spectral-response-spatial-line-factor-v5\0")
+    try:
+        runtime_distribution = distribution("rotating-shield-simulation-runtime")
+        runtime_identity = (
+            runtime_distribution.version,
+            runtime_distribution.read_text("direct_url.json"),
+        )
+    except PackageNotFoundError:
+        runtime_identity = ("uninstalled", None)
+    _hash_canonical_value(digest, runtime_identity)
+    # ContinuousKernel is owned by the shared runtime. Hash its configured
+    # constructor fields while excluding only the CUDA device ordinal and every
+    # mutable cache/counter. Backend and dtype remain part of the key because
+    # float32 GPU factors must never poison a float64 CPU cache.
+    for field in fields(kernel):
+        if field.init and field.name != "gpu_device":
+            _hash_canonical_value(digest, field.name)
+            _hash_canonical_value(digest, getattr(kernel, field.name))
+    _hash_canonical_value(digest, dict(isotope_lines))
+    for array in (areas, quadrature_points, quadrature_weights):
+        _hash_array(digest, array)
+    return digest.hexdigest()
+
+
+def _spectral_cache_root(
+    cache_directory: str | Path | None,
+    spatial_cache_key: str,
 ) -> Path | None:
-    """Return a physical-model and patch-specific disk-cache namespace."""
+    """Return the optional disk-cache root for one spatial-factor key."""
     if cache_directory is None:
         return None
-    digest = sha256()
-    digest.update(b"spectral-response-block-v1\0")
-    # ContinuousKernel is owned by the shared runtime.  Hash its configured
-    # constructor fields while excluding execution-device choices and every
-    # mutable cache/counter.  This keeps a causal prefix in one cache namespace.
-    physical_kernel_fields = {
-        field.name: repr(getattr(kernel, field.name))
-        for field in fields(kernel)
-        if field.init and field.name not in {"use_gpu", "gpu_device", "gpu_dtype"}
-    }
-    digest.update(json.dumps(physical_kernel_fields, sort_keys=True).encode("utf-8"))
-    digest.update(json.dumps(dict(isotope_lines), sort_keys=True).encode("utf-8"))
-    digest.update(
-        repr((float(continuum_to_peak), float(backscatter_fraction))).encode()
-    )
-    for array in (areas, quadrature_points, quadrature_weights, edges):
-        _hash_array(digest, array)
-    root = Path(cache_directory).expanduser().resolve() / digest.hexdigest()
+    root = Path(cache_directory).expanduser().resolve() / spatial_cache_key
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -1036,13 +1138,12 @@ def build_spectral_response_operator(
     include_low_rank_residual_nuisance: bool = True,
     include_gain_resolution_drift: bool = False,
 ) -> SpectralResponseOperatorResult:
-    """Build a disk-cacheable streaming ``A @ q`` and ``A.T @ r`` operator.
+    """Build an exact disk-cacheable line-factorized spectral operator.
 
-    Emitted blocks are one measurement by an energy-bin chunk by a patch chunk.
-    The disk cache stores the full energy axis for each measurement/patch pair
-    in one contiguous file.  Cache keys are per acquired row, so extending a
-    causal observation prefix writes only files belonging to newly appended
-    measurements without creating one filesystem entry per energy chunk.
+    The disk cache stores one compact patch-by-line factor matrix for each
+    acquired measurement/patch pair. Cache keys are per acquired row, so
+    extending a causal observation prefix writes only newly appended rows.
+    Energy-bin expansion is deferred to bounded products or diagnostics.
     """
     kernel_chunk_size = _positive_integer(chunk_size, name="chunk_size")
     measurement_step = _positive_integer(
@@ -1082,6 +1183,7 @@ def build_spectral_response_operator(
         for isotope in names
     }
     prepared_isotopes: list[_PreparedSpectralIsotope] = []
+    line_count = 0
     for isotope_index, isotope in enumerate(names):
         lines = lines_by_isotope[isotope]
         positive_line_indices = _positive_line_indices(
@@ -1108,6 +1210,7 @@ def build_spectral_response_operator(
             _PreparedSpectralIsotope(
                 isotope_index=isotope_index,
                 isotope=isotope,
+                line_start=line_count,
                 weights=np.asarray(
                     [float(line["weight"]) for line in lines],
                     dtype=np.float64,
@@ -1117,14 +1220,13 @@ def build_spectral_response_operator(
                 pulses=np.ascontiguousarray(pulses, dtype=np.float64),
             )
         )
+        line_count += len(lines)
     work_items = (
         measurement_count
         * patch_count
         * quadrature_count
         * sum(len(lines) for lines in lines_by_isotope.values())
     )
-    if int(worker_count) == 0 and work_items >= 250_000:
-        resolved_workers = min(4, max(1, (os.cpu_count() or 1) // 2))
     if bool(kernel.use_gpu):
         # Concurrent launches through one shared runtime kernel increase device
         # memory pressure and do not improve the already-batched CUDA path.
@@ -1137,17 +1239,14 @@ def build_spectral_response_operator(
         isotope: tuple(float(line["weight"]) for line in lines)
         for isotope, lines in lines_by_isotope.items()
     }
-    cache_root = _spectral_cache_root(
-        cache_directory,
+    spatial_cache_key = _spectral_spatial_cache_key(
         kernel=kernel,
         areas=areas,
         quadrature_points=quadrature_points,
         quadrature_weights=quadrature_weights,
-        edges=edges,
         isotope_lines=lines_by_isotope,
-        continuum_to_peak=continuum_to_peak,
-        backscatter_fraction=backscatter_fraction,
     )
+    cache_root = _spectral_cache_root(cache_directory, spatial_cache_key)
     measurement_row_keys = tuple(
         _measurement_cache_key(
             detector_positions[index],
@@ -1161,8 +1260,10 @@ def build_spectral_response_operator(
     performance: dict[str, object] = {
         "response_construction": {
             "worker_count": resolved_workers,
+            "requested_worker_count": int(worker_count),
             "measurement_chunk_size": measurement_step,
             "estimated_kernel_work_items": work_items,
+            "missing_kernel_work_items": 0,
             "iterations": 0,
             "kernel_batch_calls": 0,
             "kernel_batched_measurements": 0,
@@ -1170,36 +1271,23 @@ def build_spectral_response_operator(
         }
     }
 
-    def task_cache_path(
-        measurement_index: int,
-        patch_start: int,
-        patch_stop: int,
-    ) -> Path | None:
-        """Return one immutable full-energy cache path for a patch task."""
+    def measurement_cache_path(measurement_index: int) -> Path | None:
+        """Return one immutable full-patch line-factor path per unique row."""
         if cache_root is None:
             return None
-        return (
-            cache_root
-            / measurement_row_keys[measurement_index]
-            / f"g{patch_start}-{patch_stop}_all.npy"
-        )
+        return cache_root / measurement_row_keys[measurement_index] / "factors.npy"
 
     def calculate_patch_batch(
         measurement_indices: tuple[int, ...],
         patch_start: int,
         patch_stop: int,
     ) -> NDArray[np.float64]:
-        """Calculate one bounded measurement and patch response batch."""
+        """Calculate one bounded measurement and patch line-factor batch."""
         return _calculate_spectral_context_task(
             process_context,
             (measurement_indices, patch_start, patch_stop),
         )
 
-    tasks = tuple(
-        (measurement_index, patch_start, min(patch_start + patch_step, patch_count))
-        for measurement_index in range(measurement_count)
-        for patch_start in range(0, patch_count, patch_step)
-    )
     process_context = _SpectralProcessContext(
         detector_positions=detector_positions,
         fe_indices=fe_indices,
@@ -1208,156 +1296,115 @@ def build_spectral_response_operator(
         areas=areas,
         quadrature_points=quadrature_points,
         quadrature_weights=quadrature_weights,
-        isotope_count=len(names),
+        line_count=line_count,
         prepared_isotopes=tuple(prepared_isotopes),
         kernel_chunk_size=kernel_chunk_size,
     )
 
-    def task_requires_calculation(task: tuple[int, int, int]) -> bool:
-        """Return whether the contiguous cache file for a task is absent."""
-        measurement_index, patch_start, patch_stop = task
-        path = task_cache_path(
-            measurement_index,
-            patch_start,
-            patch_stop,
-        )
-        return path is None or not path.exists()
+    spatial_factors = np.empty(
+        (measurement_count, patch_count, line_count),
+        dtype=np.float64,
+    )
 
-    def build_task(
-        task: tuple[int, int, int],
-        calculated_response: NDArray[np.float64] | None = None,
-    ) -> tuple[tuple[ResponseBlock, ...], int, int]:
-        """Build or load one patch chunk and return deterministic energy blocks."""
-        measurement_index, patch_start, patch_stop = task
-        energy_ranges = tuple(
-            (start, min(start + energy_step, centers.size))
-            for start in range(0, centers.size, energy_step)
+    started = perf_counter()
+    construction = performance["response_construction"]
+    try:
+        row_members: dict[str, list[int]] = {}
+        for measurement_index, row_key in enumerate(measurement_row_keys):
+            row_members.setdefault(row_key, []).append(measurement_index)
+        representative_indices = tuple(members[0] for members in row_members.values())
+        cached_representatives = tuple(
+            measurement_index
+            for measurement_index in representative_indices
+            if (
+                measurement_cache_path(measurement_index) is not None
+                and measurement_cache_path(measurement_index).exists()
+            )
         )
-        path = task_cache_path(
-            measurement_index,
-            patch_start,
-            patch_stop,
+        cached_set = set(cached_representatives)
+        missing_representatives = tuple(
+            measurement_index
+            for measurement_index in representative_indices
+            if measurement_index not in cached_set
         )
-        missing = path is None or not path.exists()
-        calculated = calculated_response
-        if missing and calculated is None:
-            calculated = calculate_patch_batch(
-                (measurement_index,),
-                patch_start,
-                patch_stop,
-            )[0]
-        if missing:
-            assert calculated is not None
-            cached_values = calculated.reshape(centers.size, -1)
-            if path is not None:
-                atomic_save_npy(path, cached_values)
-            hits = 0
-            misses = 1
-        else:
+        expected_cache_shape = (patch_count, line_count)
+        for measurement_index in cached_representatives:
+            path = measurement_cache_path(measurement_index)
             assert path is not None
             cached_values = np.load(path, allow_pickle=False, mmap_mode="r")
-            expected_cache_shape = (
-                centers.size,
-                (patch_stop - patch_start) * len(names),
-            )
             if cached_values.shape != expected_cache_shape:
                 raise ValueError(
-                    "Cached spectral response has shape "
+                    "Cached spectral line factors have shape "
                     f"{cached_values.shape}, expected {expected_cache_shape}."
                 )
-            hits = 1
-            misses = 0
-        source_indices = np.arange(
-            patch_start * len(names),
-            patch_stop * len(names),
-            dtype=np.int64,
+            for member_index in row_members[measurement_row_keys[measurement_index]]:
+                spatial_factors[member_index] = cached_values
+        calculation_groups: list[tuple[tuple[int, ...], int, int]] = []
+        for patch_start in range(0, patch_count, patch_step):
+            patch_stop = min(patch_start + patch_step, patch_count)
+            calculation_groups.extend(
+                (
+                    missing_representatives[start : start + measurement_step],
+                    patch_start,
+                    patch_stop,
+                )
+                for start in range(0, len(missing_representatives), measurement_step)
+            )
+        missing_work_items = (
+            len(missing_representatives)
+            * patch_count
+            * quadrature_count
+            * sum(len(lines) for lines in lines_by_isotope.values())
         )
-        blocks: list[ResponseBlock] = []
-        for energy_start, energy_stop in energy_ranges:
-            values = cached_values[energy_start:energy_stop]
-            observation_indices = measurement_index * centers.size + np.arange(
-                energy_start,
-                energy_stop,
-                dtype=np.int64,
+        if int(worker_count) == 0:
+            resolved_workers = (
+                min(4, max(1, _available_cpu_count() // 2))
+                if not bool(kernel.use_gpu) and missing_work_items >= 10_000_000
+                else 1
             )
-            blocks.append(
-                ResponseBlock(
-                    observation_indices=observation_indices,
-                    source_indices=source_indices,
-                    values=np.asarray(values, dtype=np.float64),
-                )
+        resolved_workers = min(resolved_workers, _available_cpu_count())
+        resolved_workers = min(
+            resolved_workers,
+            max(1, len(calculation_groups)),
+        )
+        if isinstance(construction, dict):
+            construction["worker_count"] = resolved_workers
+            construction["missing_kernel_work_items"] = missing_work_items
+            construction["kernel_batch_calls"] = len(calculation_groups)
+            construction["kernel_batched_measurements"] = sum(
+                len(group[0]) for group in calculation_groups
             )
-        return tuple(blocks), hits, misses
 
-    def factory() -> object:
-        """Yield bounded blocks with deterministic bounded CPU parallelism."""
-        started = perf_counter()
-        construction = performance["response_construction"]
-
-        def emit(result: tuple[tuple[ResponseBlock, ...], int, int]) -> object:
-            """Record cache counters and yield one task's ordered blocks."""
-            blocks, hits, misses = result
-            cache_stats["hits"] += hits
-            cache_stats["misses"] += misses
-            cache_stats["files"] += hits + misses
-            cache_stats["blocks"] += len(blocks)
-            yield from blocks
-
-        try:
-            task_states = tuple(
-                (task, task_requires_calculation(task)) for task in tasks
+        def consume_group(
+            group: tuple[tuple[int, ...], int, int],
+            calculated: NDArray[np.float64],
+        ) -> None:
+            """Publish one measurement batch into ordered resident factors."""
+            measurement_indices, patch_start, patch_stop = group
+            expected_shape = (
+                len(measurement_indices),
+                patch_stop - patch_start,
+                line_count,
             )
-            missing_tasks = tuple(task for task, missing in task_states if missing)
-            cached_tasks = tuple(task for task, missing in task_states if not missing)
-            calculation_groups: list[tuple[tuple[int, ...], int, int]] = []
-            for patch_start in range(0, patch_count, patch_step):
-                patch_stop = min(patch_start + patch_step, patch_count)
-                missing_measurements = tuple(
-                    measurement_index
-                    for measurement_index, task_patch_start, _ in missing_tasks
-                    if task_patch_start == patch_start
+            if calculated.shape != expected_shape:
+                raise ValueError(
+                    "Calculated spectral line-factor batch has shape "
+                    f"{calculated.shape}, expected {expected_shape}."
                 )
-                calculation_groups.extend(
-                    (
-                        missing_measurements[start : start + measurement_step],
-                        patch_start,
-                        patch_stop,
-                    )
-                    for start in range(0, len(missing_measurements), measurement_step)
-                )
-            if isinstance(construction, dict):
-                construction["kernel_batch_calls"] = int(
-                    construction["kernel_batch_calls"]
-                ) + len(calculation_groups)
-                construction["kernel_batched_measurements"] = int(
-                    construction["kernel_batched_measurements"]
-                ) + sum(len(group[0]) for group in calculation_groups)
+            spatial_factors[
+                np.asarray(measurement_indices, dtype=np.int64),
+                patch_start:patch_stop,
+            ] = calculated
 
-            def emit_group(
-                group: tuple[tuple[int, ...], int, int],
-                calculated: NDArray[np.float64],
-            ) -> object:
-                """Yield one measurement batch as immutable row blocks."""
-                measurement_indices, patch_start, patch_stop = group
-                for local_index, measurement_index in enumerate(measurement_indices):
-                    yield from emit(
-                        build_task(
-                            (measurement_index, patch_start, patch_stop),
-                            calculated[local_index],
-                        )
-                    )
-
-            if resolved_workers == 1 or len(calculation_groups) <= 1:
-                for group in calculation_groups:
-                    calculated = calculate_patch_batch(*group)
-                    yield from emit_group(group, calculated)
-                for task in cached_tasks:
-                    yield from emit(build_task(task))
-                return
+        if resolved_workers == 1 or len(calculation_groups) <= 1:
+            for group in calculation_groups:
+                consume_group(group, calculate_patch_batch(*group))
+        else:
+            worker_context = _fresh_spectral_process_context(process_context)
             with ProcessPoolExecutor(
                 max_workers=resolved_workers,
                 initializer=_initialize_spectral_process,
-                initargs=(process_context,),
+                initargs=(worker_context,),
                 mp_context=get_context("spawn"),
             ) as executor:
                 remaining = iter(calculation_groups)
@@ -1374,12 +1421,15 @@ def build_spectral_response_operator(
                     pending.append(
                         (
                             group,
-                            executor.submit(_calculate_spectral_process_task, group),
+                            executor.submit(
+                                _calculate_spectral_process_task,
+                                group,
+                            ),
                         )
                     )
                 while pending:
                     group, future = pending.popleft()
-                    yield from emit_group(group, future.result())
+                    consume_group(group, future.result())
                     next_group = next(remaining, None)
                     if next_group is not None:
                         pending.append(
@@ -1391,29 +1441,75 @@ def build_spectral_response_operator(
                                 ),
                             )
                         )
-                for task in cached_tasks:
-                    yield from emit(build_task(task))
-        finally:
-            if isinstance(construction, dict):
-                construction["iterations"] = int(construction["iterations"]) + 1
-                construction["elapsed_seconds"] = float(
-                    construction["elapsed_seconds"]
-                ) + (perf_counter() - started)
+        for measurement_index in missing_representatives:
+            row_key = measurement_row_keys[measurement_index]
+            for member_index in row_members[row_key][1:]:
+                spatial_factors[member_index] = spatial_factors[measurement_index]
+            path = measurement_cache_path(measurement_index)
+            if path is not None:
+                atomic_save_npy(path, spatial_factors[measurement_index])
+        unique_row_count = len(representative_indices)
+        cache_stats.update(
+            {
+                "hits": len(cached_representatives),
+                "misses": len(missing_representatives),
+                "files": unique_row_count if cache_root is not None else 0,
+                "blocks": (
+                    unique_row_count
+                    * ((centers.size + energy_step - 1) // energy_step)
+                    * ((patch_count + patch_step - 1) // patch_step)
+                ),
+            }
+        )
+    finally:
+        if isinstance(construction, dict):
+            construction["iterations"] = 1
+            construction["elapsed_seconds"] = perf_counter() - started
 
-    operator = BlockResponseOperator(
-        (measurement_count, centers.size),
-        patch_count,
+    pulse_shapes = np.concatenate(
+        tuple(prepared.pulses for prepared in prepared_isotopes),
+        axis=0,
+    )
+    line_isotope_indices = np.concatenate(
+        tuple(
+            np.full(prepared.weights.size, prepared.isotope_index, dtype=np.int64)
+            for prepared in prepared_isotopes
+        )
+    )
+    device_digest = sha256()
+    _hash_canonical_value(device_digest, spatial_cache_key)
+    _hash_array(device_digest, edges)
+    _hash_canonical_value(
+        device_digest,
+        (float(continuum_to_peak), float(backscatter_fraction)),
+    )
+    device_cache_key = device_digest.hexdigest()
+    operator = LineFactorizedResponseOperator(
+        spatial_factors,
+        pulse_shapes,
+        line_isotope_indices,
         len(names),
-        factory,
+        energy_chunk_size=energy_step,
+        patch_chunk_size=patch_step,
+        _copy_factors=False,
         diagnostics={
-            "response_mode": "matrix_free",
+            "response_mode": "line_factorized",
             "energy_chunk_size": energy_step,
             "patch_chunk_size": patch_step,
             "cache_enabled": cache_root is not None,
-            "cache_file_layout": "measurement_patch_full_energy_v2",
+            "cache_file_layout": "measurement_full_patch_line_factors_v4",
             "cache_stats": cache_stats,
-            "device_cache_key": (None if cache_root is None else cache_root.as_posix()),
+            "device_cache_key": device_cache_key,
             "measurement_row_keys": list(measurement_row_keys),
+            "line_count": line_count,
+            "factor_response_bytes": int(spatial_factors.nbytes + pulse_shapes.nbytes),
+            "dense_response_bytes": int(
+                measurement_count
+                * centers.size
+                * patch_count
+                * len(names)
+                * np.dtype(np.float64).itemsize
+            ),
             "performance": performance,
         },
     )

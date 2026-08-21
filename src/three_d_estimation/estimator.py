@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+import os
 from time import perf_counter
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.special import gammaln
+from threadpoolctl import threadpool_limits
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
@@ -31,7 +33,7 @@ from .postprocess import (
 )
 from .provenance import estimator_provenance
 from .response_builder import build_count_responses
-from .response_operator import ResponseOperator
+from .response_operator import ResponseOperator, weighted_response_gram
 from .solver import (
     SurfaceMapConfig,
     SurfaceMapResult,
@@ -47,10 +49,10 @@ from .spectral_response_builder import (
 from .surface_patches import build_surface_patches, refine_surface_patches
 from .types import MLEEstimate, ObservationBatch, SurfacePatch, SurfacePatchSet
 from .uncertainty import (
+    _station_bootstrap_sample,
     active_support_laplace,
     augment_clusters_with_laplace,
     bootstrap_uncertainty_summary,
-    station_bootstrap_batch,
 )
 
 
@@ -73,10 +75,26 @@ class _FitState:
 
 def _bootstrap_worker_count(config: MLEConfig, replicate_count: int) -> int:
     """Return safe bootstrap concurrency for the configured solver device."""
-    configured = min(int(config.bootstrap_batch_size), int(replicate_count))
+    configured = min(
+        int(config.bootstrap_batch_size),
+        int(replicate_count),
+        _available_cpu_count(),
+    )
     if bool(config.use_gpu):
         return 1
     return configured
+
+
+def _available_cpu_count() -> int:
+    """Return the CPU count available to this process, including affinity."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except OSError:
+            affinity_count = 0
+        if affinity_count > 0:
+            return affinity_count
+    return max(1, os.cpu_count() or 1)
 
 
 def _uncertainty_invalid_reasons(
@@ -100,6 +118,38 @@ def _uncertainty_invalid_reasons(
     return tuple(reasons)
 
 
+def _compact_bootstrap_estimate(estimate: MLEEstimate) -> MLEEstimate:
+    """Drop observation-sized arrays before retaining a bootstrap replicate."""
+    retained_diagnostics = {
+        name: estimate.diagnostics[name]
+        for name in ("hotspot_clusters", "kkt_residual", "pearson_dispersion")
+        if name in estimate.diagnostics
+    }
+    return replace(
+        estimate,
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        diagnostics=retained_diagnostics,
+    )
+
+
+def _deterministic_operator_diagnostics(
+    value: object,
+) -> object:
+    """Copy operator diagnostics while excluding volatile wall-clock timings."""
+    if isinstance(value, Mapping):
+        return {
+            str(name): _deterministic_operator_diagnostics(item)
+            for name, item in value.items()
+            if not str(name).endswith("_seconds")
+        }
+    if isinstance(value, tuple):
+        return tuple(_deterministic_operator_diagnostics(item) for item in value)
+    if isinstance(value, list):
+        return [_deterministic_operator_diagnostics(item) for item in value]
+    return value
+
+
 def _uncertainty_interpretation(
     estimate: MLEEstimate,
     config: MLEConfig,
@@ -109,20 +159,14 @@ def _uncertainty_interpretation(
     return {
         "valid_for_physical_interpretation": not reasons,
         "invalid_reasons": list(reasons),
-        "kkt_residual": float(
-            estimate.diagnostics.get("kkt_residual", float("inf"))
-        ),
+        "kkt_residual": float(estimate.diagnostics.get("kkt_residual", float("inf"))),
         "kkt_tolerance": (
-            None
-            if config.kkt_tolerance is None
-            else float(config.kkt_tolerance)
+            None if config.kkt_tolerance is None else float(config.kkt_tolerance)
         ),
         "pearson_dispersion": float(
             estimate.diagnostics.get("pearson_dispersion", float("inf"))
         ),
-        "pearson_dispersion_limit": float(
-            config.debias_max_pearson_dispersion
-        ),
+        "pearson_dispersion_limit": float(config.debias_max_pearson_dispersion),
     }
 
 
@@ -157,22 +201,21 @@ def _surface_map_config(
         ),
         overdispersion_alpha=(
             ()
-            if overdispersion_alpha_by_bin is None
+            if (
+                config.spectral_likelihood != "calibrated_overdispersed"
+                or overdispersion_alpha_by_bin is None
+            )
             else tuple(
                 float(value)
                 for value in np.asarray(overdispersion_alpha_by_bin, dtype=float)
             )
         ),
         max_iterations=int(config.max_iterations),
-        poisson_em_warm_start_iterations=int(
-            config.poisson_em_warm_start_iterations
-        ),
+        poisson_em_warm_start_iterations=int(config.poisson_em_warm_start_iterations),
         tolerance=float(config.tolerance),
         objective_tolerance=float(config.objective_tolerance),
         kkt_tolerance=(
-            None
-            if config.kkt_tolerance is None
-            else float(config.kkt_tolerance)
+            None if config.kkt_tolerance is None else float(config.kkt_tolerance)
         ),
         check_interval=int(config.check_interval),
         step_safety=float(config.step_safety),
@@ -336,10 +379,18 @@ def _fit_problem(
     initial_densities: NDArray[np.float64] | None = None,
     initial_nuisance: NDArray[np.float64] | None = None,
     persistent_response_cache: dict[str, object] | None = None,
+    precomputed_spectral_details: SpectralResponseOperatorResult | None = None,
     progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     progress_label: str = "base",
 ) -> _FitState:
     """Build the configured forward model and solve one patch resolution."""
+    if bool(config.use_gpu) and (
+        config.mode != "spectral" or config.spectral_response_mode != "matrix_free"
+    ):
+        raise ValueError(
+            "GPU estimation requires spectral matrix_free response mode; "
+            "count and materialized modes are CPU-only."
+        )
     response_started = perf_counter()
     if progress_hook is not None:
         progress_hook(
@@ -375,40 +426,67 @@ def _fit_problem(
         observed = batch.isotope_counts
         spectral_details = None
     elif config.spectral_response_mode == "matrix_free":
-        calibration = (
-            None
-            if config.discrepancy_calibration_path is None
-            else load_discrepancy_calibration(config.discrepancy_calibration_path)
-        )
-        spectral_details = build_spectral_response_operator(
-            batch,
-            patches,
-            config.isotope_names,
-            kernel,
-            chunk_size=int(config.response_chunk_size),
-            measurement_chunk_size=int(config.response_measurement_chunk_size),
-            energy_chunk_size=int(config.response_energy_chunk_size),
-            patch_chunk_size=int(config.response_patch_chunk_size),
-            worker_count=int(config.response_worker_count),
-            cache_directory=config.response_cache_dir,
-            continuum_to_peak=float(config.continuum_to_peak),
-            backscatter_fraction=float(config.backscatter_fraction),
-            require_line_resolved=True,
-            include_background_nuisance=bool(config.fit_background_nuisance),
-            include_scatter_nuisance=bool(config.fit_scatter_nuisance),
-            discrepancy_calibration=calibration,
-            include_shield_leakage_nuisance=bool(config.fit_shield_leakage_nuisance),
-            include_station_rate_nuisance=bool(config.fit_station_rate_nuisance),
-            include_low_rank_residual_nuisance=bool(
-                config.fit_low_rank_residual_nuisance
-            ),
-            include_gain_resolution_drift=bool(config.fit_gain_resolution_drift),
-        )
+        if precomputed_spectral_details is None:
+            calibration = (
+                None
+                if config.discrepancy_calibration_path is None
+                else load_discrepancy_calibration(config.discrepancy_calibration_path)
+            )
+            spectral_details = build_spectral_response_operator(
+                batch,
+                patches,
+                config.isotope_names,
+                kernel,
+                chunk_size=int(config.response_chunk_size),
+                measurement_chunk_size=int(config.response_measurement_chunk_size),
+                energy_chunk_size=int(config.response_energy_chunk_size),
+                patch_chunk_size=int(config.response_patch_chunk_size),
+                worker_count=int(config.response_worker_count),
+                cache_directory=config.response_cache_dir,
+                continuum_to_peak=float(config.continuum_to_peak),
+                backscatter_fraction=float(config.backscatter_fraction),
+                require_line_resolved=True,
+                include_background_nuisance=bool(config.fit_background_nuisance),
+                include_scatter_nuisance=bool(config.fit_scatter_nuisance),
+                discrepancy_calibration=calibration,
+                include_shield_leakage_nuisance=bool(
+                    config.fit_shield_leakage_nuisance
+                ),
+                include_station_rate_nuisance=bool(config.fit_station_rate_nuisance),
+                include_low_rank_residual_nuisance=bool(
+                    config.fit_low_rank_residual_nuisance
+                ),
+                include_gain_resolution_drift=bool(config.fit_gain_resolution_drift),
+            )
+        else:
+            spectral_details = precomputed_spectral_details
+            expected_observation_shape = (
+                batch.measurement_count,
+                batch.energy_bin_count,
+            )
+            if spectral_details.operator.observation_shape != (
+                expected_observation_shape
+            ) or (
+                spectral_details.operator.patch_count != patches.patch_count
+                or spectral_details.operator.isotope_count != len(config.isotope_names)
+                or spectral_details.nuisance_response.shape[:2]
+                != expected_observation_shape
+            ):
+                raise ValueError(
+                    "Precomputed spectral response does not match bootstrap axes."
+                )
         response = spectral_details.operator
         nuisance_response = spectral_details.nuisance_response
         nuisance_names = spectral_details.nuisance_names
         nuisance_l2_weights = spectral_details.nuisance_l2_weights
-        overdispersion_alpha = spectral_details.overdispersion_alpha_by_bin
+        overdispersion_alpha = (
+            spectral_details.overdispersion_alpha_by_bin
+            if config.spectral_likelihood == "calibrated_overdispersed"
+            else np.zeros_like(
+                spectral_details.overdispersion_alpha_by_bin,
+                dtype=np.float64,
+            )
+        )
         observed = batch.spectrum_counts
         likelihood_diagnostics = {
             "family": config.spectral_likelihood,
@@ -443,7 +521,14 @@ def _fit_problem(
         nuisance_response = spectral_details.nuisance_response
         nuisance_names = spectral_details.nuisance_names
         nuisance_l2_weights = spectral_details.nuisance_l2_weights
-        overdispersion_alpha = spectral_details.overdispersion_alpha_by_bin
+        overdispersion_alpha = (
+            spectral_details.overdispersion_alpha_by_bin
+            if config.spectral_likelihood == "calibrated_overdispersed"
+            else np.zeros_like(
+                spectral_details.overdispersion_alpha_by_bin,
+                dtype=np.float64,
+            )
+        )
         observed = batch.spectrum_counts
         likelihood_diagnostics = {
             "family": config.spectral_likelihood,
@@ -862,17 +947,7 @@ def _operator_identifiability(
         values = densities.reshape(-1)[active]
         active = active[np.argsort(values)[-256:]]
     selected = operator.select_measurements(fit_indices.tolist())
-    gram = np.zeros((active.size, active.size), dtype=np.float64)
-    active_lookup = np.full(operator.source_count, -1, dtype=np.int64)
-    active_lookup[active] = np.arange(active.size, dtype=np.int64)
-    for block in selected.iter_blocks():
-        local = active_lookup[block.source_indices]
-        keep = local >= 0
-        if not np.any(keep):
-            continue
-        values = block.values[:, keep]
-        indices = local[keep]
-        gram[np.ix_(indices, indices)] += values.T @ values
+    gram = weighted_response_gram(selected, active)
     norms = np.sqrt(np.maximum(np.diag(gram), 0.0))
     denominator = norms[:, None] * norms[None, :]
     correlation = np.divide(
@@ -1206,6 +1281,7 @@ class SurfaceMLEEstimator:
         obstacle_grid: ObstacleGrid | None = None,
         initial_estimate: MLEEstimate | None = None,
         fixed_patches: SurfacePatchSet | None = None,
+        _precomputed_spectral_details: SpectralResponseOperatorResult | None = None,
     ) -> MLEEstimate:
         """Fit all history with optional warm start and fixed patch dictionary."""
         if tuple(batch.isotope_names) != tuple(self.config.isotope_names):
@@ -1293,13 +1369,12 @@ class SurfaceMLEEstimator:
             initial_densities=initial_densities,
             initial_nuisance=initial_nuisance,
             persistent_response_cache=self._persistent_response_cache,
+            precomputed_spectral_details=_precomputed_spectral_details,
             progress_hook=self._progress_hook,
             progress_label="base",
         )
         refinement_levels = (
-            int(self.config.coarse_to_fine_levels)
-            if fixed_patches is None
-            else 0
+            int(self.config.coarse_to_fine_levels) if fixed_patches is None else 0
         )
         for level in range(refinement_levels):
             selected = _refinement_patch_ids(
@@ -1460,7 +1535,7 @@ class SurfaceMLEEstimator:
                 for key, values in state.spectral_details.line_weights_by_isotope.items()
             }
             if isinstance(state.spectral_details, SpectralResponseOperatorResult):
-                diagnostics["response_operator"] = dict(
+                diagnostics["response_operator"] = _deterministic_operator_diagnostics(
                     state.spectral_details.operator.diagnostics
                 )
                 diagnostics["response_cache_directory"] = (
@@ -1587,6 +1662,8 @@ class SurfaceMLEEstimator:
         bootstrap_rejections: dict[str, int] = {}
         replicate_count = int(self.config.station_bootstrap_replicates)
         bootstrap_seconds = 0.0
+        effective_torch_threads: int | None = None
+        effective_blas_threads: int | None = None
 
         def record_bootstrap_estimate(candidate: MLEEstimate) -> None:
             """Accept only replicates that pass the same physical quality gates."""
@@ -1597,7 +1674,7 @@ class SurfaceMLEEstimator:
                         bootstrap_rejections.get(reason, 0) + 1
                     )
                 return
-            bootstrap_estimates.append(candidate)
+            bootstrap_estimates.append(_compact_bootstrap_estimate(candidate))
 
         if replicate_count:
             bootstrap_started = perf_counter()
@@ -1639,24 +1716,64 @@ class SurfaceMLEEstimator:
                 if self.config.bootstrap_refit_mode == "fixed_final_grid"
                 else None
             )
-            replicate_batches = tuple(
-                station_bootstrap_batch(batch, rng)
-                for _replicate in range(replicate_count)
+            reusable_bootstrap_details = (
+                state.spectral_details
+                if (
+                    fixed_bootstrap_patches is not None
+                    and isinstance(
+                        state.spectral_details,
+                        SpectralResponseOperatorResult,
+                    )
+                    and not self.config.fit_station_rate_nuisance
+                )
+                else None
             )
+
+            def bootstrap_sample() -> tuple[
+                ObservationBatch,
+                SpectralResponseOperatorResult | None,
+            ]:
+                """Return one resample with a zero-copy factor response view."""
+                replicate_batch, original_indices = _station_bootstrap_sample(
+                    batch,
+                    rng,
+                )
+                if reusable_bootstrap_details is None:
+                    return replicate_batch, None
+                return (
+                    replicate_batch,
+                    replace(
+                        reusable_bootstrap_details,
+                        operator=(
+                            reusable_bootstrap_details.operator.select_measurements(
+                                original_indices.tolist()
+                            )
+                        ),
+                        nuisance_response=(
+                            reusable_bootstrap_details.nuisance_response[
+                                original_indices
+                            ]
+                        ),
+                    ),
+                )
+
             configured_batch_size = min(
                 int(self.config.bootstrap_batch_size),
                 replicate_count,
             )
             batch_size = _bootstrap_worker_count(self.config, replicate_count)
+            if batch_size > 1:
+                bootstrap_config = replace(
+                    bootstrap_config,
+                    response_worker_count=1,
+                )
             if batch_size == 1:
                 bootstrap_estimator = SurfaceMLEEstimator(
                     bootstrap_config,
                     persistent_response_cache=self._persistent_response_cache,
                 )
-                for replicate_index, replicate_batch in enumerate(
-                    replicate_batches,
-                    start=1,
-                ):
+                for replicate_index in range(1, replicate_count + 1):
+                    replicate_batch, replicate_details = bootstrap_sample()
                     record_bootstrap_estimate(
                         bootstrap_estimator.fit(
                             replicate_batch,
@@ -1665,6 +1782,7 @@ class SurfaceMLEEstimator:
                             obstacle_grid=obstacle_grid,
                             initial_estimate=estimate,
                             fixed_patches=fixed_bootstrap_patches,
+                            _precomputed_spectral_details=replicate_details,
                         )
                     )
                     self._report_bootstrap_progress(
@@ -1679,10 +1797,15 @@ class SurfaceMLEEstimator:
                 )
 
                 def fit_replicate(
-                    replicate_batch: ObservationBatch,
+                    replicate: tuple[
+                        ObservationBatch,
+                        SpectralResponseOperatorResult | None,
+                    ],
                 ) -> MLEEstimate:
                     """Fit one exact replicate with shared immutable GPU rows."""
+                    replicate_batch, replicate_details = replicate
                     local_cache: dict[str, object] = {"entries": dict(response_entries)}
+                    replicate_kernel = replace(kernel)
                     replicate_estimator = SurfaceMLEEstimator(
                         bootstrap_config,
                         persistent_response_cache=local_cache,
@@ -1691,10 +1814,11 @@ class SurfaceMLEEstimator:
                         return replicate_estimator.fit(
                             replicate_batch,
                             environment,
-                            kernel,
+                            replicate_kernel,
                             obstacle_grid=obstacle_grid,
                             initial_estimate=estimate,
                             fixed_patches=fixed_bootstrap_patches,
+                            _precomputed_spectral_details=replicate_details,
                         )
                     import torch
 
@@ -1704,25 +1828,55 @@ class SurfaceMLEEstimator:
                         result = replicate_estimator.fit(
                             replicate_batch,
                             environment,
-                            kernel,
+                            replicate_kernel,
                             obstacle_grid=obstacle_grid,
                             initial_estimate=estimate,
                             fixed_patches=fixed_bootstrap_patches,
+                            _precomputed_spectral_details=replicate_details,
                         )
                     stream.synchronize()
                     return result
 
-                with ThreadPoolExecutor(max_workers=batch_size) as executor:
-                    for replicate_index, result in enumerate(
-                        executor.map(fit_replicate, replicate_batches),
-                        start=1,
+                import torch
+
+                previous_torch_threads = int(torch.get_num_threads())
+                available_cpus = _available_cpu_count()
+                effective_torch_threads = min(
+                    previous_torch_threads,
+                    max(1, available_cpus // batch_size),
+                )
+                effective_blas_threads = max(1, available_cpus // batch_size)
+                torch.set_num_threads(effective_torch_threads)
+                try:
+                    with threadpool_limits(
+                        limits=effective_blas_threads,
+                        user_api="blas",
                     ):
-                        record_bootstrap_estimate(result)
-                        self._report_bootstrap_progress(
-                            replicate_index,
-                            replicate_count,
-                            bootstrap_started,
-                        )
+                        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                            completed = 0
+                            while completed < replicate_count:
+                                chunk_count = min(
+                                    batch_size,
+                                    replicate_count - completed,
+                                )
+                                replicate_batches = tuple(
+                                    bootstrap_sample()
+                                    for _replicate in range(chunk_count)
+                                )
+                                futures = tuple(
+                                    executor.submit(fit_replicate, replicate_batch)
+                                    for replicate_batch in replicate_batches
+                                )
+                                for future in futures:
+                                    record_bootstrap_estimate(future.result())
+                                    completed += 1
+                                    self._report_bootstrap_progress(
+                                        completed,
+                                        replicate_count,
+                                        bootstrap_started,
+                                    )
+                finally:
+                    torch.set_num_threads(previous_torch_threads)
             bootstrap_seconds = perf_counter() - bootstrap_started
         minimum_valid_replicates = (
             0
@@ -1730,8 +1884,7 @@ class SurfaceMLEEstimator:
             else min(replicate_count, max(20, (4 * replicate_count + 4) // 5))
         )
         bootstrap_sample_valid = (
-            replicate_count == 0
-            or len(bootstrap_estimates) >= minimum_valid_replicates
+            replicate_count == 0 or len(bootstrap_estimates) >= minimum_valid_replicates
         )
         bootstrap, augmented_clusters = bootstrap_uncertainty_summary(
             estimate,
@@ -1754,6 +1907,14 @@ class SurfaceMLEEstimator:
                         self.config.use_gpu and configured_batch_size > 1
                     ),
                     "shared_response_cache": True,
+                    "zero_copy_factor_resampling": bool(
+                        reusable_bootstrap_details is not None
+                    ),
+                    "response_worker_count": int(
+                        bootstrap_config.response_worker_count
+                    ),
+                    "torch_threads_per_fit": effective_torch_threads,
+                    "blas_threads_per_fit": effective_blas_threads,
                     "warm_started_from_full_estimate": True,
                     "refit_mode": self.config.bootstrap_refit_mode,
                     "conditional_on_final_patch_dictionary": bool(
@@ -1779,9 +1940,7 @@ class SurfaceMLEEstimator:
             ),
             "station_bootstrap": bootstrap,
         }
-        uncertainty_reasons = list(
-            _uncertainty_invalid_reasons(estimate, self.config)
-        )
+        uncertainty_reasons = list(_uncertainty_invalid_reasons(estimate, self.config))
         if replicate_count and not bootstrap_sample_valid:
             uncertainty_reasons.append("insufficient_valid_bootstrap_replicates")
         uncertainty["interpretation"] = _uncertainty_interpretation(

@@ -8,8 +8,8 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from .response_operator import ResponseOperator
-from .types import MLEEstimate, ObservationBatch
+from .response_operator import ResponseOperator, weighted_response_gram
+from .types import MLEEstimate, ObservationBatch, SurfacePatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,24 +93,9 @@ def active_support_laplace(
             raise ValueError("Laplace overdispersion alpha must match spectrum bins.")
         variance = selected_mean + alpha[None, :] * selected_mean**2
     weights = 1.0 / np.maximum(variance.reshape(-1), 1.0e-12)
-    gram = np.zeros((active.size, active.size), dtype=np.float64)
     if isinstance(response, ResponseOperator):
         selected = response.select_measurements(fit_indices.tolist())
-        lookup = np.full(response.source_count, -1, dtype=np.int64)
-        lookup[active] = np.arange(active.size, dtype=np.int64)
-        active_design = np.zeros(
-            (selected.observation_count, active.size),
-            dtype=np.float64,
-        )
-        for block in selected.iter_blocks():
-            local = lookup[block.source_indices]
-            keep = local >= 0
-            if not np.any(keep):
-                continue
-            active_design[np.ix_(block.observation_indices, local[keep])] += (
-                block.values[:, keep]
-            )
-        gram = active_design.T @ (weights[:, None] * active_design)
+        gram = weighted_response_gram(selected, active, weights)
     else:
         values = np.asarray(response, dtype=float)[fit_indices]
         isotope_count = density.shape[1]
@@ -136,11 +121,11 @@ def active_support_laplace(
     )
 
 
-def station_bootstrap_batch(
+def _station_bootstrap_sample(
     batch: ObservationBatch,
     rng: np.random.Generator,
-) -> ObservationBatch:
-    """Resample whole station blocks with replacement and renumber causally."""
+) -> tuple[ObservationBatch, NDArray[np.int64]]:
+    """Return one station-block resample and its original row indices."""
     station_ids = np.unique(batch.station_ids)
     sampled = rng.choice(station_ids, size=station_ids.size, replace=True)
     rows: list[int] = []
@@ -153,7 +138,7 @@ def station_bootstrap_batch(
         new_blocks.extend([f"bootstrap-station:{new_station}"] * selected.size)
     indices = np.asarray(rows, dtype=np.int64)
     measurement_count = indices.size
-    return ObservationBatch(
+    resampled = ObservationBatch(
         detector_positions_xyz=batch.detector_positions_xyz[indices],
         detector_quaternions_wxyz=batch.detector_quaternions_wxyz[indices],
         fe_indices=batch.fe_indices[indices],
@@ -182,6 +167,16 @@ def station_bootstrap_batch(
         shield_actuation_times_s=batch.shield_actuation_times_s[indices],
         shield_program_block_ids=tuple(new_blocks),
     )
+    indices.setflags(write=False)
+    return resampled, indices
+
+
+def station_bootstrap_batch(
+    batch: ObservationBatch,
+    rng: np.random.Generator,
+) -> ObservationBatch:
+    """Resample whole station blocks with replacement and renumber causally."""
+    return _station_bootstrap_sample(batch, rng)[0]
 
 
 def augment_clusters_with_laplace(
@@ -280,6 +275,135 @@ def _clusters(estimate: MLEEstimate) -> list[dict[str, object]]:
     return [dict(value) for value in raw if isinstance(value, Mapping)]
 
 
+def _project_patch_strengths_to_base(
+    base_patches: Sequence[SurfacePatch],
+    replicate_patches: Sequence[SurfacePatch],
+) -> NDArray[np.float64]:
+    """Return a mass-preserving rectangle-overlap projection onto base patches."""
+    base = tuple(base_patches)
+    replicate = tuple(replicate_patches)
+    projection = np.zeros((len(base), len(replicate)), dtype=np.float64)
+    base_groups: dict[tuple[str, str], list[int]] = {}
+    replicate_groups: dict[tuple[str, str], list[int]] = {}
+    for index, patch in enumerate(base):
+        base_groups.setdefault((patch.surface_kind, patch.object_id), []).append(index)
+    for index, patch in enumerate(replicate):
+        replicate_groups.setdefault((patch.surface_kind, patch.object_id), []).append(
+            index
+        )
+    if set(base_groups) != set(replicate_groups):
+        raise ValueError("Bootstrap and base estimates cover different surfaces.")
+    for group_key, base_indices_list in base_groups.items():
+        replicate_indices_list = replicate_groups[group_key]
+        base_indices = np.asarray(base_indices_list, dtype=np.int64)
+        replicate_indices = np.asarray(replicate_indices_list, dtype=np.int64)
+        reference = base[int(base_indices[0])]
+        origin = reference.vertices_xyz[0]
+        u_axis = reference.vertices_xyz[1] - origin
+        v_axis = reference.vertices_xyz[3] - origin
+        u_axis /= np.linalg.norm(u_axis)
+        v_axis /= np.linalg.norm(v_axis)
+        normal = reference.normal_xyz
+        scale = max(
+            1.0,
+            *(float(patch.area_m2) ** 0.5 for patch in base),
+            *(float(patch.area_m2) ** 0.5 for patch in replicate),
+        )
+        tolerance = 1.0e-8 * scale
+
+        def bounds(
+            indices: NDArray[np.int64], patches: tuple[SurfacePatch, ...]
+        ) -> tuple[
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+        ]:
+            """Project one coplanar patch group into the reference face frame."""
+            vertices = np.stack(
+                [patches[int(index)].vertices_xyz for index in indices],
+                axis=0,
+            )
+            normals = np.stack(
+                [patches[int(index)].normal_xyz for index in indices],
+                axis=0,
+            )
+            if np.any(normals @ normal < 1.0 - 1.0e-8):
+                raise ValueError("Bootstrap surface orientations do not match base.")
+            offsets = vertices - origin[None, None, :]
+            if np.max(np.abs(offsets @ normal)) > tolerance:
+                raise ValueError("Bootstrap surface planes do not match base.")
+            u_values = offsets @ u_axis
+            v_values = offsets @ v_axis
+            return (
+                np.min(u_values, axis=1),
+                np.max(u_values, axis=1),
+                np.min(v_values, axis=1),
+                np.max(v_values, axis=1),
+            )
+
+        base_u0, base_u1, base_v0, base_v1 = bounds(base_indices, base)
+        rep_u0, rep_u1, rep_v0, rep_v1 = bounds(replicate_indices, replicate)
+        overlap_u = np.maximum(
+            np.minimum(base_u1[:, None], rep_u1[None, :])
+            - np.maximum(base_u0[:, None], rep_u0[None, :]),
+            0.0,
+        )
+        overlap_v = np.maximum(
+            np.minimum(base_v1[:, None], rep_v1[None, :])
+            - np.maximum(base_v0[:, None], rep_v0[None, :]),
+            0.0,
+        )
+        overlap = overlap_u * overlap_v
+        covered_area = np.sum(overlap, axis=0)
+        expected_area = np.asarray(
+            [replicate[int(index)].area_m2 for index in replicate_indices],
+            dtype=np.float64,
+        )
+        if not np.allclose(
+            covered_area,
+            expected_area,
+            rtol=1.0e-8,
+            atol=max(1.0e-12, tolerance**2),
+        ):
+            raise ValueError(
+                "Bootstrap patch projection does not preserve surface area."
+            )
+        projection[np.ix_(base_indices, replicate_indices)] = overlap / np.maximum(
+            covered_area[None, :],
+            np.finfo(np.float64).tiny,
+        )
+    return projection
+
+
+def _cluster_match_metadata(
+    estimate: MLEEstimate,
+    cluster: Mapping[str, object],
+) -> tuple[set[str], set[str], float, bool]:
+    """Return physical support gates for one reported hotspot cluster."""
+    patch_ids = cluster.get("patch_ids", ())
+    if not isinstance(patch_ids, Sequence) or isinstance(patch_ids, (str, bytes)):
+        return set(), set(), 0.0, False
+    by_id = {int(patch.patch_id): patch for patch in estimate.patches}
+    patches = tuple(by_id.get(int(patch_id)) for patch_id in patch_ids)
+    selected = tuple(patch for patch in patches if patch is not None)
+    centroid = np.asarray(cluster.get("centroid_xyz"), dtype=np.float64)
+    if not selected or centroid.shape != (3,) or np.any(~np.isfinite(centroid)):
+        return set(), set(), 0.0, False
+    vertices = np.concatenate([patch.vertices_xyz for patch in selected], axis=0)
+    support_center = np.mean(vertices, axis=0)
+    support_radius = float(np.max(np.linalg.norm(vertices - support_center, axis=1)))
+    centroid_valid = bool(
+        np.linalg.norm(centroid - support_center) <= support_radius + 1.0e-8
+    )
+    return (
+        {str(patch.surface_kind) for patch in selected},
+        {str(patch.object_id) for patch in selected},
+        support_radius,
+        centroid_valid,
+    )
+
+
 def bootstrap_uncertainty_summary(
     base: MLEEstimate,
     replicates: Sequence[MLEEstimate],
@@ -294,9 +418,34 @@ def bootstrap_uncertainty_summary(
     quantiles = (alpha, 1.0 - alpha)
     base_patch_ids = [int(patch.patch_id) for patch in base.patches]
     base_kinds = [str(patch.surface_kind) for patch in base.patches]
+    projected_strengths = np.zeros(
+        (len(estimates), len(base.isotope_names), len(base.patches)),
+        dtype=np.float64,
+    )
+    for replicate_index, estimate in enumerate(estimates):
+        projection = _project_patch_strengths_to_base(
+            base.patches,
+            estimate.patches,
+        )
+        isotope_lookup = {
+            name: index for index, name in enumerate(estimate.isotope_names)
+        }
+        for base_isotope_index, isotope in enumerate(base.isotope_names):
+            replicate_isotope_index = isotope_lookup.get(isotope)
+            if replicate_isotope_index is None:
+                raise ValueError(
+                    "Bootstrap isotope names do not match the base estimate."
+                )
+            projected_strengths[replicate_index, base_isotope_index] = (
+                projection
+                @ np.asarray(
+                    estimate.patch_strength_by_isotope[replicate_isotope_index],
+                    dtype=np.float64,
+                )
+            )
     isotope_summaries: dict[str, object] = {}
     for isotope_index, isotope in enumerate(base.isotope_names):
-        strength_samples = np.zeros((len(estimates), len(base.patches)), dtype=float)
+        strength_samples = projected_strengths[:, isotope_index]
         surface_fraction_samples: dict[str, list[float]] = {
             "floor": [],
             "wall": [],
@@ -307,21 +456,9 @@ def bootstrap_uncertainty_summary(
         z_samples: list[float] = []
         ceiling_dominant: list[float] = []
         for replicate_index, estimate in enumerate(estimates):
-            index_by_id = {
-                int(patch.patch_id): index
-                for index, patch in enumerate(estimate.patches)
-            }
-            for base_index, patch_id in enumerate(base_patch_ids):
-                source_index = index_by_id.get(patch_id)
-                if source_index is not None:
-                    strength_samples[replicate_index, base_index] = float(
-                        estimate.patch_strength_by_isotope[
-                            isotope_index,
-                            source_index,
-                        ]
-                    )
+            replicate_isotope_index = tuple(estimate.isotope_names).index(isotope)
             all_strengths = np.asarray(
-                estimate.patch_strength_by_isotope[isotope_index],
+                estimate.patch_strength_by_isotope[replicate_isotope_index],
                 dtype=float,
             )
             total = max(float(np.sum(all_strengths)), 1.0e-30)
@@ -345,11 +482,12 @@ def bootstrap_uncertainty_summary(
             ceiling_dominant.append(
                 float(surface_fraction_samples["ceiling"][-1] >= 0.5)
             )
-        maximum_by_replicate = np.maximum(
-            np.max(strength_samples, axis=1, keepdims=True),
-            1.0e-30,
+        maximum_by_replicate = np.max(strength_samples, axis=1, keepdims=True)
+        selected = (maximum_by_replicate > 0.0) & (
+            strength_samples >= 1.0e-3 * maximum_by_replicate
         )
-        selected = strength_samples >= 1.0e-3 * maximum_by_replicate
+        finite_z = np.asarray(z_samples, dtype=np.float64)
+        finite_z = finite_z[np.isfinite(finite_z)]
         isotope_summaries[isotope] = {
             "patch_ids": base_patch_ids,
             "patch_surface_kinds": base_kinds,
@@ -366,24 +504,31 @@ def bootstrap_uncertainty_summary(
                 }
                 for kind, values in surface_fraction_samples.items()
             },
-            "z_interval_m": np.nanquantile(z_samples, quantiles).tolist(),
+            "z_interval_m": (
+                np.quantile(finite_z, quantiles).tolist() if finite_z.size else None
+            ),
+            "z_interval_status": (
+                "available" if finite_z.size else "unavailable_zero_strength"
+            ),
             "ceiling_source_probability": float(np.mean(ceiling_dominant)),
         }
 
     base_clusters = _clusters(base)
+    base_cluster_metadata = tuple(
+        _cluster_match_metadata(base, cluster) for cluster in base_clusters
+    )
     centroid_samples: list[list[NDArray[np.float64]]] = [
         [] for _cluster in base_clusters
     ]
-    strength_samples_by_cluster: list[list[float]] = [
-        [] for _cluster in base_clusters
-    ]
+    strength_samples_by_cluster: list[list[float]] = [[] for _cluster in base_clusters]
     from scipy.optimize import linear_sum_assignment
 
     for estimate in estimates:
         replicate_clusters = _clusters(estimate)
-        isotopes = {
-            str(cluster.get("isotope", "")) for cluster in base_clusters
-        }
+        replicate_cluster_metadata = tuple(
+            _cluster_match_metadata(estimate, cluster) for cluster in replicate_clusters
+        )
+        isotopes = {str(cluster.get("isotope", "")) for cluster in base_clusters}
         for isotope in isotopes:
             base_indices = [
                 index
@@ -416,12 +561,39 @@ def bootstrap_uncertainty_summary(
                 base_points[:, None, :] - candidate_points[None, :, :],
                 axis=2,
             )
-            matched_base, matched_candidate = linear_sum_assignment(distances)
+            valid = np.zeros_like(distances, dtype=bool)
+            for base_local, base_index in enumerate(base_indices):
+                base_kinds_set, base_objects, base_radius, base_valid = (
+                    base_cluster_metadata[base_index]
+                )
+                for candidate_local, candidate_index in enumerate(candidate_indices):
+                    (
+                        candidate_kinds,
+                        candidate_objects,
+                        candidate_radius,
+                        candidate_valid,
+                    ) = replicate_cluster_metadata[candidate_index]
+                    valid[base_local, candidate_local] = bool(
+                        base_valid
+                        and candidate_valid
+                        and base_kinds_set.intersection(candidate_kinds)
+                        and base_objects.intersection(candidate_objects)
+                        and distances[base_local, candidate_local]
+                        <= base_radius + candidate_radius + 1.0e-8
+                    )
+            if not np.any(valid):
+                continue
+            invalid_cost = max(float(np.max(distances)), 1.0) * 1.0e6
+            matched_base, matched_candidate = linear_sum_assignment(
+                np.where(valid, distances, invalid_cost)
+            )
             for base_local, candidate_local in zip(
                 matched_base,
                 matched_candidate,
                 strict=True,
             ):
+                if not valid[int(base_local), int(candidate_local)]:
+                    continue
                 base_index = base_indices[int(base_local)]
                 candidate_index = candidate_indices[int(candidate_local)]
                 centroid_samples[base_index].append(

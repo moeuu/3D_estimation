@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.sparse import csr_matrix
 
-from .response_operator import ResponseOperator
+from .response_operator import LineFactorizedResponseOperator, ResponseOperator
 
 
 @dataclass(frozen=True)
@@ -81,8 +81,7 @@ class SurfaceMapConfig:
                 "poisson_em_warm_start_iterations must be a nonnegative integer."
             )
         if self.kkt_tolerance is not None and (
-            not np.isfinite(self.kkt_tolerance)
-            or float(self.kkt_tolerance) < 0.0
+            not np.isfinite(self.kkt_tolerance) or float(self.kkt_tolerance) < 0.0
         ):
             raise ValueError("kkt_tolerance must be null or finite and nonnegative.")
         if int(self.check_interval) < 1:
@@ -656,33 +655,27 @@ def _poisson_em_warm_start_numpy(
         densities = np.full_like(densities, initial_scale)
         nuisance = np.full_like(nuisance, initial_scale)
     density_denominator = (
-        source_column_sums
-        + float(config.l1_weight) * problem.patch_areas[:, None]
+        source_column_sums + float(config.l1_weight) * problem.patch_areas[:, None]
     )
-    nuisance_base_denominator = (
-        nuisance_column_sums + float(config.nuisance_l1_weight)
-    )
+    nuisance_base_denominator = nuisance_column_sums + float(config.nuisance_l1_weight)
     started = perf_counter()
     for iteration in range(1, iteration_count + 1):
-        expected = (
-            problem.background
-            + problem.response_by_density @ densities.reshape(-1)
+        expected = problem.background + problem.response_by_density @ densities.reshape(
+            -1
         )
         if nuisance.size:
             expected = expected + problem.nuisance_response @ nuisance
         ratio = problem.observed / np.maximum(expected, float(config.min_mean))
-        density_numerator = (
-            problem.response_by_density.T @ ratio
-        ).reshape(densities.shape)
+        density_numerator = (problem.response_by_density.T @ ratio).reshape(
+            densities.shape
+        )
         densities *= density_numerator / np.maximum(
             density_denominator,
             np.finfo(np.float64).tiny,
         )
         if nuisance.size:
             nuisance_numerator = problem.nuisance_response.T @ ratio
-            nuisance_denominator = (
-                nuisance_base_denominator + nuisance_l2 * nuisance
-            )
+            nuisance_denominator = nuisance_base_denominator + nuisance_l2 * nuisance
             nuisance *= nuisance_numerator / np.maximum(
                 nuisance_denominator,
                 np.finfo(np.float64).tiny,
@@ -698,9 +691,7 @@ def _poisson_em_warm_start_numpy(
                     "completed": int(iteration),
                     "total": iteration_count,
                     "elapsed_seconds": elapsed,
-                    "eta_seconds": elapsed
-                    * (iteration_count - iteration)
-                    / iteration,
+                    "eta_seconds": elapsed * (iteration_count - iteration) / iteration,
                 }
             )
     return densities, nuisance
@@ -934,13 +925,13 @@ def fit_surface_map_poisson(
                     "kkt_residual": kkt_residual,
                 }
             )
-        if relative_change <= float(
-            solver_config.tolerance
-        ) and relative_objective_change <= float(
-            solver_config.objective_tolerance
-        ) and (
-            solver_config.kkt_tolerance is None
-            or kkt_residual <= float(solver_config.kkt_tolerance)
+        if (
+            relative_change <= float(solver_config.tolerance)
+            and relative_objective_change <= float(solver_config.objective_tolerance)
+            and (
+                solver_config.kkt_tolerance is None
+                or kkt_residual <= float(solver_config.kkt_tolerance)
+            )
         ):
             converged = True
             break
@@ -991,6 +982,17 @@ class _IndexedCudaResponse:
     row_indices: object
 
 
+@dataclass(frozen=True, slots=True)
+class _TorchLineFactorizedResponse:
+    """Keep exact spectral line factors resident on one Torch device."""
+
+    spatial_factors: object
+    pulse_shapes: object
+    line_isotope_indices: object
+    source_mask: object
+    measurement_indices: object | None = None
+
+
 def _torch_response_product(
     operator: ResponseOperator,
     values: object,
@@ -1002,6 +1004,67 @@ def _torch_response_product(
     """Apply a streamed response operator while retaining state on one device."""
     torch = torch_module
     vector = values
+    if isinstance(dense_response, _TorchLineFactorizedResponse):
+        spatial_factors = dense_response.spatial_factors
+        if transpose:
+            residual = vector.reshape(
+                operator.observation_shape[0],
+                int(dense_response.pulse_shapes.shape[1]),
+            )
+            if dense_response.measurement_indices is not None:
+                base_residual = torch.zeros(
+                    (
+                        int(spatial_factors.shape[0]),
+                        int(dense_response.pulse_shapes.shape[1]),
+                    ),
+                    dtype=vector.dtype,
+                    device=vector.device,
+                )
+                base_residual.index_add_(
+                    0,
+                    dense_response.measurement_indices,
+                    residual,
+                )
+                residual = base_residual
+            residual_by_line = residual @ dense_response.pulse_shapes.T
+            gradient_by_line = torch.einsum(
+                "mgl,ml->gl",
+                spatial_factors,
+                residual_by_line,
+            )
+            gradient = torch.zeros(
+                (
+                    operator.patch_count,
+                    operator.isotope_count,
+                ),
+                dtype=vector.dtype,
+                device=vector.device,
+            )
+            gradient.index_add_(
+                1,
+                dense_response.line_isotope_indices,
+                gradient_by_line,
+            )
+            gradient *= dense_response.source_mask
+            return gradient.reshape(-1)
+        densities = vector.reshape(operator.patch_count, operator.isotope_count)
+        densities = densities * dense_response.source_mask
+        density_by_line = densities.index_select(
+            1,
+            dense_response.line_isotope_indices,
+        )
+        amplitudes = torch.einsum(
+            "mgl,gl->ml",
+            spatial_factors,
+            density_by_line,
+        )
+        spectra = amplitudes @ dense_response.pulse_shapes
+        if dense_response.measurement_indices is not None:
+            spectra = spectra.index_select(
+                0,
+                dense_response.measurement_indices,
+            )
+        return spectra.reshape(-1)
     if isinstance(dense_response, _IndexedCudaResponse):
         matrix = dense_response.matrix
         row_indices = dense_response.row_indices
@@ -1071,6 +1134,7 @@ def _prune_persistent_cuda_responses(
     *,
     torch_module: object,
     maximum_entries: int = 2,
+    release_cuda_cache: bool = True,
 ) -> int:
     """Evict stale dense CUDA responses before another layout is cached.
 
@@ -1096,9 +1160,346 @@ def _prune_persistent_cuda_responses(
         oldest_identity = next(iter(entries))
         del entries[oldest_identity]
         evicted += 1
-    if evicted:
+    if evicted and release_cuda_cache:
         torch_module.cuda.empty_cache()
     return evicted
+
+
+def _prepare_line_factorized_torch_response(
+    operator: LineFactorizedResponseOperator,
+    *,
+    device: object,
+    dtype: object,
+    cache_fraction: float,
+    torch_module: object,
+    persistent_cache: dict[str, object] | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+    progress_phase: str = "mle_line_factor_cache",
+) -> tuple[
+    object | None,
+    dict[str, object],
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+]:
+    """Prepare compact exact line factors on CPU or CUDA without bin expansion."""
+    torch = torch_module
+    floating_element_size = int(torch.empty((), dtype=dtype).element_size())
+    floating_elements = int(
+        operator.observation_shape[0]
+        * operator.patch_count
+        * operator.line_isotope_indices.size
+        + operator.pulse_shapes.size
+    )
+    metadata_bytes = int(
+        operator.line_isotope_indices.size
+        * torch.empty((), dtype=torch.long).element_size()
+        + operator.source_mask.size * torch.empty((), dtype=torch.bool).element_size()
+    )
+    required_bytes = floating_elements * floating_element_size + metadata_bytes
+    dense_equivalent_bytes = (
+        operator.observation_count * operator.source_count * floating_element_size
+    )
+    diagnostics: dict[str, object] = {
+        "mode": "line_factorized_host_fallback",
+        "required_bytes": required_bytes,
+        "dense_equivalent_bytes": dense_equivalent_bytes,
+        "compression_ratio": dense_equivalent_bytes / max(required_bytes, 1),
+        "cached_bytes": 0,
+        "preparation_seconds": 0.0,
+        "host_to_device_bytes": 0,
+    }
+    is_cuda = getattr(device, "type", None) == "cuda"
+    if is_cuda and float(cache_fraction) <= 0.0:
+        diagnostics["fallback_reason"] = "response_device_cache_disabled"
+        return None, diagnostics, None, None
+
+    operator_diagnostics = getattr(operator, "diagnostics", {})
+    cache_key = operator_diagnostics.get("device_cache_key")
+    base_row_keys_raw = operator_diagnostics.get("measurement_row_keys")
+    base_row_keys = (
+        tuple(str(value) for value in base_row_keys_raw)
+        if isinstance(base_row_keys_raw, list)
+        else ()
+    )
+    selected_raw = operator_diagnostics.get("selected_measurements")
+    if isinstance(selected_raw, list) and base_row_keys:
+        try:
+            selected_measurements = tuple(int(value) for value in selected_raw)
+            row_keys = tuple(base_row_keys[index] for index in selected_measurements)
+        except (IndexError, TypeError, ValueError):
+            row_keys = ()
+    else:
+        row_keys = base_row_keys
+    source_masked = not bool(np.all(operator.source_mask))
+    persistent_eligible = bool(
+        persistent_cache is not None
+        and isinstance(cache_key, str)
+        and cache_key
+        and row_keys
+    )
+    persistent_store_eligible = persistent_eligible and not source_masked
+    persistent_identity = (str(device), str(dtype), str(cache_key))
+    reusable: dict[str, object] | None = None
+    if persistent_eligible and persistent_cache is not None:
+        diagnostics["persistent_cache_entry_limit"] = 2
+        diagnostics["persistent_cache_evicted_entries"] = (
+            _prune_persistent_cuda_responses(
+                persistent_cache,
+                persistent_identity,
+                torch_module=torch,
+                release_cuda_cache=is_cuda,
+            )
+        )
+        entries = persistent_cache.get("entries")
+        candidate = (
+            entries.get(persistent_identity) if isinstance(entries, dict) else None
+        )
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("representation") == "line_factorized"
+            and int(candidate.get("source_count", -1)) == operator.source_count
+            and int(candidate.get("line_count", -1))
+            == operator.line_isotope_indices.size
+        ):
+            reusable = candidate
+
+    if reusable is not None:
+        reusable_keys = reusable.get("row_keys")
+        reusable_response = reusable.get("response")
+        if isinstance(reusable_keys, tuple) and isinstance(
+            reusable_response,
+            _TorchLineFactorizedResponse,
+        ):
+            if reusable_keys == row_keys:
+                cached_rows = reusable.get("row_sums")
+                cached_columns = reusable.get("column_sums")
+                if (
+                    not source_masked
+                    and isinstance(cached_rows, np.ndarray)
+                    and isinstance(
+                        cached_columns,
+                        np.ndarray,
+                    )
+                ):
+                    diagnostics.update(
+                        {
+                            "mode": "persistent_line_factor_cache_hit",
+                            "cached_bytes": required_bytes,
+                            "persistent_reused_measurements": len(row_keys),
+                        }
+                    )
+                    return (
+                        reusable_response,
+                        diagnostics,
+                        cached_rows,
+                        cached_columns,
+                    )
+                if source_masked:
+                    masked = _TorchLineFactorizedResponse(
+                        spatial_factors=reusable_response.spatial_factors,
+                        pulse_shapes=reusable_response.pulse_shapes,
+                        line_isotope_indices=(reusable_response.line_isotope_indices),
+                        source_mask=torch.tensor(
+                            operator.source_mask,
+                            dtype=torch.bool,
+                            device=device,
+                        ),
+                    )
+                    row_sums, column_sums = operator.response_sums()
+                    diagnostics.update(
+                        {
+                            "mode": "persistent_line_factor_mask_view",
+                            "cached_bytes": required_bytes,
+                            "persistent_reused_measurements": len(row_keys),
+                            "host_to_device_bytes": (
+                                int(operator.source_mask.nbytes) if is_cuda else 0
+                            ),
+                        }
+                    )
+                    return masked, diagnostics, row_sums, column_sums
+            if all(key in reusable_keys for key in row_keys):
+                key_to_index = {key: index for index, key in enumerate(reusable_keys)}
+                selected = torch.as_tensor(
+                    [key_to_index[key] for key in row_keys],
+                    dtype=torch.long,
+                    device=device,
+                )
+                indexed = _TorchLineFactorizedResponse(
+                    spatial_factors=reusable_response.spatial_factors,
+                    pulse_shapes=reusable_response.pulse_shapes,
+                    line_isotope_indices=(reusable_response.line_isotope_indices),
+                    source_mask=(
+                        torch.tensor(
+                            operator.source_mask,
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                        if source_masked
+                        else reusable_response.source_mask
+                    ),
+                    measurement_indices=selected,
+                )
+                row_sums, column_sums = operator.response_sums()
+                diagnostics.update(
+                    {
+                        "mode": (
+                            "persistent_line_factor_masked_row_gather"
+                            if source_masked
+                            else "persistent_line_factor_row_gather"
+                        ),
+                        "cached_bytes": required_bytes,
+                        "persistent_reused_measurements": len(row_keys),
+                        "materialized_row_gather_bytes": 0,
+                        "host_to_device_bytes": (
+                            int(operator.source_mask.nbytes)
+                            if source_masked and is_cuda
+                            else 0
+                        ),
+                    }
+                )
+                return indexed, diagnostics, row_sums, column_sums
+
+    if is_cuda:
+        torch.cuda.empty_cache()
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        budget_bytes = int(float(cache_fraction) * int(free_bytes))
+        diagnostics["free_device_bytes_at_prepare"] = int(free_bytes)
+        diagnostics["budget_bytes"] = budget_bytes
+        if required_bytes > budget_bytes:
+            diagnostics["fallback_reason"] = "line_factors_exceed_device_cache_budget"
+            return None, diagnostics, None, None
+
+    started = perf_counter()
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": str(progress_phase),
+                "completed": 0,
+                "total": required_bytes,
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
+    previous_keys = reusable.get("row_keys") if reusable is not None else None
+    previous_response = reusable.get("response") if reusable is not None else None
+    prefix_count = 0
+    host_spatial_factors = operator.spatial_factors
+    try:
+        if (
+            isinstance(previous_keys, tuple)
+            and isinstance(previous_response, _TorchLineFactorizedResponse)
+            and row_keys[: len(previous_keys)] == previous_keys
+            and previous_response.measurement_indices is None
+        ):
+            prefix_count = len(previous_keys)
+            appended = torch.tensor(
+                host_spatial_factors[prefix_count:],
+                dtype=dtype,
+                device=device,
+            )
+            spatial_factors = torch.cat(
+                (previous_response.spatial_factors, appended),
+                dim=0,
+            )
+            pulse_shapes = previous_response.pulse_shapes
+            line_isotope_indices = previous_response.line_isotope_indices
+            source_mask = (
+                torch.tensor(
+                    operator.source_mask,
+                    dtype=torch.bool,
+                    device=device,
+                )
+                if source_masked
+                else previous_response.source_mask
+            )
+            diagnostics["host_to_device_bytes"] = (
+                int(host_spatial_factors[prefix_count:].size) * floating_element_size
+            )
+            if source_masked:
+                diagnostics["host_to_device_bytes"] += int(operator.source_mask.nbytes)
+        else:
+            spatial_factors = torch.tensor(
+                host_spatial_factors,
+                dtype=dtype,
+                device=device,
+            )
+            pulse_shapes = torch.tensor(
+                operator.pulse_shapes,
+                dtype=dtype,
+                device=device,
+            )
+            line_isotope_indices = torch.tensor(
+                operator.line_isotope_indices,
+                dtype=torch.long,
+                device=device,
+            )
+            source_mask = torch.tensor(
+                operator.source_mask,
+                dtype=torch.bool,
+                device=device,
+            )
+            if is_cuda:
+                diagnostics["host_to_device_bytes"] = required_bytes
+        prepared = _TorchLineFactorizedResponse(
+            spatial_factors=spatial_factors,
+            pulse_shapes=pulse_shapes,
+            line_isotope_indices=line_isotope_indices,
+            source_mask=source_mask,
+        )
+    except torch.OutOfMemoryError:
+        if is_cuda:
+            torch.cuda.empty_cache()
+        diagnostics.update(
+            {
+                "fallback_reason": "device_out_of_memory_during_line_factor_prepare",
+                "preparation_seconds": perf_counter() - started,
+            }
+        )
+        return None, diagnostics, None, None
+    if is_cuda:
+        torch.cuda.synchronize(device)
+    row_sums, column_sums = operator.response_sums()
+    diagnostics.update(
+        {
+            "mode": (
+                "line_factorized_cuda_prefix_append"
+                if prefix_count
+                else (
+                    "line_factorized_cuda_cache"
+                    if is_cuda
+                    else "line_factorized_cpu_cache"
+                )
+            ),
+            "cached_bytes": required_bytes,
+            "preparation_seconds": perf_counter() - started,
+            "persistent_prefix_measurements": prefix_count,
+        }
+    )
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": str(progress_phase),
+                "completed": required_bytes,
+                "total": required_bytes,
+                "elapsed_seconds": perf_counter() - started,
+                "eta_seconds": 0.0,
+            }
+        )
+    if persistent_store_eligible and persistent_cache is not None:
+        entries = persistent_cache.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            raise TypeError("Persistent response cache entries must be a dictionary.")
+        entries[persistent_identity] = {
+            "identity": persistent_identity,
+            "representation": "line_factorized",
+            "row_keys": row_keys,
+            "source_count": operator.source_count,
+            "line_count": operator.line_isotope_indices.size,
+            "response": prepared,
+            "row_sums": row_sums,
+            "column_sums": column_sums,
+        }
+    return prepared, diagnostics, row_sums, column_sums
 
 
 def _prepare_dense_torch_response(
@@ -1125,6 +1526,17 @@ def _prepare_dense_torch_response(
     deterministic when the required matrix does not fit the configured share
     of currently free device memory.
     """
+    if isinstance(operator, LineFactorizedResponseOperator):
+        return _prepare_line_factorized_torch_response(
+            operator,
+            device=device,
+            dtype=dtype,
+            cache_fraction=cache_fraction,
+            torch_module=torch_module,
+            persistent_cache=persistent_cache,
+            progress_hook=progress_hook,
+            progress_phase=progress_phase,
+        )
     torch = torch_module
     required_bytes = (
         int(operator.observation_count)
@@ -1199,8 +1611,7 @@ def _prepare_dense_torch_response(
                     and identity[2] == str(cache_key)
                     and identity != persistent_identity
                     and isinstance(entry, dict)
-                    and int(entry.get("source_count", -1))
-                    == operator.source_count
+                    and int(entry.get("source_count", -1)) == operator.source_count
                 ),
                 None,
             )
@@ -1236,12 +1647,8 @@ def _prepare_dense_torch_response(
                             diagnostics.update(
                                 {
                                     "cross_dtype_cache_reused": True,
-                                    "cross_dtype_source": str(
-                                        alternate_matrix.dtype
-                                    ),
-                                    "cross_dtype_conversion_bytes": (
-                                        converted_bytes
-                                    ),
+                                    "cross_dtype_source": str(alternate_matrix.dtype),
+                                    "cross_dtype_conversion_bytes": (converted_bytes),
                                     "cross_dtype_conversion_seconds": (
                                         perf_counter() - converted_started
                                     ),
@@ -1690,6 +2097,8 @@ def fit_surface_map_poisson_operator(
     ):
         raise ValueError("response_device_cache_fraction must lie in [0, 1).")
     device = torch.device(gpu_device if use_gpu else "cpu")
+    if use_gpu and device.type != "cuda":
+        raise ValueError("use_gpu=True requires a CUDA gpu_device.")
     if use_gpu and device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA matrix-free solve requested but CUDA is unavailable.")
     dtype = torch.float32 if gpu_dtype == "float32" else torch.float64
@@ -1732,7 +2141,12 @@ def fit_surface_map_poisson_operator(
         dense_response,
         response_cache_diagnostics,
         required=(
-            bool(require_gpu_response_cache) and use_gpu and device.type == "cuda"
+            use_gpu
+            and device.type == "cuda"
+            and (
+                bool(require_gpu_response_cache)
+                or isinstance(response_operator, LineFactorizedResponseOperator)
+            )
         ),
     )
     observed = tensor(observed_vector)
@@ -1986,9 +2400,7 @@ def fit_surface_map_poisson_operator(
 
     em_warm_start_elapsed = 0.0
     em_warm_start_iterations_completed = 0
-    em_warm_start_iterations = int(
-        solver_config.poisson_em_warm_start_iterations
-    )
+    em_warm_start_iterations = int(solver_config.poisson_em_warm_start_iterations)
     if (
         solver_config.likelihood_family == "poisson"
         and em_warm_start_iterations > 0
@@ -2045,16 +2457,12 @@ def fit_surface_map_poisson_operator(
                 em_warm_start_iterations_completed = em_iteration
                 if progress_hook is not None and (
                     em_iteration == em_warm_start_iterations
-                    or em_iteration
-                    % max(1, min(20, em_warm_start_iterations))
-                    == 0
+                    or em_iteration % max(1, min(20, em_warm_start_iterations)) == 0
                 ):
                     elapsed = perf_counter() - em_started
                     progress_hook(
                         {
-                            "phase": (
-                                f"{progress_phase}:poisson_em_warm_start"
-                            ),
+                            "phase": (f"{progress_phase}:poisson_em_warm_start"),
                             "completed": int(em_iteration),
                             "total": em_warm_start_iterations,
                             "elapsed_seconds": elapsed,
@@ -2164,13 +2572,14 @@ def fit_surface_map_poisson_operator(
                         "kkt_residual": kkt_residual,
                     }
                 )
-            if relative_change <= float(
-                solver_config.tolerance
-            ) and relative_objective_change <= float(
-                solver_config.objective_tolerance
-            ) and (
-                solver_config.kkt_tolerance is None
-                or kkt_residual <= float(solver_config.kkt_tolerance)
+            if (
+                relative_change <= float(solver_config.tolerance)
+                and relative_objective_change
+                <= float(solver_config.objective_tolerance)
+                and (
+                    solver_config.kkt_tolerance is None
+                    or kkt_residual <= float(solver_config.kkt_tolerance)
+                )
             ):
                 converged = True
                 break
@@ -2270,13 +2679,13 @@ def fit_surface_map_poisson_operator(
                     "kkt_residual": kkt_residual,
                 }
             )
-        if relative_change <= float(
-            solver_config.tolerance
-        ) and relative_objective_change <= float(
-            solver_config.objective_tolerance
-        ) and (
-            solver_config.kkt_tolerance is None
-            or kkt_residual <= float(solver_config.kkt_tolerance)
+        if (
+            relative_change <= float(solver_config.tolerance)
+            and relative_objective_change <= float(solver_config.objective_tolerance)
+            and (
+                solver_config.kkt_tolerance is None
+                or kkt_residual <= float(solver_config.kkt_tolerance)
+            )
         ):
             converged = True
             break
@@ -2306,12 +2715,8 @@ def fit_surface_map_poisson_operator(
             "dtype": str(gpu_dtype),
             "elapsed_seconds": perf_counter() - solve_started,
             "response_product_calls": int(response_product_calls),
-            "poisson_em_warm_start_iterations": int(
-                em_warm_start_iterations_completed
-            ),
-            "poisson_em_warm_start_elapsed_seconds": float(
-                em_warm_start_elapsed
-            ),
+            "poisson_em_warm_start_iterations": int(em_warm_start_iterations_completed),
+            "poisson_em_warm_start_elapsed_seconds": float(em_warm_start_elapsed),
             "response_cache": response_cache_diagnostics,
         }
         performance["solver"] = solver_diagnostics

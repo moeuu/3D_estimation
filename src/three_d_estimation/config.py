@@ -69,7 +69,7 @@ class MLEConfig:
     over_relaxation: float = 1.0
     min_mean: float = 1.0e-12
     response_chunk_size: int = 262144
-    spectral_response_mode: Literal["materialized", "matrix_free"] = "materialized"
+    spectral_response_mode: Literal["materialized", "matrix_free"] = "matrix_free"
     response_measurement_chunk_size: int = 8
     response_energy_chunk_size: int = 128
     response_patch_chunk_size: int = 128

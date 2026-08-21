@@ -13,8 +13,9 @@ requires-python = ">=3.12"
 dependencies = [
   "matplotlib>=3.10.7",
   "numpy>=2.3.5",
-  "rotating-shield-simulation-runtime",
+  "rotating-shield-simulation-runtime==0.1.0",
   "scipy>=1.16.3",
+  "threadpoolctl>=3.6.0",
   "torch",
 ]
 
@@ -49,4 +50,4 @@ target-version = "py312"
 select = ["E4", "E7", "E9", "F"]
 
 [tool.uv.sources]
-rotating-shield-simulation-runtime = { path = "../Rotating-shield-simulation-runtime", editable = true }
+rotating-shield-simulation-runtime = { git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git", rev = "445f333a1fd18747213f6f700a519897a4bb2cf9" }

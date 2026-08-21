@@ -27,6 +27,17 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
         dependency.startswith("pytest") for dependency in development_dependencies
     )
     assert any(dependency.startswith("ruff") for dependency in development_dependencies)
+    runtime_dependency = next(
+        dependency
+        for dependency in runtime_dependencies
+        if dependency.startswith("rotating-shield-simulation-runtime")
+    )
+    runtime_source = configuration["tool"]["uv"]["sources"][
+        "rotating-shield-simulation-runtime"
+    ]
+    assert "==" in runtime_dependency
+    assert set(runtime_source) == {"git", "rev"}
+    assert len(runtime_source["rev"]) == 40
 
 
 def test_package_discovery_contains_only_mle_code() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import tracemalloc
 
@@ -13,7 +13,7 @@ from numpy.typing import NDArray
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
-from measurement.shielding import generate_octant_orientations
+from measurement.shielding import OctantShield, generate_octant_orientations
 from runtime.discrepancy_calibration import DiscrepancyCalibration
 from spectrum.response_matrix import (
     BACKSCATTER_FRACTION,
@@ -697,11 +697,133 @@ def test_matrix_free_cache_appends_only_new_measurement_rows(tmp_path: Path) -> 
     )
 
 
-def test_matrix_free_cache_io_scales_with_patch_tasks_not_energy_chunks(
+def test_factor_cache_namespace_is_stable_across_physical_object_instances(
+    tmp_path: Path,
+) -> None:
+    """Equivalent shield objects must not create address-derived namespaces."""
+    edges = np.arange(0.0, 1005.0, 10.0)
+    observations = _observations(np.asarray([[0.0, 0.0, 0.5]]), edges)
+    patches = _patches(np.asarray([[[1.0, 0.0, 0.5]]]))
+    first_kernel = _kernel({"Cs-137": _CS_LINE})
+    second_kernel = _kernel({"Cs-137": _CS_LINE})
+    first_kernel.octant_shield = OctantShield()
+    second_kernel.octant_shield = OctantShield()
+
+    first = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        first_kernel,
+        cache_directory=tmp_path,
+    )
+    second = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        second_kernel,
+        cache_directory=tmp_path,
+    )
+
+    assert first.cache_directory == second.cache_directory
+    assert second.operator.diagnostics["cache_stats"] == {
+        "hits": 1,
+        "misses": 0,
+        "files": 1,
+        "blocks": 1,
+    }
+
+
+def test_spatial_factor_cache_separates_backend_and_numeric_precision() -> None:
+    """Float32 GPU factors must never be reused as float64 CPU truth."""
+    points = np.asarray([[[1.0, 0.0, 0.5]]], dtype=np.float64)
+    patches = _patches(points)
+    cpu = _kernel({"Cs-137": _CS_LINE})
+    gpu_float32 = replace(
+        cpu,
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float32",
+    )
+    gpu_float64 = replace(gpu_float32, gpu_dtype="float64")
+
+    def cache_key(kernel: ContinuousKernel) -> str:
+        """Return the private spatial key for one execution configuration."""
+        return spectral_builder._spectral_spatial_cache_key(
+            kernel=kernel,
+            areas=patches.areas_m2,
+            quadrature_points=patches.quadrature_points_xyz,
+            quadrature_weights=patches.quadrature_weights,
+            isotope_lines={"Cs-137": _CS_LINE},
+        )
+
+    assert cache_key(cpu) != cache_key(gpu_float32)
+    assert cache_key(gpu_float32) != cache_key(gpu_float64)
+
+
+def test_device_factor_key_is_stable_without_disk_cache_and_tracks_pulses() -> None:
+    """In-memory CPU/CUDA reuse must not depend on enabling the disk cache."""
+    edges = np.arange(0.0, 1005.0, 10.0)
+    observations = _observations(np.asarray([[0.0, 0.0, 0.5]]), edges)
+    patches = _patches(np.asarray([[[1.0, 0.0, 0.5]]]))
+    common = {
+        "observations": observations,
+        "patches": patches,
+        "isotopes": ("Cs-137",),
+    }
+    first = build_spectral_response_operator(
+        **common,
+        kernel=_kernel({"Cs-137": _CS_LINE}),
+    )
+    equivalent = build_spectral_response_operator(
+        **common,
+        kernel=_kernel({"Cs-137": _CS_LINE}),
+    )
+    changed_pulse = build_spectral_response_operator(
+        **common,
+        kernel=_kernel({"Cs-137": _CS_LINE}),
+        continuum_to_peak=0.5 * COMPTON_CONTINUUM_TO_PEAK,
+    )
+
+    first_key = first.operator.diagnostics["device_cache_key"]
+    assert first.cache_directory is None
+    assert isinstance(first_key, str) and first_key
+    assert equivalent.operator.diagnostics["device_cache_key"] == first_key
+    assert changed_pulse.operator.diagnostics["device_cache_key"] != first_key
+
+
+def test_factor_builder_deduplicates_identical_measurement_rows(
+    tmp_path: Path,
+) -> None:
+    """Bootstrap row repeats must share one transport calculation and file."""
+    edges = np.arange(0.0, 1005.0, 10.0)
+    positions = np.repeat(np.asarray([[0.0, 0.0, 0.5]]), 3, axis=0)
+    observations = _observations(positions, edges)
+    patches = _patches(np.asarray([[[1.0, 0.0, 0.5]]]))
+
+    result = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        cache_directory=tmp_path,
+    )
+    construction = result.operator.diagnostics["performance"][
+        "response_construction"
+    ]
+
+    assert len(tuple(tmp_path.rglob("factors.npy"))) == 1
+    assert construction["kernel_batched_measurements"] == 1
+    np.testing.assert_array_equal(
+        result.operator.spatial_factors,
+        np.repeat(result.operator.spatial_factors[:1], 3, axis=0),
+    )
+
+
+def test_matrix_free_cache_io_is_one_file_per_unique_measurement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cached traversal performs one file load per row/patch task."""
+    """Factor-cache loading performs one file read per unique measurement."""
     edges = np.arange(0.0, 805.0, 10.0)
     observations = _observations(
         np.asarray([[0.0, 0.0, 0.5], [0.25, 0.0, 1.0]]),
@@ -726,11 +848,11 @@ def test_matrix_free_cache_io_scales_with_patch_tasks_not_energy_chunks(
     )
     first.operator.row_sums()
 
-    expected_task_count = observations.detector_positions_xyz.shape[0] * 2
-    assert len(tuple(cache.rglob("*.npy"))) == expected_task_count
+    expected_file_count = observations.detector_positions_xyz.shape[0]
+    assert len(tuple(cache.rglob("*.npy"))) == expected_file_count
     assert (
         first.operator.diagnostics["cache_file_layout"]
-        == "measurement_patch_full_energy_v2"
+        == "measurement_full_patch_line_factors_v4"
     )
 
     load_count = 0
@@ -752,12 +874,12 @@ def test_matrix_free_cache_io_scales_with_patch_tasks_not_energy_chunks(
     )
     cached.operator.row_sums()
 
-    assert load_count == expected_task_count
+    assert load_count == expected_file_count
     assert cached.operator.diagnostics["cache_stats"] == {
-        "hits": expected_task_count,
+        "hits": expected_file_count,
         "misses": 0,
-        "files": expected_task_count,
-        "blocks": expected_task_count * 12,
+        "files": expected_file_count,
+        "blocks": expected_file_count * 2 * 12,
     }
 
 

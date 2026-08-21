@@ -6,6 +6,7 @@ import argparse
 import ast
 import json
 from pathlib import Path
+import re
 import sys
 import tomllib
 
@@ -41,8 +42,30 @@ def _check_package_boundary() -> list[str]:
     if included != ["three_d_estimation*"]:
         return [f"unexpected package discovery include: {included!r}"]
     dependencies = payload["project"]["dependencies"]
-    if "rotating-shield-simulation-runtime" not in dependencies:
+    runtime_dependencies = [
+        dependency
+        for dependency in dependencies
+        if dependency.startswith("rotating-shield-simulation-runtime")
+    ]
+    if not runtime_dependencies:
         return ["shared simulation runtime dependency is missing"]
+    if len(runtime_dependencies) != 1 or "==" not in runtime_dependencies[0]:
+        return ["shared simulation runtime dependency must use an exact version"]
+    runtime_source = (
+        payload.get("tool", {})
+        .get("uv", {})
+        .get("sources", {})
+        .get("rotating-shield-simulation-runtime")
+    )
+    if not isinstance(runtime_source, dict):
+        return ["shared simulation runtime source pin is missing"]
+    revision = runtime_source.get("rev")
+    if (
+        not isinstance(runtime_source.get("git"), str)
+        or not isinstance(revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", revision) is None
+    ):
+        return ["shared simulation runtime source must pin one Git commit"]
     return []
 
 

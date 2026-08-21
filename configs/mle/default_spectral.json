@@ -1,5 +1,6 @@
 {
   "mode": "spectral",
+  "spectral_response_mode": "matrix_free",
   "isotope_names": ["Co-60", "Cs-137", "Eu-154"],
   "patch_spacing_m": [1.0, 1.0, 1.0],
   "quadrature_order": 4,

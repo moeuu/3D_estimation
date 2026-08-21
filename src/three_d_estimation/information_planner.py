@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import (
+    asdict,
+    dataclass,
+    field,
+    fields as dataclass_fields,
+    is_dataclass,
+    replace,
+)
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -16,11 +24,27 @@ from measurement.continuous_kernels import ContinuousKernel
 from runtime.discrepancy_calibration import load_discrepancy_calibration
 
 from .config import MLEConfig
-from .spectral_response_builder import build_spectral_response
+from .response_operator import LineFactorizedResponseOperator
+from .spectral_response_builder import (
+    _hash_canonical_value,
+    build_spectral_response,
+    build_spectral_response_operator,
+)
 from .types import MLEEstimate, ObservationBatch, SurfacePatch
+from .uncertainty import _project_patch_strengths_to_base
 
 
-PLANNING_METHOD = "two_stage_grouped_poisson_fisher_d_s_station_block_v3"
+PLANNING_METHOD = "two_stage_grouped_likelihood_fisher_d_s_station_block_v4"
+_BEAM_PRECISION_WORKSPACE_LIMIT_BYTES = 64 * 1024 * 1024
+
+
+def _beam_precision_chunk_size(parameter_count: int) -> int:
+    """Bound temporary beam precision matrices to a fixed workspace."""
+    count = int(parameter_count)
+    if count < 1:
+        raise ValueError("parameter_count must be positive.")
+    bytes_per_expansion = 3 * count * count * np.dtype(np.float64).itemsize
+    return max(1, _BEAM_PRECISION_WORKSPACE_LIMIT_BYTES // bytes_per_expansion)
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +344,63 @@ class _PlanningGeometry:
     station_ids: NDArray[np.int64] | None = None
 
 
+def _historical_row_keys(
+    observations: ObservationBatch,
+) -> tuple[tuple[object, ...], ...]:
+    """Return causal cache keys for every response-relevant history row."""
+    return tuple(
+        (
+            int(step_id),
+            np.asarray(position, dtype=np.float64).tobytes(),
+            np.asarray(quaternion, dtype=np.float64).tobytes(),
+            int(fe_index),
+            int(pb_index),
+            float(live_time),
+            int(station_id),
+        )
+        for (
+            step_id,
+            position,
+            quaternion,
+            fe_index,
+            pb_index,
+            live_time,
+            station_id,
+        ) in zip(
+            observations.step_ids,
+            observations.detector_positions_xyz,
+            observations.detector_quaternions_wxyz,
+            observations.fe_indices,
+            observations.pb_indices,
+            observations.live_times_s,
+            observations.station_ids,
+            strict=True,
+        )
+    )
+
+
+def _calibration_identity(path: str | None) -> tuple[str, str | None] | None:
+    """Return a content-sensitive identity for one calibration artifact."""
+    if path is None:
+        return None
+    resolved = Path(path).expanduser().resolve()
+    digest = sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None
+    return resolved.as_posix(), digest
+
+
+def _kernel_physical_identity(kernel: object) -> object:
+    """Return a value-sensitive identity for shared runtime kernel settings."""
+    if not is_dataclass(kernel) or isinstance(kernel, type):
+        return (type(kernel).__module__, type(kernel).__qualname__, id(kernel))
+    digest = sha256()
+    digest.update(b"planner-continuous-kernel-v1\0")
+    for kernel_field in dataclass_fields(kernel):
+        if kernel_field.init and kernel_field.name != "gpu_device":
+            _hash_canonical_value(digest, kernel_field.name)
+            _hash_canonical_value(digest, getattr(kernel, kernel_field.name))
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class _PatchView:
     """Expose estimated patches with aggregate area access."""
@@ -333,6 +414,42 @@ class _PatchView:
             [patch.area_m2 for patch in self.patches],
             dtype=np.float64,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _LineSpectralDesign:
+    """Store compact integrated-strength line factors for planning."""
+
+    spatial_factors: NDArray[np.float64]
+    pulse_shapes: NDArray[np.float64]
+    line_isotope_indices: NDArray[np.int64]
+    nuisance_response: NDArray[np.float64]
+    nuisance_names: tuple[str, ...]
+    energy_chunk_size: int
+    nuisance_l2_weights: NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float64)
+    )
+    overdispersion_alpha_by_bin: NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float64)
+    )
+
+    @property
+    def observation_shape(self) -> tuple[int, int]:
+        """Return action and energy-bin dimensions."""
+        return (
+            int(self.spatial_factors.shape[0]),
+            int(self.pulse_shapes.shape[1]),
+        )
+
+    @property
+    def patch_count(self) -> int:
+        """Return the shared surface patch count."""
+        return int(self.spatial_factors.shape[1])
+
+    @property
+    def isotope_count(self) -> int:
+        """Return the isotope dimension encoded by line membership."""
+        return int(np.max(self.line_isotope_indices)) + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,6 +734,29 @@ def _source_marginal_precision(
     return 0.5 * (marginal + marginal.T)
 
 
+def _planning_prior_precision(
+    source_count: int,
+    nuisance_scales: NDArray[np.float64],
+    nuisance_l2_weights: NDArray[np.float64],
+    *,
+    laplace_prior_precision: float,
+) -> NDArray[np.float64]:
+    """Return source ridge plus correctly scaled fitted nuisance precision."""
+    scales = np.asarray(nuisance_scales, dtype=np.float64)
+    weights = np.asarray(nuisance_l2_weights, dtype=np.float64)
+    if scales.shape != weights.shape or np.any(weights < 0.0):
+        raise ValueError("Planner nuisance scales and L2 weights must align.")
+    parameter_count = int(source_count) + int(scales.size)
+    prior = float(laplace_prior_precision) * np.eye(
+        parameter_count,
+        dtype=np.float64,
+    )
+    if scales.size:
+        nuisance_indices = np.arange(int(source_count), parameter_count)
+        prior[nuisance_indices, nuisance_indices] += weights * scales**2
+    return prior
+
+
 def _screening_background_rate(
     observations: ObservationBatch,
     edges: NDArray[np.float64],
@@ -648,6 +788,50 @@ def _screening_background_rate(
     return grouped / total_live_time
 
 
+def _group_last_axis(
+    values: NDArray[np.float64],
+    group_indices: NDArray[np.int64],
+    group_count: int,
+) -> NDArray[np.float64]:
+    """Sum the final array axis into deterministic non-overlapping groups."""
+    array = np.asarray(values, dtype=np.float64)
+    indices = np.asarray(group_indices, dtype=np.int64)
+    count = int(group_count)
+    if array.ndim < 1 or indices.shape != (array.shape[-1],):
+        raise ValueError("Group indices must align with the final array axis.")
+    if count < 1 or np.any(indices < 0) or np.any(indices >= count):
+        raise ValueError("Group indices must lie within the output group count.")
+    flat = array.reshape(-1, array.shape[-1])
+    grouped = np.zeros((flat.shape[0], count), dtype=np.float64)
+    for group_index in range(count):
+        selected = indices == group_index
+        if np.any(selected):
+            grouped[:, group_index] = np.sum(flat[:, selected], axis=1)
+    return grouped.reshape(*array.shape[:-1], count)
+
+
+def _grouped_overdispersed_variance(
+    expected_counts_by_bin: NDArray[np.float64],
+    alpha_by_bin: NDArray[np.float64],
+    group_indices: NDArray[np.int64],
+    group_count: int,
+) -> NDArray[np.float64]:
+    """Aggregate independent NB2 variances without losing fine-bin alpha."""
+    expected = np.asarray(expected_counts_by_bin, dtype=np.float64)
+    alpha = np.asarray(alpha_by_bin, dtype=np.float64)
+    if expected.ndim != 2 or alpha.shape != (expected.shape[1],):
+        raise ValueError("Fine expected counts and overdispersion must align.")
+    if (
+        np.any(~np.isfinite(expected))
+        or np.any(expected < 0.0)
+        or np.any(~np.isfinite(alpha))
+        or np.any(alpha < 0.0)
+    ):
+        raise ValueError("Expected counts and overdispersion must be non-negative.")
+    fine_variance = expected + alpha[None, :] * expected**2
+    return _group_last_axis(fine_variance, group_indices, group_count)
+
+
 def _screening_fisher_information(
     source_response: NDArray[np.float64],
     source_basis: NDArray[np.float64],
@@ -655,14 +839,26 @@ def _screening_fisher_information(
     background_counts: NDArray[np.float64],
     *,
     minimum_expected_count: float,
+    observation_variance: NDArray[np.float64] | None = None,
     use_gpu: bool = False,
     gpu_device: str = "cuda",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return source-only grouped-Poisson Fisher matrices for screening."""
+    """Return source-only grouped likelihood Fisher matrices for screening."""
     response = np.asarray(source_response, dtype=np.float64)
     background = np.ascontiguousarray(background_counts, dtype=np.float64)
     if response.ndim != 4 or background.shape != response.shape[:2]:
         raise ValueError("Screening response and background counts must align.")
+    supplied_variance = (
+        None
+        if observation_variance is None
+        else np.asarray(observation_variance, dtype=np.float64)
+    )
+    if supplied_variance is not None and (
+        supplied_variance.shape != response.shape[:2]
+        or np.any(~np.isfinite(supplied_variance))
+        or np.any(supplied_variance < 0.0)
+    ):
+        raise ValueError("Screening observation variance must align and be finite.")
     if use_gpu:
         import torch
 
@@ -687,11 +883,23 @@ def _screening_fisher_information(
             expected_t + background_t,
             min=float(minimum_expected_count),
         )
+        variance_t = (
+            expected_t
+            if supplied_variance is None
+            else torch.clamp(
+                torch.as_tensor(
+                    supplied_variance,
+                    dtype=torch.float64,
+                    device=device,
+                ),
+                min=float(minimum_expected_count),
+            )
+        )
         information_t = torch.einsum(
             "abp,abq,ab->apq",
             jacobian_t,
             jacobian_t,
-            1.0 / expected_t,
+            1.0 / variance_t,
         )
         information = information_t.detach().cpu().numpy()
         expected = expected_t.detach().cpu().numpy()
@@ -712,11 +920,19 @@ def _screening_fisher_information(
             expected + background,
             float(minimum_expected_count),
         )
+        variance = (
+            expected
+            if supplied_variance is None
+            else np.maximum(
+                supplied_variance,
+                float(minimum_expected_count),
+            )
+        )
         information = np.einsum(
             "abp,abq,ab->apq",
             jacobian,
             jacobian,
-            1.0 / expected,
+            1.0 / variance,
             optimize=True,
         )
     information = 0.5 * (information + np.swapaxes(information, 1, 2))
@@ -997,6 +1213,118 @@ def _spectral_design(
     )
 
 
+def _factorized_spectral_design(
+    observations: object,
+    estimate: MLEEstimate,
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+) -> _LineSpectralDesign:
+    """Build compact exact line factors in integrated-strength coordinates."""
+    calibration = (
+        None
+        if mle_config.discrepancy_calibration_path is None
+        else load_discrepancy_calibration(mle_config.discrepancy_calibration_path)
+    )
+    patch_view = _PatchView(estimate.patches)
+    details = build_spectral_response_operator(
+        observations,
+        patch_view,
+        estimate.isotope_names,
+        kernel,
+        chunk_size=int(mle_config.response_chunk_size),
+        measurement_chunk_size=int(mle_config.response_measurement_chunk_size),
+        energy_chunk_size=int(mle_config.response_energy_chunk_size),
+        patch_chunk_size=int(mle_config.response_patch_chunk_size),
+        worker_count=int(mle_config.response_worker_count),
+        cache_directory=None,
+        continuum_to_peak=float(mle_config.continuum_to_peak),
+        backscatter_fraction=float(mle_config.backscatter_fraction),
+        require_line_resolved=True,
+        include_background_nuisance=bool(mle_config.fit_background_nuisance),
+        include_scatter_nuisance=bool(mle_config.fit_scatter_nuisance),
+        discrepancy_calibration=calibration,
+        include_shield_leakage_nuisance=bool(mle_config.fit_shield_leakage_nuisance),
+        include_station_rate_nuisance=False,
+        include_low_rank_residual_nuisance=bool(
+            mle_config.fit_low_rank_residual_nuisance
+        ),
+        include_gain_resolution_drift=bool(mle_config.fit_gain_resolution_drift),
+    )
+    areas = patch_view.areas_m2
+    spatial = (
+        np.asarray(details.operator.spatial_factors, dtype=np.float64)
+        / areas[
+            None,
+            :,
+            None,
+        ]
+    )
+    spatial = np.ascontiguousarray(spatial, dtype=np.float64)
+    spatial.setflags(write=False)
+    overdispersion = (
+        details.overdispersion_alpha_by_bin
+        if mle_config.spectral_likelihood == "calibrated_overdispersed"
+        else np.zeros_like(details.overdispersion_alpha_by_bin)
+    )
+    nuisance_l2_weights = np.ascontiguousarray(
+        np.asarray(details.nuisance_l2_weights, dtype=np.float64)
+        + float(mle_config.nuisance_l2_weight)
+    )
+    nuisance_l2_weights.setflags(write=False)
+    return _LineSpectralDesign(
+        spatial_factors=spatial,
+        pulse_shapes=details.operator.pulse_shapes,
+        line_isotope_indices=details.operator.line_isotope_indices,
+        nuisance_response=details.nuisance_response,
+        nuisance_names=details.nuisance_names,
+        energy_chunk_size=int(mle_config.response_energy_chunk_size),
+        nuisance_l2_weights=nuisance_l2_weights,
+        overdispersion_alpha_by_bin=overdispersion,
+    )
+
+
+def _concatenate_factorized_designs(
+    first: _LineSpectralDesign,
+    second: _LineSpectralDesign,
+) -> _LineSpectralDesign:
+    """Append causal action rows after validating one common line model."""
+    if (
+        not np.array_equal(first.pulse_shapes, second.pulse_shapes)
+        or not np.array_equal(
+            first.line_isotope_indices,
+            second.line_isotope_indices,
+        )
+        or first.nuisance_names != second.nuisance_names
+        or first.patch_count != second.patch_count
+        or not np.array_equal(
+            first.nuisance_l2_weights,
+            second.nuisance_l2_weights,
+        )
+        or not np.array_equal(
+            first.overdispersion_alpha_by_bin,
+            second.overdispersion_alpha_by_bin,
+        )
+    ):
+        raise ValueError("Factorized planning designs do not share one model.")
+    spatial = np.concatenate((first.spatial_factors, second.spatial_factors), axis=0)
+    nuisance = np.concatenate(
+        (first.nuisance_response, second.nuisance_response),
+        axis=0,
+    )
+    spatial.setflags(write=False)
+    nuisance.setflags(write=False)
+    return _LineSpectralDesign(
+        spatial_factors=spatial,
+        pulse_shapes=first.pulse_shapes,
+        line_isotope_indices=first.line_isotope_indices,
+        nuisance_response=nuisance,
+        nuisance_names=first.nuisance_names,
+        energy_chunk_size=first.energy_chunk_size,
+        nuisance_l2_weights=first.nuisance_l2_weights,
+        overdispersion_alpha_by_bin=first.overdispersion_alpha_by_bin,
+    )
+
+
 def _screening_spectral_design(
     observations: object,
     patches: object,
@@ -1025,6 +1353,109 @@ def _screening_spectral_design(
     return details.response_per_integrated_strength
 
 
+def _calibrated_screening_spectral_design(
+    observations: _PlanningGeometry,
+    patches: object,
+    isotopes: Sequence[str],
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+    source_strengths: NDArray[np.float64],
+    background_rate_by_bin: NDArray[np.float64],
+    grouped_edges_keV: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Build grouped response and exact grouped NB2 variance from line factors."""
+    if mle_config.discrepancy_calibration_path is None:
+        raise ValueError("Calibrated screening requires a calibration artifact.")
+    calibration = load_discrepancy_calibration(mle_config.discrepancy_calibration_path)
+    details = build_spectral_response_operator(
+        observations,
+        patches,
+        isotopes,
+        kernel,
+        chunk_size=int(mle_config.response_chunk_size),
+        measurement_chunk_size=int(mle_config.response_measurement_chunk_size),
+        energy_chunk_size=int(mle_config.response_energy_chunk_size),
+        patch_chunk_size=int(mle_config.response_patch_chunk_size),
+        worker_count=int(mle_config.response_worker_count),
+        cache_directory=None,
+        continuum_to_peak=float(mle_config.continuum_to_peak),
+        backscatter_fraction=float(mle_config.backscatter_fraction),
+        require_line_resolved=True,
+        include_background_nuisance=False,
+        include_scatter_nuisance=False,
+        discrepancy_calibration=calibration,
+        include_shield_leakage_nuisance=False,
+        include_station_rate_nuisance=False,
+        include_low_rank_residual_nuisance=False,
+        include_gain_resolution_drift=False,
+    )
+    operator = details.operator
+    if not isinstance(operator, LineFactorizedResponseOperator):
+        raise TypeError("Calibrated screening requires line-factorized response.")
+    full_edges = np.asarray(observations.energy_bin_edges_keV, dtype=np.float64)
+    grouped_edges = np.asarray(grouped_edges_keV, dtype=np.float64)
+    full_centers = 0.5 * (full_edges[:-1] + full_edges[1:])
+    group_indices = np.searchsorted(grouped_edges, full_centers, side="right") - 1
+    group_count = int(grouped_edges.size - 1)
+    group_indices = np.clip(group_indices, 0, group_count - 1).astype(
+        np.int64,
+        copy=False,
+    )
+    grouped_pulses = _group_last_axis(
+        operator.pulse_shapes,
+        group_indices,
+        group_count,
+    )
+    measurement_count = int(operator.observation_shape[0])
+    grouped_response = np.zeros(
+        (
+            measurement_count,
+            group_count,
+            operator.patch_count,
+            operator.isotope_count,
+        ),
+        dtype=np.float64,
+    )
+    for line_index, isotope_index in enumerate(operator.line_isotope_indices):
+        grouped_response[:, :, :, int(isotope_index)] += (
+            operator.spatial_factors[:, None, :, line_index]
+            * grouped_pulses[line_index][None, :, None]
+        )
+    strengths = np.asarray(source_strengths, dtype=np.float64)
+    if strengths.shape != (operator.patch_count, operator.isotope_count):
+        raise ValueError("Screening strengths do not match compact response axes.")
+    amplitudes = np.einsum(
+        "mgl,gl->ml",
+        operator.spatial_factors,
+        strengths[:, operator.line_isotope_indices],
+        optimize=True,
+    )
+    background_rate = np.asarray(background_rate_by_bin, dtype=np.float64)
+    if background_rate.shape != (operator.observation_shape[1],):
+        raise ValueError("Fine screening background rate must match energy bins.")
+    background_by_bin = (
+        np.asarray(observations.live_times_s, dtype=np.float64)[:, None]
+        * background_rate[None, :]
+    )
+    expected_by_bin = amplitudes @ operator.pulse_shapes + background_by_bin
+    grouped_variance = _grouped_overdispersed_variance(
+        expected_by_bin,
+        details.overdispersion_alpha_by_bin,
+        group_indices,
+        group_count,
+    )
+    grouped_background = _group_last_axis(
+        background_by_bin,
+        group_indices,
+        group_count,
+    )
+    return grouped_response, grouped_background, grouped_variance
+
+
 def _historical_spectral_design(
     observations: ObservationBatch,
     estimate: MLEEstimate,
@@ -1039,6 +1470,7 @@ def _historical_spectral_design(
 ]:
     """Build or append the exact historical design for a causal prefix."""
     step_ids = tuple(int(value) for value in observations.step_ids)
+    row_keys = _historical_row_keys(observations)
     identity = (
         tuple(
             (
@@ -1057,7 +1489,7 @@ def _historical_spectral_design(
             for patch in estimate.patches
         ),
         tuple(estimate.isotope_names),
-        id(kernel),
+        _kernel_physical_identity(kernel),
         observations.energy_bin_edges_keV.tobytes(),
         float(mle_config.continuum_to_peak),
         float(mle_config.backscatter_fraction),
@@ -1066,16 +1498,16 @@ def _historical_spectral_design(
         bool(mle_config.fit_shield_leakage_nuisance),
         bool(mle_config.fit_low_rank_residual_nuisance),
         bool(mle_config.fit_gain_resolution_drift),
-        mle_config.discrepancy_calibration_path,
+        _calibration_identity(mle_config.discrepancy_calibration_path),
     )
     entry = None if cache is None else cache.get("historical_design")
     previous_count = 0
     if isinstance(entry, dict) and entry.get("identity") == identity:
-        previous_steps = entry.get("step_ids")
-        if isinstance(previous_steps, tuple) and step_ids[: len(previous_steps)] == (
-            previous_steps
+        previous_rows = entry.get("row_keys")
+        if isinstance(previous_rows, tuple) and row_keys[: len(previous_rows)] == (
+            previous_rows
         ):
-            previous_count = len(previous_steps)
+            previous_count = len(previous_rows)
             if previous_count == len(step_ids):
                 return (
                     np.asarray(entry["source"], dtype=np.float64),
@@ -1087,7 +1519,9 @@ def _historical_spectral_design(
                         "computed_measurements": 0,
                     },
                 )
-    if previous_count and not mle_config.fit_gain_resolution_drift:
+    if previous_count and mle_config.fit_gain_resolution_drift:
+        previous_count = 0
+    if previous_count:
         selected = slice(previous_count, len(step_ids))
         suffix = _PlanningGeometry(
             detector_positions_xyz=observations.detector_positions_xyz[selected],
@@ -1128,6 +1562,7 @@ def _historical_spectral_design(
         cache["historical_design"] = {
             "identity": identity,
             "step_ids": step_ids,
+            "row_keys": row_keys,
             "source": source,
             "nuisance": nuisance,
             "nuisance_names": tuple(nuisance_names),
@@ -1144,6 +1579,124 @@ def _historical_spectral_design(
     )
 
 
+def _historical_factorized_spectral_design(
+    observations: ObservationBatch,
+    estimate: MLEEstimate,
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+    cache: dict[str, object] | None,
+) -> tuple[_LineSpectralDesign, dict[str, object]]:
+    """Build or append compact historical factors for one causal prefix."""
+    step_ids = tuple(int(value) for value in observations.step_ids)
+    row_keys = _historical_row_keys(observations)
+    identity = (
+        tuple(
+            (
+                int(patch.patch_id),
+                np.asarray(patch.centroid_xyz, dtype=np.float64).tobytes(),
+                float(patch.area_m2),
+                np.asarray(
+                    patch.quadrature_points_xyz,
+                    dtype=np.float64,
+                ).tobytes(),
+                np.asarray(
+                    patch.quadrature_weights,
+                    dtype=np.float64,
+                ).tobytes(),
+            )
+            for patch in estimate.patches
+        ),
+        tuple(estimate.isotope_names),
+        _kernel_physical_identity(kernel),
+        observations.energy_bin_edges_keV.tobytes(),
+        float(mle_config.continuum_to_peak),
+        float(mle_config.backscatter_fraction),
+        bool(mle_config.fit_background_nuisance),
+        bool(mle_config.fit_scatter_nuisance),
+        bool(mle_config.fit_shield_leakage_nuisance),
+        bool(mle_config.fit_low_rank_residual_nuisance),
+        bool(mle_config.fit_gain_resolution_drift),
+        str(mle_config.spectral_likelihood),
+        float(mle_config.nuisance_l2_weight),
+        int(mle_config.response_energy_chunk_size),
+        _calibration_identity(mle_config.discrepancy_calibration_path),
+    )
+    entry = None if cache is None else cache.get("historical_factorized_design")
+    previous_count = 0
+    if isinstance(entry, dict) and entry.get("identity") == identity:
+        previous_rows = entry.get("row_keys")
+        previous_design = entry.get("design")
+        if (
+            isinstance(previous_rows, tuple)
+            and isinstance(previous_design, _LineSpectralDesign)
+            and row_keys[: len(previous_rows)] == previous_rows
+        ):
+            previous_count = len(previous_rows)
+            if previous_count == len(step_ids):
+                return previous_design, {
+                    "mode": "prefix_hit",
+                    "reused_measurements": previous_count,
+                    "computed_measurements": 0,
+                }
+    if previous_count and mle_config.fit_gain_resolution_drift:
+        previous_count = 0
+    if previous_count:
+        selected = slice(previous_count, len(step_ids))
+        suffix = _PlanningGeometry(
+            detector_positions_xyz=observations.detector_positions_xyz[selected],
+            fe_indices=observations.fe_indices[selected],
+            pb_indices=observations.pb_indices[selected],
+            live_times_s=observations.live_times_s[selected],
+            energy_bin_edges_keV=observations.energy_bin_edges_keV,
+            station_ids=observations.station_ids[selected],
+        )
+        suffix_design = _factorized_spectral_design(
+            suffix,
+            estimate,
+            kernel,
+            mle_config,
+        )
+        assert isinstance(entry, dict)
+        previous_design = entry.get("design")
+        if isinstance(previous_design, _LineSpectralDesign):
+            design = _concatenate_factorized_designs(
+                previous_design,
+                suffix_design,
+            )
+            mode = "prefix_append"
+        else:
+            previous_count = 0
+    if previous_count == 0:
+        design = _factorized_spectral_design(
+            observations,
+            estimate,
+            kernel,
+            mle_config,
+        )
+        mode = "full_rebuild"
+    if cache is not None:
+        cache["historical_factorized_design"] = {
+            "identity": identity,
+            "step_ids": step_ids,
+            "row_keys": row_keys,
+            "design": design,
+        }
+    return design, {
+        "mode": mode,
+        "reused_measurements": previous_count,
+        "computed_measurements": len(step_ids) - previous_count,
+    }
+
+
+def _cached_model_identity(
+    cache: dict[str, object] | None,
+    entry_name: str,
+) -> object | None:
+    """Return the physical model identity stored with one response cache."""
+    entry = None if cache is None else cache.get(entry_name)
+    return entry.get("identity") if isinstance(entry, dict) else None
+
+
 def _fisher_information(
     source_response: NDArray[np.float64],
     nuisance_response: NDArray[np.float64],
@@ -1153,6 +1706,7 @@ def _fisher_information(
     nuisance_scales: NDArray[np.float64],
     *,
     minimum_expected_count: float,
+    overdispersion_alpha_by_bin: NDArray[np.float64] | None = None,
     use_gpu: bool = False,
     gpu_device: str = "cuda",
 ) -> tuple[
@@ -1177,6 +1731,13 @@ def _fisher_information(
         nuisance_coefficients.shape != nuisance_scales.shape
     ):
         raise ValueError("Nuisance response, coefficients, and scales must align.")
+    alpha = (
+        np.zeros(bin_count, dtype=np.float64)
+        if overdispersion_alpha_by_bin is None
+        else np.asarray(overdispersion_alpha_by_bin, dtype=np.float64)
+    )
+    if alpha.shape != (bin_count,) or np.any(~np.isfinite(alpha)) or np.any(alpha < 0):
+        raise ValueError("Fisher overdispersion alpha must match energy bins.")
     if use_gpu:
         import torch
 
@@ -1199,32 +1760,41 @@ def _fisher_information(
         )
         nuisance_jacobian_t = nuisance_t * tensor(nuisance_scales)[None, None, :]
         jacobian_t = torch.cat((source_jacobian_t, nuisance_jacobian_t), dim=2)
-        expected_t = torch.einsum(
+        expected_raw_t = torch.einsum(
             "abgi,gi->ab",
             response_t,
             tensor(source_strengths),
         )
         if nuisance_coefficients.size:
-            expected_t = expected_t + torch.einsum(
+            expected_raw_t = expected_raw_t + torch.einsum(
                 "abn,n->ab",
                 nuisance_t,
                 tensor(nuisance_coefficients),
             )
         expected_t = torch.clamp(
-            expected_t,
+            expected_raw_t,
             min=float(minimum_expected_count),
         )
-        information_t = torch.einsum(
-            "abp,abq,ab->apq",
-            jacobian_t,
-            jacobian_t,
-            1.0 / expected_t,
+        variance_t = expected_t + tensor(alpha)[None, :] * expected_t.square()
+        weighted_jacobian_t = jacobian_t * torch.rsqrt(variance_t).unsqueeze(-1)
+        information_t = torch.bmm(
+            weighted_jacobian_t.transpose(1, 2),
+            weighted_jacobian_t,
         )
         information_t = 0.5 * information_t.add(information_t.transpose(1, 2))
-        station_cross_t = torch.sum(jacobian_t, dim=1)
-        station_information_t = torch.sum(expected_t, dim=1)
+        station_derivative_t = torch.clamp(expected_raw_t, min=0.0)
+        station_weight_t = station_derivative_t / variance_t
+        station_cross_t = torch.sum(
+            jacobian_t * station_weight_t.unsqueeze(-1),
+            dim=1,
+        )
+        station_information_t = torch.sum(
+            station_derivative_t * station_weight_t,
+            dim=1,
+        )
+        expected_totals_t = torch.sum(station_derivative_t, dim=1)
         information = information_t.detach().cpu().numpy()
-        expected = expected_t.detach().cpu().numpy()
+        expected_totals = expected_totals_t.detach().cpu().numpy()
         station_cross = station_cross_t.detach().cpu().numpy()
         station_information = station_information_t.detach().cpu().numpy()
     else:
@@ -1236,31 +1806,266 @@ def _fisher_information(
         )
         nuisance_jacobian = nuisance * nuisance_scales[None, None, :]
         jacobian = np.concatenate((source_jacobian, nuisance_jacobian), axis=2)
-        expected = np.einsum(
+        expected_raw = np.einsum(
             "abgi,gi->ab",
             response,
             source_strengths,
             optimize=True,
         )
         if nuisance_coefficients.size:
-            expected = expected + np.einsum(
+            expected_raw = expected_raw + np.einsum(
                 "abn,n->ab",
                 nuisance,
                 nuisance_coefficients,
                 optimize=True,
             )
-        expected = np.maximum(expected, float(minimum_expected_count))
-        information = np.einsum(
-            "abp,abq,ab->apq",
-            jacobian,
-            jacobian,
-            1.0 / expected,
-            optimize=True,
+        expected = np.maximum(expected_raw, float(minimum_expected_count))
+        variance = expected + alpha[None, :] * expected**2
+        weighted_jacobian = jacobian / np.sqrt(variance)[..., None]
+        information = np.matmul(
+            np.swapaxes(weighted_jacobian, 1, 2),
+            weighted_jacobian,
         )
         information = 0.5 * (information + np.swapaxes(information, 1, 2))
-        station_cross = np.sum(jacobian, axis=1)
-        station_information = np.sum(expected, axis=1)
-    return information, station_information, station_cross, station_information
+        station_derivative = np.maximum(expected_raw, 0.0)
+        station_weight = station_derivative / variance
+        station_cross = np.sum(jacobian * station_weight[..., None], axis=1)
+        station_information = np.sum(station_derivative * station_weight, axis=1)
+        expected_totals = np.sum(station_derivative, axis=1)
+    return information, expected_totals, station_cross, station_information
+
+
+def _factorized_source_spectrum(
+    design: _LineSpectralDesign,
+    source_weights: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Project compact line factors onto one patch-isotope source map."""
+    weights = np.asarray(source_weights, dtype=np.float64)
+    if weights.shape != (design.patch_count, design.isotope_count):
+        raise ValueError("Source weights do not match factorized planning axes.")
+    weights_by_line = weights[:, design.line_isotope_indices]
+    amplitudes = np.einsum(
+        "mgl,gl->ml",
+        design.spatial_factors,
+        weights_by_line,
+        optimize=True,
+    )
+    return amplitudes @ design.pulse_shapes
+
+
+def _factorized_fisher_information(
+    design: _LineSpectralDesign,
+    source_basis: NDArray[np.float64],
+    source_strengths: NDArray[np.float64],
+    nuisance_coefficients: NDArray[np.float64],
+    nuisance_scales: NDArray[np.float64],
+    *,
+    minimum_expected_count: float,
+    use_gpu: bool = False,
+    gpu_device: str = "cuda",
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Reduce exact Fisher terms from line factors in bounded energy chunks."""
+    basis = np.asarray(source_basis, dtype=np.float64)
+    strengths = np.asarray(source_strengths, dtype=np.float64)
+    nuisance_coefficients = np.asarray(nuisance_coefficients, dtype=np.float64)
+    nuisance_scales = np.asarray(nuisance_scales, dtype=np.float64)
+    if basis.shape[:2] != (design.patch_count, design.isotope_count):
+        raise ValueError("source_basis does not match factorized response axes.")
+    if strengths.shape != (design.patch_count, design.isotope_count):
+        raise ValueError("source_strengths do not match factorized response axes.")
+    nuisance_count = int(nuisance_coefficients.size)
+    if (
+        design.nuisance_response.shape != (*design.observation_shape, nuisance_count)
+        or nuisance_scales.shape != nuisance_coefficients.shape
+    ):
+        raise ValueError("Factorized nuisance response and coefficients must align.")
+    basis_by_line = basis[:, design.line_isotope_indices, :]
+    strengths_by_line = strengths[:, design.line_isotope_indices]
+    action_count, bin_count = design.observation_shape
+    alpha = np.asarray(design.overdispersion_alpha_by_bin, dtype=np.float64)
+    if alpha.size == 0:
+        alpha = np.zeros(bin_count, dtype=np.float64)
+    if alpha.shape != (bin_count,) or np.any(~np.isfinite(alpha)) or np.any(alpha < 0):
+        raise ValueError("Factorized Fisher overdispersion must match energy bins.")
+    parameter_count = int(basis.shape[2] + nuisance_count)
+    energy_step = max(1, int(design.energy_chunk_size))
+    if use_gpu:
+        import torch
+
+        device = torch.device(gpu_device)
+        if device.type != "cuda":
+            raise ValueError("GPU Fisher planning requires a CUDA device.")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA Fisher planning requested but CUDA is unavailable."
+            )
+
+        def tensor(values: object) -> object:
+            """Copy one factorized planner array to CUDA float64."""
+            return torch.as_tensor(values, dtype=torch.float64, device=device)
+
+        spatial_t = tensor(design.spatial_factors)
+        pulses_t = tensor(design.pulse_shapes)
+        nuisance_t = tensor(design.nuisance_response)
+        amplitude_basis_t = torch.einsum(
+            "mgl,glk->mlk",
+            spatial_t,
+            tensor(basis_by_line),
+        )
+        amplitude_strength_t = torch.einsum(
+            "mgl,gl->ml",
+            spatial_t,
+            tensor(strengths_by_line),
+        )
+        nuisance_coefficients_t = tensor(nuisance_coefficients)
+        nuisance_scales_t = tensor(nuisance_scales)
+        alpha_t = tensor(alpha)
+        information_t = torch.zeros(
+            (action_count, parameter_count, parameter_count),
+            dtype=torch.float64,
+            device=device,
+        )
+        station_cross_t = torch.zeros(
+            (action_count, parameter_count),
+            dtype=torch.float64,
+            device=device,
+        )
+        station_information_t = torch.zeros(
+            action_count,
+            dtype=torch.float64,
+            device=device,
+        )
+        expected_totals_t = torch.zeros(
+            action_count,
+            dtype=torch.float64,
+            device=device,
+        )
+        for energy_start in range(0, bin_count, energy_step):
+            energy_stop = min(energy_start + energy_step, bin_count)
+            pulse_chunk = pulses_t[:, energy_start:energy_stop]
+            source_jacobian = torch.einsum(
+                "mlk,le->mek",
+                amplitude_basis_t,
+                pulse_chunk,
+            )
+            nuisance_chunk = nuisance_t[:, energy_start:energy_stop]
+            nuisance_jacobian = nuisance_chunk * nuisance_scales_t[None, None, :]
+            jacobian = torch.cat((source_jacobian, nuisance_jacobian), dim=2)
+            expected_raw = torch.einsum(
+                "ml,le->me",
+                amplitude_strength_t,
+                pulse_chunk,
+            )
+            if nuisance_count:
+                expected_raw = expected_raw + torch.einsum(
+                    "men,n->me",
+                    nuisance_chunk,
+                    nuisance_coefficients_t,
+                )
+            expected = torch.clamp(
+                expected_raw,
+                min=float(minimum_expected_count),
+            )
+            alpha_chunk = alpha_t[energy_start:energy_stop]
+            variance = expected + alpha_chunk[None, :] * expected.square()
+            weighted_jacobian = jacobian * torch.rsqrt(variance).unsqueeze(-1)
+            information_t += torch.bmm(
+                weighted_jacobian.transpose(1, 2),
+                weighted_jacobian,
+            )
+            station_derivative = torch.clamp(expected_raw, min=0.0)
+            station_weight = station_derivative / variance
+            station_cross_t += torch.sum(
+                jacobian * station_weight.unsqueeze(-1),
+                dim=1,
+            )
+            station_information_t += torch.sum(
+                station_derivative * station_weight,
+                dim=1,
+            )
+            expected_totals_t += torch.sum(station_derivative, dim=1)
+        information_t = 0.5 * information_t.add(information_t.transpose(1, 2))
+        information = information_t.cpu().numpy()
+        expected_totals = expected_totals_t.cpu().numpy()
+        station_cross = station_cross_t.cpu().numpy()
+        station_information = station_information_t.cpu().numpy()
+    else:
+        amplitude_basis = np.einsum(
+            "mgl,glk->mlk",
+            design.spatial_factors,
+            basis_by_line,
+            optimize=True,
+        )
+        amplitude_strength = np.einsum(
+            "mgl,gl->ml",
+            design.spatial_factors,
+            strengths_by_line,
+            optimize=True,
+        )
+        information = np.zeros(
+            (action_count, parameter_count, parameter_count),
+            dtype=np.float64,
+        )
+        station_cross = np.zeros(
+            (action_count, parameter_count),
+            dtype=np.float64,
+        )
+        station_information = np.zeros(action_count, dtype=np.float64)
+        expected_totals = np.zeros(action_count, dtype=np.float64)
+        for energy_start in range(0, bin_count, energy_step):
+            energy_stop = min(energy_start + energy_step, bin_count)
+            pulse_chunk = design.pulse_shapes[:, energy_start:energy_stop]
+            source_jacobian = np.einsum(
+                "mlk,le->mek",
+                amplitude_basis,
+                pulse_chunk,
+                optimize=True,
+            )
+            nuisance_chunk = design.nuisance_response[
+                :,
+                energy_start:energy_stop,
+            ]
+            nuisance_jacobian = nuisance_chunk * nuisance_scales[None, None, :]
+            jacobian = np.concatenate(
+                (source_jacobian, nuisance_jacobian),
+                axis=2,
+            )
+            expected_raw = np.einsum(
+                "ml,le->me",
+                amplitude_strength,
+                pulse_chunk,
+                optimize=True,
+            )
+            if nuisance_count:
+                expected_raw += np.einsum(
+                    "men,n->me",
+                    nuisance_chunk,
+                    nuisance_coefficients,
+                    optimize=True,
+                )
+            expected = np.maximum(expected_raw, float(minimum_expected_count))
+            alpha_chunk = alpha[energy_start:energy_stop]
+            variance = expected + alpha_chunk[None, :] * expected**2
+            weighted_jacobian = jacobian / np.sqrt(variance)[..., None]
+            information += np.matmul(
+                np.swapaxes(weighted_jacobian, 1, 2),
+                weighted_jacobian,
+            )
+            station_derivative = np.maximum(expected_raw, 0.0)
+            station_weight = station_derivative / variance
+            station_cross += np.sum(jacobian * station_weight[..., None], axis=1)
+            station_information += np.sum(
+                station_derivative * station_weight,
+                axis=1,
+            )
+            expected_totals += np.sum(station_derivative, axis=1)
+        information = 0.5 * (information + np.swapaxes(information, 1, 2))
+    return information, expected_totals, station_cross, station_information
 
 
 def _historical_fisher_precision(
@@ -1270,14 +2075,16 @@ def _historical_fisher_precision(
     source_strengths: NDArray[np.float64],
     nuisance_coefficients: NDArray[np.float64],
     nuisance_scales: NDArray[np.float64],
-    step_ids: Sequence[int],
+    history_keys: Sequence[object],
     *,
+    model_identity: object | None = None,
     minimum_expected_count: float,
     cache: dict[str, object] | None,
 ) -> tuple[NDArray[np.float64], dict[str, object]]:
     """Reuse historical Fisher terms only while their fitted state is exact."""
-    steps = tuple(int(value) for value in step_ids)
+    steps = tuple(history_keys)
     parameter_identity = (
+        model_identity,
         np.asarray(source_basis, dtype=np.float64).tobytes(),
         np.asarray(source_strengths, dtype=np.float64).tobytes(),
         np.asarray(nuisance_coefficients, dtype=np.float64).tobytes(),
@@ -1341,35 +2148,139 @@ def _historical_fisher_precision(
     }
 
 
+def _historical_factorized_fisher_precision(
+    design: _LineSpectralDesign,
+    source_basis: NDArray[np.float64],
+    source_strengths: NDArray[np.float64],
+    nuisance_coefficients: NDArray[np.float64],
+    nuisance_scales: NDArray[np.float64],
+    history_keys: Sequence[object],
+    *,
+    model_identity: object | None = None,
+    minimum_expected_count: float,
+    cache: dict[str, object] | None,
+    use_gpu: bool,
+    gpu_device: str,
+    cache_entry_name: str = "historical_factorized_fisher",
+) -> tuple[NDArray[np.float64], dict[str, object]]:
+    """Reuse compact-design historical Fisher terms for a causal prefix."""
+    steps = tuple(history_keys)
+    parameter_identity = (
+        model_identity,
+        np.asarray(design.overdispersion_alpha_by_bin, dtype=np.float64).tobytes(),
+        np.asarray(source_basis, dtype=np.float64).tobytes(),
+        np.asarray(source_strengths, dtype=np.float64).tobytes(),
+        np.asarray(nuisance_coefficients, dtype=np.float64).tobytes(),
+        np.asarray(nuisance_scales, dtype=np.float64).tobytes(),
+        float(minimum_expected_count),
+    )
+    entry = None if cache is None else cache.get(cache_entry_name)
+    previous_count = 0
+    if isinstance(entry, dict) and entry.get("identity") == parameter_identity:
+        previous_steps = entry.get("step_ids")
+        if isinstance(previous_steps, tuple) and steps[: len(previous_steps)] == (
+            previous_steps
+        ):
+            previous_count = len(previous_steps)
+            if previous_count == len(steps):
+                return np.asarray(entry["precision"], dtype=np.float64), {
+                    "mode": "prefix_hit",
+                    "reused_measurements": previous_count,
+                    "computed_measurements": 0,
+                }
+    selected_design = (
+        _LineSpectralDesign(
+            spatial_factors=design.spatial_factors[previous_count:],
+            pulse_shapes=design.pulse_shapes,
+            line_isotope_indices=design.line_isotope_indices,
+            nuisance_response=design.nuisance_response[previous_count:],
+            nuisance_names=design.nuisance_names,
+            energy_chunk_size=design.energy_chunk_size,
+            nuisance_l2_weights=design.nuisance_l2_weights,
+            overdispersion_alpha_by_bin=design.overdispersion_alpha_by_bin,
+        )
+        if previous_count
+        else design
+    )
+    information, _, _, _ = _factorized_fisher_information(
+        selected_design,
+        source_basis,
+        source_strengths,
+        nuisance_coefficients,
+        nuisance_scales,
+        minimum_expected_count=minimum_expected_count,
+        use_gpu=use_gpu,
+        gpu_device=gpu_device,
+    )
+    precision = np.sum(information, axis=0)
+    if previous_count:
+        assert isinstance(entry, dict)
+        precision += np.asarray(entry["precision"], dtype=np.float64)
+        mode = "prefix_append"
+    else:
+        mode = "full_rebuild"
+    precision = np.asarray(precision, dtype=np.float64)
+    precision.setflags(write=False)
+    if cache is not None:
+        cache[cache_entry_name] = {
+            "identity": parameter_identity,
+            "step_ids": steps,
+            "precision": precision,
+        }
+    return precision, {
+        "mode": mode,
+        "reused_measurements": previous_count,
+        "computed_measurements": len(steps) - previous_count,
+    }
+
+
 def _symmetric_spectral_separation(
     first: NDArray[np.float64],
     second: NDArray[np.float64],
+    overdispersion_alpha_by_bin: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Return bounded symmetric chi-square separation along the bin axis."""
+    """Return bounded count- and variance-aware spectral separation."""
     first_values = np.asarray(first, dtype=np.float64)
     second_values = np.asarray(second, dtype=np.float64)
-    first_normalized = first_values / np.maximum(
-        np.sum(first_values, axis=-1, keepdims=True),
-        1.0e-30,
+    if first_values.shape != second_values.shape or first_values.ndim < 1:
+        raise ValueError("Spectral hypotheses must have matching array shapes.")
+    if (
+        np.any(~np.isfinite(first_values))
+        or np.any(first_values < 0.0)
+        or np.any(~np.isfinite(second_values))
+        or np.any(second_values < 0.0)
+    ):
+        raise ValueError("Spectral hypotheses must contain finite non-negative counts.")
+    alpha = (
+        np.zeros(first_values.shape[-1], dtype=np.float64)
+        if overdispersion_alpha_by_bin is None
+        else np.asarray(overdispersion_alpha_by_bin, dtype=np.float64)
     )
-    second_normalized = second_values / np.maximum(
-        np.sum(second_values, axis=-1, keepdims=True),
-        1.0e-30,
+    if alpha.size == 0:
+        alpha = np.zeros(first_values.shape[-1], dtype=np.float64)
+    if (
+        alpha.shape != (first_values.shape[-1],)
+        or np.any(~np.isfinite(alpha))
+        or np.any(alpha < 0.0)
+    ):
+        raise ValueError("Spectral separation overdispersion must match bins.")
+    denominator = (
+        first_values + second_values + alpha * (first_values**2 + second_values**2)
     )
-    denominator = first_normalized + second_normalized
-    return 0.5 * np.sum(
+    distance = 0.5 * np.sum(
         np.divide(
-            (first_normalized - second_normalized) ** 2,
+            (first_values - second_values) ** 2,
             denominator,
             out=np.zeros_like(denominator),
             where=denominator > 0.0,
         ),
         axis=-1,
     )
+    return -np.expm1(-np.maximum(distance, 0.0))
 
 
 def _ambiguity_metrics(
-    response: NDArray[np.float64],
+    response: NDArray[np.float64] | _LineSpectralDesign,
     information: NDArray[np.float64],
     poses: NDArray[np.float64],
     estimate: MLEEstimate,
@@ -1378,7 +2289,24 @@ def _ambiguity_metrics(
     alternatives: Sequence[MLEEstimate],
 ) -> dict[str, NDArray[np.float64]]:
     """Return pose/pair metrics for vertical and support-hypothesis ambiguity."""
-    action_count, _bin_count, patch_count, isotope_count = response.shape
+    if isinstance(response, _LineSpectralDesign):
+        action_count, _bin_count = response.observation_shape
+        patch_count = response.patch_count
+        isotope_count = response.isotope_count
+        separation_alpha = response.overdispersion_alpha_by_bin
+
+        def project(weights: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Project one source hypothesis through compact line factors."""
+            return _factorized_source_spectrum(response, weights)
+
+    else:
+        action_count, _bin_count, patch_count, isotope_count = response.shape
+        separation_alpha = np.zeros(_bin_count, dtype=np.float64)
+
+        def project(weights: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Project one source hypothesis through a dense test response."""
+            return np.einsum("abgi,gi->ab", response, weights, optimize=True)
+
     if patch_count != len(estimate.patches):
         raise ValueError("Planner response and estimate patches do not align.")
     floor = np.asarray(
@@ -1395,13 +2323,14 @@ def _ambiguity_metrics(
         weights = np.zeros((patch_count, isotope_count), dtype=np.float64)
         if np.any(mask):
             weights[mask] = 1.0 / (float(np.count_nonzero(mask)) * isotope_count)
-        return np.einsum("abgi,gi->ab", response, weights, optimize=True)
+        return project(weights)
 
     floor_spectrum = surface_spectrum(floor)
     ceiling_spectrum = surface_spectrum(ceiling)
     floor_ceiling = _symmetric_spectral_separation(
         floor_spectrum,
         ceiling_spectrum,
+        separation_alpha,
     )
     floor_centered = floor_spectrum - np.mean(floor_spectrum, axis=1, keepdims=True)
     ceiling_centered = ceiling_spectrum - np.mean(
@@ -1431,40 +2360,49 @@ def _ambiguity_metrics(
     ) / np.maximum(basis_mass, 1.0e-30)
     z_span = max(float(np.ptp(patch_z)), 1.0e-12)
     z_scale = (basis_z - float(np.mean(basis_z))) / z_span
-    source_count = source_basis.shape[2]
+    source_count = int(source_basis.shape[2])
+    nuisance_count = int(information.shape[1]) - source_count
+    marginal_information = np.stack(
+        tuple(
+            _source_marginal_precision(action_information, nuisance_count)
+            for action_information in information
+        ),
+        axis=0,
+    )
     z_fisher = np.einsum(
-        "ak,ak->a",
-        np.diagonal(information[:, :source_count, :source_count], axis1=1, axis2=2),
-        np.broadcast_to(z_scale * z_scale, (action_count, source_count)),
+        "k,akl,l->a",
+        z_scale,
+        marginal_information,
+        z_scale,
         optimize=True,
     )
     z_fisher = np.log1p(np.maximum(z_fisher, 0.0))
 
     support_separation = np.zeros(action_count, dtype=np.float64)
     base_strength = np.asarray(estimate.patch_strength_by_isotope, dtype=float).T
-    base_prediction = np.einsum(
-        "abgi,gi->ab",
-        response,
-        base_strength,
-        optimize=True,
-    )
-    valid_alternatives = [
-        alternative
-        for alternative in alternatives
-        if tuple(patch.patch_id for patch in alternative.patches)
-        == tuple(patch.patch_id for patch in estimate.patches)
-        and tuple(alternative.isotope_names) == tuple(estimate.isotope_names)
-    ]
-    for alternative in valid_alternatives:
-        prediction = np.einsum(
-            "abgi,gi->ab",
-            response,
-            np.asarray(alternative.patch_strength_by_isotope, dtype=float).T,
-            optimize=True,
-        )
+    base_prediction = project(base_strength)
+    for alternative in alternatives:
+        if tuple(alternative.isotope_names) != tuple(estimate.isotope_names):
+            continue
+        try:
+            projection = _project_patch_strengths_to_base(
+                estimate.patches,
+                alternative.patches,
+            )
+        except ValueError:
+            continue
+        alternative_strength = np.asarray(
+            alternative.patch_strength_by_isotope,
+            dtype=np.float64,
+        ).T
+        prediction = project(projection @ alternative_strength)
         support_separation = np.maximum(
             support_separation,
-            _symmetric_spectral_separation(base_prediction, prediction),
+            _symmetric_spectral_separation(
+                base_prediction,
+                prediction,
+                separation_alpha,
+            ),
         )
 
     strengths = np.sum(base_strength, axis=1)
@@ -1732,14 +2670,31 @@ def _cuda_beam_search_pose_program(
                 )
         if not metadata:
             raise RuntimeError("No unselected shield pair remains.")
-        parent_t = torch.as_tensor(parents, dtype=torch.long, device=device)
-        pair_t = torch.as_tensor(pair_indices, dtype=torch.long, device=device)
-        next_precisions = state_precisions[parent_t] + information_t[pair_t]
-        next_values = _cuda_source_log_precision(
-            next_precisions,
-            effective_nuisance_count,
-            torch_module=torch,
-        )
+        parent_array = np.asarray(parents, dtype=np.int64)
+        pair_array = np.asarray(pair_indices, dtype=np.int64)
+        next_values = np.empty(parent_array.size, dtype=np.float64)
+        expansion_step = _beam_precision_chunk_size(int(precision.shape[0]))
+        for expansion_start in range(0, parent_array.size, expansion_step):
+            expansion_stop = min(
+                expansion_start + expansion_step,
+                parent_array.size,
+            )
+            parent_t = torch.as_tensor(
+                parent_array[expansion_start:expansion_stop],
+                dtype=torch.long,
+                device=device,
+            )
+            pair_t = torch.as_tensor(
+                pair_array[expansion_start:expansion_stop],
+                dtype=torch.long,
+                device=device,
+            )
+            precision_chunk = state_precisions[parent_t] + information_t[pair_t]
+            next_values[expansion_start:expansion_stop] = _cuda_source_log_precision(
+                precision_chunk,
+                effective_nuisance_count,
+                torch_module=torch,
+            )
         expansions: list[
             tuple[
                 tuple[float, float, tuple[int, ...]],
@@ -1773,12 +2728,23 @@ def _cuda_beam_search_pose_program(
             )
         expansions.sort(key=lambda item: item[0])
         retained = expansions[: int(config.shield_program_beam_width)]
-        retained_indices = torch.as_tensor(
+        retained_indices = np.asarray(
             [item[1] for item in retained],
+            dtype=np.int64,
+        )
+        retained_parent_t = torch.as_tensor(
+            parent_array[retained_indices],
             dtype=torch.long,
             device=device,
         )
-        state_precisions = next_precisions[retained_indices]
+        retained_pair_t = torch.as_tensor(
+            pair_array[retained_indices],
+            dtype=torch.long,
+            device=device,
+        )
+        state_precisions = (
+            state_precisions[retained_parent_t] + information_t[retained_pair_t]
+        )
         states = [item[2] for item in retained]
     selected_indices, selected_pairs, current_value, rotation, _ = states[0]
     return selected_indices, selected_pairs, current_value, rotation
@@ -1861,21 +2827,40 @@ def _cuda_beam_search_pose_programs(
                             next_rotation,
                         )
                     )
-        candidate_t = torch.as_tensor(
-            candidate_indices,
-            dtype=torch.long,
-            device=device,
-        )
-        parent_t = torch.as_tensor(parent_indices, dtype=torch.long, device=device)
-        pair_t = torch.as_tensor(pair_indices, dtype=torch.long, device=device)
-        next_precisions = (
-            state_precisions[candidate_t, parent_t] + information_t[candidate_t, pair_t]
-        )
-        next_values = _cuda_source_log_precision(
-            next_precisions,
-            effective_nuisance_count,
-            torch_module=torch,
-        )
+        candidate_array = np.asarray(candidate_indices, dtype=np.int64)
+        parent_array = np.asarray(parent_indices, dtype=np.int64)
+        pair_array = np.asarray(pair_indices, dtype=np.int64)
+        next_values = np.empty(candidate_array.size, dtype=np.float64)
+        expansion_step = _beam_precision_chunk_size(int(precision.shape[0]))
+        for expansion_start in range(0, candidate_array.size, expansion_step):
+            expansion_stop = min(
+                expansion_start + expansion_step,
+                candidate_array.size,
+            )
+            candidate_t = torch.as_tensor(
+                candidate_array[expansion_start:expansion_stop],
+                dtype=torch.long,
+                device=device,
+            )
+            parent_t = torch.as_tensor(
+                parent_array[expansion_start:expansion_stop],
+                dtype=torch.long,
+                device=device,
+            )
+            pair_t = torch.as_tensor(
+                pair_array[expansion_start:expansion_stop],
+                dtype=torch.long,
+                device=device,
+            )
+            precision_chunk = (
+                state_precisions[candidate_t, parent_t]
+                + information_t[candidate_t, pair_t]
+            )
+            next_values[expansion_start:expansion_stop] = _cuda_source_log_precision(
+                precision_chunk,
+                effective_nuisance_count,
+                torch_module=torch,
+            )
         expansions: list[
             list[
                 tuple[
@@ -1922,13 +2907,27 @@ def _cuda_beam_search_pose_programs(
                 raise RuntimeError("Candidate beams retained inconsistent widths.")
             retained_indices.extend(item[1] for item in retained)
             next_states.append([item[2] for item in retained])
-        retained_t = torch.as_tensor(
-            retained_indices,
+        retained_array = np.asarray(retained_indices, dtype=np.int64)
+        retained_candidate_t = torch.as_tensor(
+            candidate_array[retained_array],
+            dtype=torch.long,
+            device=device,
+        )
+        retained_parent_t = torch.as_tensor(
+            parent_array[retained_array],
+            dtype=torch.long,
+            device=device,
+        )
+        retained_pair_t = torch.as_tensor(
+            pair_array[retained_array],
             dtype=torch.long,
             device=device,
         )
         assert retained_count is not None
-        state_precisions = next_precisions[retained_t].reshape(
+        state_precisions = (
+            state_precisions[retained_candidate_t, retained_parent_t]
+            + information_t[retained_candidate_t, retained_pair_t]
+        ).reshape(
             candidate_count,
             retained_count,
             *precision.shape,
@@ -2161,21 +3160,22 @@ def _select_pose_program(
                     tuple[
                         tuple[int, ...],
                         tuple[int, ...],
-                        NDArray[np.float64],
+                        int,
+                        int,
                         float,
                         float,
                         int,
                     ],
                 ]
             ] = []
-            for (
+            for parent_index, (
                 state_indices,
                 state_pairs,
                 state_precision,
                 _,
                 rotation,
                 _previous,
-            ) in states:
+            ) in enumerate(states):
                 selected_set = set(state_indices)
                 for pair_index, raw_pair_id in enumerate(pair_ids):
                     if pair_index in selected_set:
@@ -2206,7 +3206,8 @@ def _select_pose_program(
                             (
                                 next_indices,
                                 next_pairs,
-                                next_precision,
+                                parent_index,
+                                pair_index,
                                 next_value,
                                 next_rotation,
                                 pair_id,
@@ -2216,10 +3217,31 @@ def _select_pose_program(
             if not expansions:
                 raise RuntimeError("No unselected shield pair remains.")
             expansions.sort(key=lambda item: item[0])
-            states = [
-                state
-                for _, state in expansions[: int(config.shield_program_beam_width)]
-            ]
+            previous_states = states
+            states = []
+            for _, retained in expansions[: int(config.shield_program_beam_width)]:
+                (
+                    next_indices,
+                    next_pairs,
+                    parent_index,
+                    pair_index,
+                    next_value,
+                    next_rotation,
+                    pair_id,
+                ) = retained
+                next_precision = (
+                    previous_states[parent_index][2] + information[pair_index]
+                )
+                states.append(
+                    (
+                        next_indices,
+                        next_pairs,
+                        next_precision,
+                        next_value,
+                        next_rotation,
+                        pair_id,
+                    )
+                )
         (
             selected_indices,
             selected_pair_ids,
@@ -2443,35 +3465,44 @@ def _screen_candidate_measurements(
         estimate.patch_strength_by_isotope,
         dtype=np.float64,
     ).T
-    historical_source, historical_nuisance, nuisance_names, _ = (
-        _historical_spectral_design(
-            historical_observations,
-            estimate,
-            kernel,
-            mle_config,
-            historical_response_cache,
-        )
+    historical_design, _ = _historical_factorized_spectral_design(
+        historical_observations,
+        estimate,
+        kernel,
+        mle_config,
+        historical_response_cache,
     )
+    nuisance_names = historical_design.nuisance_names
     nuisance_coefficients = _nuisance_coefficients(estimate, nuisance_names)
     nuisance_scales = np.maximum(
         nuisance_coefficients,
         float(config.nuisance_scale_floor),
     )
-    historical_precision, _ = _historical_fisher_precision(
-        historical_source,
-        historical_nuisance,
+    historical_precision, _ = _historical_factorized_fisher_precision(
+        historical_design,
         historical_basis,
         historical_strengths,
         nuisance_coefficients,
         nuisance_scales,
-        historical_observations.step_ids,
+        _historical_row_keys(historical_observations),
+        model_identity=_cached_model_identity(
+            historical_response_cache,
+            "historical_factorized_design",
+        ),
         minimum_expected_count=float(config.minimum_expected_bin_count),
         cache=historical_response_cache,
+        use_gpu=bool(mle_config.use_gpu),
+        gpu_device=str(mle_config.gpu_device),
+        cache_entry_name="historical_factorized_fisher:screening",
     )
     nuisance_count = int(nuisance_coefficients.size)
     joint_precision = (
-        float(config.laplace_prior_precision)
-        * np.eye(historical_precision.shape[0], dtype=np.float64)
+        _planning_prior_precision(
+            int(historical_basis.shape[2]),
+            nuisance_scales,
+            historical_design.nuisance_l2_weights,
+            laplace_prior_precision=float(config.laplace_prior_precision),
+        )
         + historical_precision
     )
     base_precision = _source_marginal_precision(joint_precision, nuisance_count)
@@ -2483,24 +3514,31 @@ def _screen_candidate_measurements(
         bin_count + 1,
         dtype=np.float64,
     )
+    calibrated_screening = mle_config.spectral_likelihood == "calibrated_overdispersed"
     background_rate = _screening_background_rate(
         historical_observations,
-        screening_edges,
-        np.einsum(
-            "mbpi,pi->mb",
-            historical_source,
+        full_edges if calibrated_screening else screening_edges,
+        _factorized_source_spectrum(
+            historical_design,
             historical_strengths,
-            optimize=True,
         ),
     )
     cache_identity = (
-        id(estimate),
-        tuple(int(value) for value in historical_observations.step_ids),
+        np.asarray(
+            estimate.patch_strength_by_isotope,
+            dtype=np.float64,
+        ).tobytes(),
+        np.asarray(source_strengths, dtype=np.float64).tobytes(),
+        np.asarray(basis, dtype=np.float64).tobytes(),
+        np.asarray(background_rate, dtype=np.float64).tobytes(),
+        _cached_model_identity(
+            historical_response_cache,
+            "historical_factorized_design",
+        ),
+        _historical_row_keys(historical_observations),
         tuple(int(value) for value in representative_pairs),
-        int(bin_count),
-        int(config.screening_source_parameter_limit),
-        int(config.screening_points_per_mode),
-        int(config.shield_program_length),
+        config.to_dict(),
+        mle_config.to_dict(),
         current_pair_id,
     )
     cache_entry = (
@@ -2564,21 +3602,39 @@ def _screen_candidate_measurements(
                 float(config.live_time_s),
                 dtype=np.float64,
             ),
-            energy_bin_edges_keV=screening_edges,
+            energy_bin_edges_keV=(
+                full_edges if calibrated_screening else screening_edges
+            ),
+            station_ids=np.zeros(expanded.shape[0], dtype=np.int64),
         )
         response_started = perf_counter()
-        response = _screening_spectral_design(
-            geometry,
-            screening_patches,
-            estimate.isotope_names,
-            kernel,
-            mle_config,
-        )
+        if calibrated_screening:
+            response, background, observation_variance = (
+                _calibrated_screening_spectral_design(
+                    geometry,
+                    screening_patches,
+                    estimate.isotope_names,
+                    kernel,
+                    mle_config,
+                    source_strengths,
+                    background_rate,
+                    screening_edges,
+                )
+            )
+        else:
+            response = _screening_spectral_design(
+                geometry,
+                screening_patches,
+                estimate.isotope_names,
+                kernel,
+                mle_config,
+            )
+            background = np.broadcast_to(
+                float(config.live_time_s) * background_rate[None, :],
+                response.shape[:2],
+            )
+            observation_variance = None
         response_seconds += perf_counter() - response_started
-        background = np.broadcast_to(
-            float(config.live_time_s) * background_rate[None, :],
-            response.shape[:2],
-        )
         fisher_started = perf_counter()
         information, totals = _screening_fisher_information(
             response,
@@ -2586,6 +3642,7 @@ def _screen_candidate_measurements(
             source_strengths,
             background,
             minimum_expected_count=float(config.minimum_expected_bin_count),
+            observation_variance=observation_variance,
             use_gpu=bool(mle_config.use_gpu),
             gpu_device=str(mle_config.gpu_device),
         )
@@ -2667,7 +3724,11 @@ def _screen_candidate_measurements(
         )
     )
     diagnostics = {
-        "criterion": "grouped-Poisson source Fisher screening",
+        "criterion": (
+            "grouped-NB2 source Fisher screening"
+            if calibrated_screening
+            else "grouped-Poisson source Fisher screening"
+        ),
         "approximate": True,
         "stage": "screening",
         "candidate_count": int(poses.shape[0]),
@@ -2774,41 +3835,51 @@ def _plan_next_measurement_exact(
         dtype=np.float64,
     ).T
     response_started = perf_counter()
-    (
-        historical_source,
-        historical_nuisance,
-        nuisance_names,
-        historical_cache_diagnostics,
-    ) = _historical_spectral_design(
-        historical_observations,
-        estimate,
-        kernel,
-        mle_config,
-        historical_response_cache,
+    historical_design, historical_cache_diagnostics = (
+        _historical_factorized_spectral_design(
+            historical_observations,
+            estimate,
+            kernel,
+            mle_config,
+            historical_response_cache,
+        )
     )
     response_seconds += perf_counter() - response_started
+    nuisance_names = historical_design.nuisance_names
     nuisance_coefficients = _nuisance_coefficients(estimate, nuisance_names)
     nuisance_scales = np.maximum(
         nuisance_coefficients,
         float(resolved.nuisance_scale_floor),
     )
     fisher_started = perf_counter()
-    historical_precision, historical_fisher_diagnostics = _historical_fisher_precision(
-        historical_source,
-        historical_nuisance,
-        source_basis,
-        source_strengths,
-        nuisance_coefficients,
-        nuisance_scales,
-        historical_observations.step_ids,
-        minimum_expected_count=float(resolved.minimum_expected_bin_count),
-        cache=historical_response_cache,
+    historical_precision, historical_fisher_diagnostics = (
+        _historical_factorized_fisher_precision(
+            historical_design,
+            source_basis,
+            source_strengths,
+            nuisance_coefficients,
+            nuisance_scales,
+            _historical_row_keys(historical_observations),
+            model_identity=_cached_model_identity(
+                historical_response_cache,
+                "historical_factorized_design",
+            ),
+            minimum_expected_count=float(resolved.minimum_expected_bin_count),
+            cache=historical_response_cache,
+            use_gpu=bool(mle_config.use_gpu),
+            gpu_device=str(mle_config.gpu_device),
+            cache_entry_name="historical_factorized_fisher:exact",
+        )
     )
     fisher_seconds += perf_counter() - fisher_started
     parameter_count = int(source_basis.shape[2] + nuisance_coefficients.size)
     base_precision = (
-        float(resolved.laplace_prior_precision)
-        * np.eye(parameter_count, dtype=np.float64)
+        _planning_prior_precision(
+            int(source_basis.shape[2]),
+            nuisance_scales,
+            historical_design.nuisance_l2_weights,
+            laplace_prior_precision=float(resolved.laplace_prior_precision),
+        )
         + historical_precision
     )
     nuisance_count = int(nuisance_coefficients.size)
@@ -2861,14 +3932,14 @@ def _plan_next_measurement_exact(
             energy_bin_edges_keV=historical_observations.energy_bin_edges_keV,
         )
         response_started = perf_counter()
-        candidate_source, candidate_nuisance, candidate_names = _spectral_design(
+        candidate_design = _factorized_spectral_design(
             geometry,
             estimate,
             kernel,
             mle_config,
         )
         response_seconds += perf_counter() - response_started
-        if tuple(candidate_names) != tuple(nuisance_names):
+        if tuple(candidate_design.nuisance_names) != tuple(nuisance_names):
             raise RuntimeError("Historical and candidate nuisance bases differ.")
         fisher_started = perf_counter()
         (
@@ -2876,18 +3947,19 @@ def _plan_next_measurement_exact(
             expected_counts,
             station_rate_cross,
             station_rate_information,
-        ) = _fisher_information(
-            candidate_source,
-            candidate_nuisance,
+        ) = _factorized_fisher_information(
+            candidate_design,
             source_basis,
             source_strengths,
             nuisance_coefficients,
             nuisance_scales,
             minimum_expected_count=float(resolved.minimum_expected_bin_count),
+            use_gpu=bool(mle_config.use_gpu),
+            gpu_device=str(mle_config.gpu_device),
         )
         fisher_seconds += perf_counter() - fisher_started
         ambiguity = _ambiguity_metrics(
-            candidate_source,
+            candidate_design,
             information,
             local_poses,
             estimate,
@@ -3061,8 +4133,13 @@ def _plan_next_measurement_exact(
         )
     )
     selected = ranked[0]
+    likelihood_label = (
+        "NB2"
+        if mle_config.spectral_likelihood == "calibrated_overdispersed"
+        else "Poisson"
+    )
     diagnostics: dict[str, object] = {
-        "criterion": "D_s-optimal expected Poisson Fisher information",
+        "criterion": f"D_s-optimal expected {likelihood_label} Fisher information",
         "laplace_approximation": True,
         "nuisance_marginalization": "Schur determinant",
         "shield_program_selection": "joint_station_block_beam_search",
@@ -3083,7 +4160,9 @@ def _plan_next_measurement_exact(
         ),
         "config": resolved.to_dict(),
         "performance": {
-            "fisher_device": "cpu",
+            "fisher_device": (
+                str(mle_config.gpu_device) if mle_config.use_gpu else "cpu"
+            ),
             "beam_device": (
                 str(mle_config.gpu_device)
                 if mle_config.use_gpu and parameter_count >= 24
@@ -3203,7 +4282,9 @@ def plan_next_measurement(
     restored_selected = restore_index(exact.selected_action)
     diagnostics = {
         **exact.diagnostics,
-        "criterion": "two-stage grouped screening then exact D_s-optimal Fisher",
+        "criterion": (
+            "two-stage grouped likelihood screening then exact D_s-optimal Fisher"
+        ),
         "approximate_candidate_screening": True,
         "screening": screening.diagnostics,
         "total_candidate_count": int(poses.shape[0]),

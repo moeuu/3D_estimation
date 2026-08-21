@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,8 +17,15 @@ from three_d_estimation.information_planner import (
     MLEPlanningAction,
     MLEPlanningConfig,
     MLEPlanningResult,
+    _LineSpectralDesign,
     _ambiguity_metrics,
+    _beam_precision_chunk_size,
+    _factorized_fisher_information,
     _fisher_information,
+    _grouped_overdispersed_variance,
+    _historical_factorized_fisher_precision,
+    _historical_factorized_spectral_design,
+    _planning_prior_precision,
     _historical_fisher_precision,
     _historical_spectral_design,
     _representative_pair_ids,
@@ -26,6 +35,7 @@ from three_d_estimation.information_planner import (
     _screening_pseudo_model,
     _screening_source_basis,
     _source_basis,
+    _symmetric_spectral_separation,
     plan_next_measurement,
     select_fisher_action,
 )
@@ -233,13 +243,21 @@ def test_refinement_screening_computes_only_new_candidate_poses(
         isotope_names=("Cs-137",),
     )
 
-    def fake_history(*args: object, **kwargs: object) -> tuple[object, ...]:
-        """Return one exact historical source column and no nuisance columns."""
+    def fake_history(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[_LineSpectralDesign, dict[str, object]]:
+        """Return one compact historical source and no nuisance columns."""
         del args, kwargs
         return (
-            np.ones((1, 2, 1, 1)),
-            np.zeros((1, 2, 0)),
-            (),
+            _LineSpectralDesign(
+                spatial_factors=np.ones((1, 1, 1), dtype=np.float64),
+                pulse_shapes=np.ones((1, 2), dtype=np.float64),
+                line_isotope_indices=np.zeros(1, dtype=np.int64),
+                nuisance_response=np.zeros((1, 2, 0), dtype=np.float64),
+                nuisance_names=(),
+                energy_chunk_size=1,
+            ),
             {},
         )
 
@@ -261,7 +279,7 @@ def test_refinement_screening_computes_only_new_candidate_poses(
 
     monkeypatch.setattr(
         information_planner,
-        "_historical_spectral_design",
+        "_historical_factorized_spectral_design",
         fake_history,
     )
     monkeypatch.setattr(
@@ -309,10 +327,53 @@ def test_refinement_screening_computes_only_new_candidate_poses(
         cache,
         None,
     )
+    changed_live_time = _screen_candidate_measurements(
+        *common,
+        refined_poses,
+        np.asarray([0], dtype=np.int64),
+        np.zeros(3),
+        0,
+        replace(config, live_time_s=2.0 * config.live_time_s),
+        cache,
+        None,
+    )
+    changed_history = replace(
+        history,
+        spectrum_counts=2.0 * history.spectrum_counts,
+    )
+    changed_counts = _screen_candidate_measurements(
+        estimate,
+        changed_history,
+        kernel,
+        common[3],
+        refined_poses,
+        np.asarray([0], dtype=np.int64),
+        np.zeros(3),
+        0,
+        replace(config, live_time_s=2.0 * config.live_time_s),
+        cache,
+        None,
+    )
 
-    assert computed_rows == [2, 1]
+    assert computed_rows == [2, 1, 3, 3]
     assert refined.diagnostics["reused_candidates"] == 2
     assert refined.diagnostics["computed_candidates"] == 1
+    assert changed_live_time.diagnostics["reused_candidates"] == 0
+    assert changed_live_time.diagnostics["computed_candidates"] == 3
+    assert changed_counts.diagnostics["reused_candidates"] == 0
+    assert changed_counts.diagnostics["computed_candidates"] == 3
+
+
+def test_kernel_cache_identity_changes_with_physical_mutation() -> None:
+    """Planner caches must not survive an in-place physical-kernel change."""
+    kernel = ContinuousKernel(use_gpu=False)
+    original = information_planner._kernel_physical_identity(kernel)
+    kernel.obstacle_height_m = float(kernel.obstacle_height_m) + 0.5
+    changed = information_planner._kernel_physical_identity(kernel)
+    kernel.gpu_device = "cuda:1"
+
+    assert changed != original
+    assert information_planner._kernel_physical_identity(kernel) == changed
 
 
 def _orientations() -> np.ndarray:
@@ -462,7 +523,179 @@ def test_joint_program_uses_pair_specific_ambiguity_utility() -> None:
     assert selected.shield_pair_ids == (2,)
 
 
-def test_planner_cpu_gpu_equivalence_when_cuda_is_available() -> None:
+def test_factorized_fisher_matches_dense_response_without_energy_expansion() -> None:
+    """Line-factor Fisher reduction must equal the dense deterministic oracle."""
+    rng = np.random.default_rng(20260822)
+    action_count, bin_count, patch_count, isotope_count, line_count = (
+        5,
+        13,
+        4,
+        2,
+        3,
+    )
+    spatial = rng.uniform(1.0e-4, 2.0e-2, (action_count, patch_count, line_count))
+    pulses = rng.uniform(0.0, 1.0, (line_count, bin_count))
+    line_isotopes = np.asarray([0, 1, 0], dtype=np.int64)
+    nuisance = rng.uniform(1.0e-4, 1.0e-2, (action_count, bin_count, 2))
+    design = _LineSpectralDesign(
+        spatial_factors=spatial,
+        pulse_shapes=pulses,
+        line_isotope_indices=line_isotopes,
+        nuisance_response=nuisance,
+        nuisance_names=("background", "scatter"),
+        energy_chunk_size=4,
+    )
+    dense = np.zeros(
+        (action_count, bin_count, patch_count, isotope_count),
+        dtype=np.float64,
+    )
+    for line_index, isotope_index in enumerate(line_isotopes):
+        dense[:, :, :, isotope_index] += np.einsum(
+            "mg,b->mbg",
+            spatial[:, :, line_index],
+            pulses[line_index],
+        )
+    basis = rng.uniform(0.0, 1.0, (patch_count, isotope_count, 3))
+    strengths = rng.uniform(0.1, 3.0, (patch_count, isotope_count))
+    coefficients = np.asarray([0.4, 0.8])
+    scales = np.asarray([1.0, 1.5])
+
+    expected = _fisher_information(
+        dense,
+        nuisance,
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        minimum_expected_count=1.0e-3,
+    )
+    actual = _factorized_fisher_information(
+        design,
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        minimum_expected_count=1.0e-3,
+    )
+
+    for actual_values, expected_values in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(
+            actual_values,
+            expected_values,
+            rtol=2.0e-13,
+            atol=2.0e-14,
+        )
+
+
+def test_fisher_floor_and_overdispersion_preserve_station_derivatives() -> None:
+    """A numerical mean floor must not invent station-rate information."""
+    response = np.asarray([[[[1.0]], [[2.0]]]], dtype=np.float64)
+    nuisance = np.zeros((1, 2, 0), dtype=np.float64)
+    basis = np.ones((1, 1, 1), dtype=np.float64)
+    strengths = np.asarray([[0.1]], dtype=np.float64)
+    alpha = np.asarray([0.0, 1.0], dtype=np.float64)
+    dense = _fisher_information(
+        response,
+        nuisance,
+        basis,
+        strengths,
+        np.zeros(0),
+        np.zeros(0),
+        minimum_expected_count=1.0,
+        overdispersion_alpha_by_bin=alpha,
+    )
+    factor = _factorized_fisher_information(
+        _LineSpectralDesign(
+            spatial_factors=np.ones((1, 1, 1), dtype=np.float64),
+            pulse_shapes=np.asarray([[1.0, 2.0]], dtype=np.float64),
+            line_isotope_indices=np.zeros(1, dtype=np.int64),
+            nuisance_response=nuisance,
+            nuisance_names=(),
+            energy_chunk_size=1,
+            overdispersion_alpha_by_bin=alpha,
+        ),
+        basis,
+        strengths,
+        np.zeros(0),
+        np.zeros(0),
+        minimum_expected_count=1.0,
+    )
+
+    for actual, expected in zip(factor, dense, strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1.0e-14, atol=1.0e-14)
+    np.testing.assert_allclose(dense[0], [[[3.0]]])
+    np.testing.assert_allclose(dense[1], [0.3])
+    np.testing.assert_allclose(dense[2], [[0.3]])
+    np.testing.assert_allclose(dense[3], [0.03])
+
+
+def test_planning_prior_scales_fitted_nuisance_regularization() -> None:
+    """Normalized nuisance coordinates need L2 precision scaled by scale squared."""
+    prior = _planning_prior_precision(
+        2,
+        np.asarray([2.0, 3.0]),
+        np.asarray([4.0, 5.0]),
+        laplace_prior_precision=0.1,
+    )
+
+    np.testing.assert_allclose(np.diag(prior), [0.1, 0.1, 16.1, 45.1])
+
+
+def test_factorized_design_uses_effective_nuisance_weight_and_likelihood(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner factors must match estimator regularization and Poisson variance."""
+    operator = SimpleNamespace(
+        spatial_factors=np.ones((1, 1, 1), dtype=np.float64),
+        pulse_shapes=np.asarray([[0.25, 0.75]], dtype=np.float64),
+        line_isotope_indices=np.asarray([0], dtype=np.int64),
+    )
+    details = SimpleNamespace(
+        operator=operator,
+        nuisance_response=np.ones((1, 2, 1), dtype=np.float64),
+        nuisance_names=("background_rate_cps",),
+        nuisance_l2_weights=np.asarray([2.0]),
+        overdispersion_alpha_by_bin=np.asarray([0.1, 0.2]),
+    )
+    monkeypatch.setattr(
+        information_planner,
+        "build_spectral_response_operator",
+        lambda *_args, **_kwargs: details,
+    )
+    estimate = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=(_floor_patch(0, 0.0),),
+        density_by_isotope=np.asarray([[1.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.zeros(0),
+        nuisance_parameters=np.zeros(0),
+        objective_value=1.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+
+    design = information_planner._factorized_spectral_design(
+        object(),
+        estimate,
+        object(),  # type: ignore[arg-type]
+        MLEConfig(
+            mode="spectral",
+            isotope_names=("Cs-137",),
+            nuisance_l2_weight=3.0,
+        ),
+    )
+
+    np.testing.assert_array_equal(design.nuisance_l2_weights, [5.0])
+    np.testing.assert_array_equal(design.overdispersion_alpha_by_bin, [0.0, 0.0])
+
+
+def test_planner_cpu_gpu_equivalence_when_cuda_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Float64 CUDA Fisher and eight-view beam results must match CPU results."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -501,6 +734,41 @@ def test_planner_cpu_gpu_equivalence_when_cuda_is_available() -> None:
             atol=2.0e-13,
         )
 
+    line_isotopes = np.asarray([0, 1, 0], dtype=np.int64)
+    factor_design = _LineSpectralDesign(
+        spatial_factors=rng.uniform(1.0e-5, 1.0e-2, (9, 3, 3)),
+        pulse_shapes=rng.uniform(0.0, 1.0, (3, 12)),
+        line_isotope_indices=line_isotopes,
+        nuisance_response=nuisance,
+        nuisance_names=("background", "scatter"),
+        energy_chunk_size=5,
+        overdispersion_alpha_by_bin=rng.uniform(0.0, 0.2, size=12),
+    )
+    factor_cpu = _factorized_fisher_information(
+        factor_design,
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        minimum_expected_count=1.0e-3,
+    )
+    factor_gpu = _factorized_fisher_information(
+        factor_design,
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        minimum_expected_count=1.0e-3,
+        use_gpu=True,
+    )
+    for gpu_values, cpu_values in zip(factor_gpu, factor_cpu, strict=True):
+        np.testing.assert_allclose(
+            gpu_values,
+            cpu_values,
+            rtol=2.0e-12,
+            atol=2.0e-13,
+        )
+
     pair_count = 9
     parameter_count = 24
     jacobian = rng.normal(size=(2, pair_count, parameter_count, 3))
@@ -531,6 +799,11 @@ def test_planner_cpu_gpu_equivalence_when_cuda_is_available() -> None:
         nuisance_count=2,
         config=config,
         pair_utility_bonus=bonuses,
+    )
+    monkeypatch.setattr(
+        information_planner,
+        "_BEAM_PRECISION_WORKSPACE_LIMIT_BYTES",
+        3 * parameter_count**2 * 8 * 64,
     )
     gpu_selected, gpu_ranked = select_fisher_action(
         poses,
@@ -603,10 +876,10 @@ def test_historical_design_appends_only_new_station_rows(
         diagnostics={},
     )
 
-    def history(count: int) -> ObservationBatch:
+    def history(count: int, *, position_offset: float = 0.0) -> ObservationBatch:
         """Return a deterministic causal spectrum prefix."""
         positions = np.zeros((count, 3), dtype=np.float64)
-        positions[:, 0] = np.arange(count, dtype=np.float64)
+        positions[:, 0] = np.arange(count, dtype=np.float64) + position_offset
         return ObservationBatch(
             detector_positions_xyz=positions,
             detector_quaternions_wxyz=np.tile(
@@ -666,8 +939,15 @@ def test_historical_design_appends_only_new_station_rows(
         config,
         cache,  # type: ignore[arg-type]
     )
+    changed_geometry = _historical_spectral_design(
+        history(3, position_offset=0.25),
+        estimate,
+        kernel,
+        config,
+        cache,  # type: ignore[arg-type]
+    )
 
-    assert computed_counts == [2, 1]
+    assert computed_counts == [2, 1, 3]
     assert first[3]["mode"] == "full_rebuild"
     assert extended[3] == {
         "mode": "prefix_append",
@@ -675,6 +955,7 @@ def test_historical_design_appends_only_new_station_rows(
         "computed_measurements": 1,
     }
     assert hit[3]["mode"] == "prefix_hit"
+    assert changed_geometry[3]["mode"] == "full_rebuild"
     np.testing.assert_array_equal(extended[0], hit[0])
     np.testing.assert_array_equal(extended[0][:2], first[0])
 
@@ -691,6 +972,7 @@ def test_historical_design_appends_only_new_station_rows(
         coefficients,
         scales,
         (0, 1),
+        model_identity="model-a",
         minimum_expected_count=1.0e-6,
         cache=fisher_cache,
     )
@@ -702,6 +984,7 @@ def test_historical_design_appends_only_new_station_rows(
         coefficients,
         scales,
         (0, 1, 2),
+        model_identity="model-a",
         minimum_expected_count=1.0e-6,
         cache=fisher_cache,
     )
@@ -713,8 +996,21 @@ def test_historical_design_appends_only_new_station_rows(
         coefficients,
         scales,
         (0, 1, 2),
+        model_identity="model-a",
         minimum_expected_count=1.0e-6,
         cache=None,
+    )
+    changed_model_fisher = _historical_fisher_precision(
+        extended[0],
+        extended[1],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1, 2),
+        model_identity="model-b",
+        minimum_expected_count=1.0e-6,
+        cache=fisher_cache,
     )
     changed_estimate_fisher = _historical_fisher_precision(
         extended[0],
@@ -724,6 +1020,7 @@ def test_historical_design_appends_only_new_station_rows(
         coefficients,
         scales,
         (0, 1, 2),
+        model_identity="model-b",
         minimum_expected_count=1.0e-6,
         cache=fisher_cache,
     )
@@ -731,7 +1028,240 @@ def test_historical_design_appends_only_new_station_rows(
     assert first_fisher[1]["mode"] == "full_rebuild"
     assert extended_fisher[1]["mode"] == "prefix_append"
     np.testing.assert_allclose(extended_fisher[0], full_fisher[0], rtol=1.0e-15)
+    assert changed_model_fisher[1]["mode"] == "full_rebuild"
     assert changed_estimate_fisher[1]["mode"] == "full_rebuild"
+
+    computed_counts.clear()
+    drift_cache: dict[str, object] = {}
+    drift_config = MLEConfig(
+        mode="spectral",
+        isotope_names=("Cs-137",),
+        fit_gain_resolution_drift=True,
+        discrepancy_calibration_path="/nonexistent/test-calibration.json",
+    )
+    _historical_spectral_design(
+        history(2),
+        estimate,
+        kernel,
+        drift_config,
+        drift_cache,  # type: ignore[arg-type]
+    )
+    drift_extended = _historical_spectral_design(
+        history(3),
+        estimate,
+        kernel,
+        drift_config,
+        drift_cache,  # type: ignore[arg-type]
+    )
+
+    assert computed_counts == [2, 3]
+    assert drift_extended[3]["mode"] == "full_rebuild"
+
+
+def test_factorized_history_and_fisher_append_only_new_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compact exact planning caches must preserve causal prefix reuse."""
+    estimate = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=(_floor_patch(0, 0.0),),
+        density_by_isotope=np.asarray([[1.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.asarray([0.5]),
+        nuisance_parameters=np.zeros(0),
+        objective_value=1.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+
+    def history(count: int) -> ObservationBatch:
+        """Return a deterministic factorized-planner history prefix."""
+        positions = np.zeros((count, 3), dtype=np.float64)
+        positions[:, 0] = np.arange(count, dtype=np.float64)
+        return ObservationBatch(
+            detector_positions_xyz=positions,
+            detector_quaternions_wxyz=np.tile(
+                np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                (count, 1),
+            ),
+            fe_indices=np.zeros(count, dtype=np.int64),
+            pb_indices=np.zeros(count, dtype=np.int64),
+            live_times_s=np.ones(count),
+            spectrum_counts=np.ones((count, 2)),
+            spectrum_variances=None,
+            energy_bin_edges_keV=np.asarray([0.0, 1.0, 2.0]),
+            isotope_counts=np.ones((count, 1)),
+            isotope_covariances=np.ones((count, 1, 1)),
+            station_ids=np.arange(count, dtype=np.int64),
+            isotope_names=("Cs-137",),
+        )
+
+    computed_counts: list[int] = []
+
+    def fake_design(
+        observations: object,
+        _estimate: MLEEstimate,
+        _kernel: object,
+        _config: MLEConfig,
+    ) -> _LineSpectralDesign:
+        """Return compact row-identifiable factors and record new work."""
+        positions = np.asarray(observations.detector_positions_xyz)
+        count = int(positions.shape[0])
+        computed_counts.append(count)
+        amplitudes = positions[:, 0] + 1.0
+        return _LineSpectralDesign(
+            spatial_factors=amplitudes[:, None, None],
+            pulse_shapes=np.asarray([[0.25, 0.75]]),
+            line_isotope_indices=np.asarray([0], dtype=np.int64),
+            nuisance_response=np.broadcast_to(
+                amplitudes[:, None, None],
+                (count, 2, 1),
+            ).copy(),
+            nuisance_names=("background_rate_cps",),
+            energy_chunk_size=1,
+        )
+
+    monkeypatch.setattr(
+        information_planner,
+        "_factorized_spectral_design",
+        fake_design,
+    )
+    response_cache: dict[str, object] = {}
+    kernel = object()
+    config = MLEConfig(
+        mode="spectral",
+        isotope_names=("Cs-137",),
+        discrepancy_calibration_path="/nonexistent/test-calibration.json",
+    )
+    first = _historical_factorized_spectral_design(
+        history(2),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        config,
+        response_cache,
+    )
+    extended = _historical_factorized_spectral_design(
+        history(3),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        config,
+        response_cache,
+    )
+    hit = _historical_factorized_spectral_design(
+        history(3),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        config,
+        response_cache,
+    )
+    likelihood_rebuilt = _historical_factorized_spectral_design(
+        history(3),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        replace(config, spectral_likelihood="calibrated_overdispersed"),
+        response_cache,
+    )
+    regularization_rebuilt = _historical_factorized_spectral_design(
+        history(3),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        replace(
+            config,
+            spectral_likelihood="calibrated_overdispersed",
+            nuisance_l2_weight=1.0,
+        ),
+        response_cache,
+    )
+
+    assert computed_counts == [2, 1, 3, 3]
+    assert first[1]["mode"] == "full_rebuild"
+    assert extended[1]["mode"] == "prefix_append"
+    assert hit[1]["mode"] == "prefix_hit"
+    assert likelihood_rebuilt[1]["mode"] == "full_rebuild"
+    assert regularization_rebuilt[1]["mode"] == "full_rebuild"
+    np.testing.assert_array_equal(
+        first[0].spatial_factors,
+        extended[0].spatial_factors[:2],
+    )
+
+    fisher_cache: dict[str, object] = {}
+    basis = np.ones((1, 1, 1), dtype=np.float64)
+    strengths = np.ones((1, 1), dtype=np.float64)
+    coefficients = np.asarray([0.5])
+    scales = np.asarray([1.0])
+    first_fisher = _historical_factorized_fisher_precision(
+        first[0],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1),
+        model_identity="model-a",
+        minimum_expected_count=1.0e-6,
+        cache=fisher_cache,
+        use_gpu=False,
+        gpu_device="cuda",
+    )
+    extended_fisher = _historical_factorized_fisher_precision(
+        extended[0],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1, 2),
+        model_identity="model-a",
+        minimum_expected_count=1.0e-6,
+        cache=fisher_cache,
+        use_gpu=False,
+        gpu_device="cuda",
+    )
+    full_fisher = _historical_factorized_fisher_precision(
+        extended[0],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1, 2),
+        model_identity="model-a",
+        minimum_expected_count=1.0e-6,
+        cache=None,
+        use_gpu=False,
+        gpu_device="cuda",
+    )
+
+    assert first_fisher[1]["mode"] == "full_rebuild"
+    assert extended_fisher[1]["mode"] == "prefix_append"
+    np.testing.assert_allclose(extended_fisher[0], full_fisher[0], rtol=1.0e-15)
+
+    computed_counts.clear()
+    drift_cache: dict[str, object] = {}
+    drift_config = MLEConfig(
+        mode="spectral",
+        isotope_names=("Cs-137",),
+        fit_gain_resolution_drift=True,
+        discrepancy_calibration_path="/nonexistent/test-calibration.json",
+    )
+    _historical_factorized_spectral_design(
+        history(2),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        drift_config,
+        drift_cache,
+    )
+    drift_extended = _historical_factorized_spectral_design(
+        history(3),
+        estimate,
+        kernel,  # type: ignore[arg-type]
+        drift_config,
+        drift_cache,
+    )
+
+    assert computed_counts == [2, 3]
+    assert drift_extended[1]["mode"] == "full_rebuild"
 
 
 def test_zero_mle_regions_remain_in_the_exploration_basis() -> None:
@@ -860,6 +1390,7 @@ def test_screening_fisher_cpu_gpu_equivalence_when_cuda_is_available() -> None:
     basis = rng.uniform(0.0, 1.0, size=(3, 2, 5))
     strengths = rng.uniform(0.1, 3.0, size=(3, 2))
     background = rng.uniform(0.1, 4.0, size=(7, 16))
+    variance = rng.uniform(0.2, 8.0, size=(7, 16))
 
     cpu = _screening_fisher_information(
         response,
@@ -867,6 +1398,7 @@ def test_screening_fisher_cpu_gpu_equivalence_when_cuda_is_available() -> None:
         strengths,
         background,
         minimum_expected_count=1.0e-3,
+        observation_variance=variance,
     )
     gpu = _screening_fisher_information(
         response,
@@ -874,11 +1406,87 @@ def test_screening_fisher_cpu_gpu_equivalence_when_cuda_is_available() -> None:
         strengths,
         background,
         minimum_expected_count=1.0e-3,
+        observation_variance=variance,
         use_gpu=True,
     )
 
     for actual, expected in zip(gpu, cpu, strict=True):
         np.testing.assert_allclose(actual, expected, rtol=2.0e-12, atol=2.0e-13)
+
+
+def test_grouped_overdispersion_preserves_fine_bin_variance() -> None:
+    """Grouped NB2 variance must sum fine-bin variances, not average alpha."""
+    variance = _grouped_overdispersed_variance(
+        np.asarray([[2.0, 3.0]]),
+        np.asarray([0.1, 0.2]),
+        np.asarray([0, 0], dtype=np.int64),
+        1,
+    )
+
+    np.testing.assert_allclose(variance, [[7.2]])
+
+
+def test_screening_overdispersion_can_reverse_poisson_ranking() -> None:
+    """High-count overdispersed candidates must not dominate screening."""
+    response = np.asarray(
+        [
+            [[[[10.0]]]],
+            [[[[6.0]]]],
+        ]
+    ).reshape(2, 1, 1, 1)
+    basis = np.ones((1, 1, 1), dtype=np.float64)
+    strengths = np.ones((1, 1), dtype=np.float64)
+    background = np.zeros((2, 1), dtype=np.float64)
+    poisson, totals = _screening_fisher_information(
+        response,
+        basis,
+        strengths,
+        background,
+        minimum_expected_count=1.0e-6,
+    )
+    overdispersed, _ = _screening_fisher_information(
+        response,
+        basis,
+        strengths,
+        background,
+        minimum_expected_count=1.0e-6,
+        observation_variance=np.asarray([[110.0], [6.0]]),
+    )
+    common = (
+        np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]]),
+        (0,),
+    )
+    poisson_selected, _ = select_fisher_action(
+        *common,
+        poisson[:, None, :, :],
+        totals[:, None],
+        np.eye(1),
+        _orientations(),
+        nuisance_count=0,
+        config=MLEPlanningConfig(shield_program_length=1),
+    )
+    nb_selected, _ = select_fisher_action(
+        *common,
+        overdispersed[:, None, :, :],
+        totals[:, None],
+        np.eye(1),
+        _orientations(),
+        nuisance_count=0,
+        config=MLEPlanningConfig(shield_program_length=1),
+    )
+
+    assert poisson_selected.candidate_index == 0
+    assert nb_selected.candidate_index == 1
+
+
+def test_beam_precision_chunks_stay_within_workspace_limit() -> None:
+    """Default-size beam expansion matrices must stay under 64 MiB."""
+    parameter_count = 98
+    chunk_size = _beam_precision_chunk_size(parameter_count)
+    estimated_bytes = 3 * chunk_size * parameter_count**2 * 8
+
+    assert chunk_size < 8 * 64 * 63
+    assert estimated_bytes <= 64 * 1024 * 1024
 
 
 def test_d_s_optimality_marginalizes_nuisance_confounding() -> None:
@@ -1018,7 +1626,191 @@ def test_floor_ceiling_competition_rewards_height_discrimination() -> None:
         source_basis,
         (),
     )
+    factor_metrics = _ambiguity_metrics(
+        _LineSpectralDesign(
+            spatial_factors=np.transpose(response[:, :, :, 0], (0, 2, 1)),
+            pulse_shapes=np.eye(2, dtype=np.float64),
+            line_isotope_indices=np.zeros(2, dtype=np.int64),
+            nuisance_response=np.zeros((2, 2, 0), dtype=np.float64),
+            nuisance_names=(),
+            energy_chunk_size=1,
+        ),
+        information,
+        np.asarray([[0.5, 0.5, 0.5], [0.5, 0.5, 1.5]]),
+        estimate,
+        history,
+        source_basis,
+        (),
+    )
 
     assert metrics["floor_ceiling"][1] > metrics["floor_ceiling"][0]
     assert metrics["correlation"][1] > metrics["correlation"][0]
     assert metrics["surface_coverage"][1] > metrics["surface_coverage"][0]
+    for name, values in metrics.items():
+        np.testing.assert_allclose(factor_metrics[name], values)
+
+
+def test_spectral_separation_respects_counts_and_overdispersion() -> None:
+    """Low-count or overdispersed distinctions must receive less utility."""
+    first = np.asarray([[1.0, 0.1]])
+    second = np.asarray([[0.1, 1.0]])
+    low_count = _symmetric_spectral_separation(first, second)
+    high_count = _symmetric_spectral_separation(100.0 * first, 100.0 * second)
+    overdispersed = _symmetric_spectral_separation(
+        100.0 * first,
+        100.0 * second,
+        np.ones(2),
+    )
+
+    assert high_count[0] > low_count[0]
+    assert overdispersed[0] < high_count[0]
+
+
+def test_support_ambiguity_projects_alternative_patch_grids() -> None:
+    """Alternative support utility must survive coarse-to-fine patch changes."""
+
+    def patch(patch_id: int, x0: float, x1: float) -> SurfacePatch:
+        """Return one rectangle on a shared physical floor surface."""
+        area = x1 - x0
+        return SurfacePatch(
+            patch_id=patch_id,
+            centroid_xyz=np.asarray([0.5 * (x0 + x1), 0.5, 0.0]),
+            normal_xyz=np.asarray([0.0, 0.0, 1.0]),
+            area_m2=area,
+            surface_kind="floor",
+            object_id="shared-floor",
+            vertices_xyz=np.asarray(
+                [
+                    [x0, 0.0, 0.0],
+                    [x1, 0.0, 0.0],
+                    [x1, 1.0, 0.0],
+                    [x0, 1.0, 0.0],
+                ]
+            ),
+            quadrature_points_xyz=np.asarray([[0.5 * (x0 + x1), 0.5, 0.0]]),
+            quadrature_weights=np.asarray([1.0]),
+        )
+
+    base = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=(patch(10, 0.0, 0.5), patch(11, 0.5, 1.0)),
+        density_by_isotope=np.asarray([[2.0, 0.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0, 0.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.zeros(0),
+        nuisance_parameters=np.zeros(0),
+        objective_value=0.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+    alternative = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=(patch(99, 0.0, 1.0),),
+        density_by_isotope=np.asarray([[1.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.zeros(0),
+        nuisance_parameters=np.zeros(0),
+        objective_value=0.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+    history = ObservationBatch(
+        detector_positions_xyz=np.asarray([[0.5, 0.5, 1.0]]),
+        detector_quaternions_wxyz=np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+        fe_indices=np.asarray([0]),
+        pb_indices=np.asarray([0]),
+        live_times_s=np.asarray([1.0]),
+        spectrum_counts=np.ones((1, 2)),
+        spectrum_variances=None,
+        energy_bin_edges_keV=np.asarray([0.0, 1.0, 2.0]),
+        isotope_counts=np.ones((1, 1)),
+        isotope_covariances=np.ones((1, 1, 1)),
+        station_ids=np.asarray([0]),
+        isotope_names=("Cs-137",),
+    )
+    response = np.zeros((1, 2, 2, 1), dtype=np.float64)
+    response[0, 0, 0, 0] = 1.0
+    response[0, 1, 1, 0] = 1.0
+    basis = np.zeros((2, 1, 2), dtype=np.float64)
+    basis[0, 0, 0] = 1.0
+    basis[1, 0, 1] = 1.0
+
+    metrics = _ambiguity_metrics(
+        response,
+        np.eye(2, dtype=np.float64)[None, :, :],
+        np.asarray([[0.5, 0.5, 1.0]]),
+        base,
+        history,
+        basis,
+        (alternative,),
+    )
+
+    assert metrics["support"][0] > 0.0
+
+
+def test_vertical_fisher_uses_cross_terms_and_marginalizes_nuisance() -> None:
+    """Vertical utility must use the source Schur quadratic, not its diagonal."""
+    patches = (_floor_patch(0, 0.0), _ceiling_patch(1, 0.0))
+    estimate = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=patches,
+        density_by_isotope=np.asarray([[1.0, 1.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0, 1.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.zeros(0),
+        nuisance_parameters=np.zeros(0),
+        objective_value=1.0,
+        poisson_deviance=1.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+    history = ObservationBatch(
+        detector_positions_xyz=np.asarray([[0.5, 0.5, 0.5]]),
+        detector_quaternions_wxyz=np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+        fe_indices=np.asarray([0]),
+        pb_indices=np.asarray([0]),
+        live_times_s=np.asarray([1.0]),
+        spectrum_counts=np.ones((1, 2)),
+        spectrum_variances=None,
+        energy_bin_edges_keV=np.asarray([0.0, 1.0, 2.0]),
+        isotope_counts=np.ones((1, 1)),
+        isotope_covariances=np.ones((1, 1, 1)),
+        station_ids=np.asarray([0]),
+        isotope_names=("Cs-137",),
+    )
+    response = np.ones((2, 2, 2, 1), dtype=np.float64)
+    source_basis = np.zeros((2, 1, 2), dtype=np.float64)
+    source_basis[0, 0, 0] = 1.0
+    source_basis[1, 0, 1] = 1.0
+    source_information = np.asarray([[1.0, -1.0], [-1.0, 1.0]])
+    information = np.zeros((2, 3, 3), dtype=np.float64)
+    information[:, :2, :2] = source_information
+    information[:, 2, 2] = 2.0
+    information[1, :2, 2] = [-1.0, 1.0]
+    information[1, 2, :2] = [-1.0, 1.0]
+
+    metrics = _ambiguity_metrics(
+        response,
+        information,
+        np.asarray([[0.5, 0.5, 0.5], [0.5, 0.5, 1.5]]),
+        estimate,
+        history,
+        source_basis,
+        (),
+    )
+
+    np.testing.assert_allclose(
+        metrics["z_fisher"],
+        np.log1p([1.0, 0.5]),
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )

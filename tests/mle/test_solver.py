@@ -8,12 +8,17 @@ import pytest
 from three_d_estimation.solver import (
     _enforce_cuda_response_cache_requirement,
     _prepare_dense_torch_response,
+    _torch_response_product,
     SurfaceMapConfig,
     evaluate_surface_map_objective,
     fit_surface_map_poisson,
     fit_surface_map_poisson_operator,
 )
-from three_d_estimation.response_operator import BlockResponseOperator, ResponseBlock
+from three_d_estimation.response_operator import (
+    BlockResponseOperator,
+    LineFactorizedResponseOperator,
+    ResponseBlock,
+)
 
 
 def _dense_density_operator(
@@ -58,6 +63,41 @@ def _dense_density_operator(
         patch_count,
         isotope_count,
         factory,
+        diagnostics=diagnostics,
+    )
+
+
+def _line_factorized_density_operator(
+    *,
+    spatial_factors: np.ndarray | None = None,
+    diagnostics: dict[str, object] | None = None,
+) -> LineFactorizedResponseOperator:
+    """Return a deterministic two-isotope factorized density response."""
+    spatial = (
+        np.asarray(
+            [
+                [[1.0, 0.2, 0.4], [0.3, 0.8, 0.1]],
+                [[0.4, 0.7, 0.2], [1.1, 0.2, 0.5]],
+                [[0.8, 0.1, 0.6], [0.2, 1.0, 0.3]],
+            ],
+            dtype=np.float64,
+        )
+        if spatial_factors is None
+        else np.asarray(spatial_factors, dtype=np.float64)
+    )
+    pulses = np.asarray(
+        [
+            [0.7, 0.2, 0.1, 0.0],
+            [0.0, 0.3, 0.5, 0.2],
+            [0.1, 0.2, 0.4, 0.3],
+        ],
+        dtype=np.float64,
+    )
+    return LineFactorizedResponseOperator(
+        spatial,
+        pulses,
+        np.asarray([0, 1, 0], dtype=np.int64),
+        2,
         diagnostics=diagnostics,
     )
 
@@ -511,6 +551,199 @@ def test_matrix_free_solver_matches_materialized_tensor() -> None:
     )
 
 
+def test_line_factorized_cpu_solver_matches_materialized_tensor() -> None:
+    """CPU iterations must retain exact factors instead of expanding blocks."""
+    operator = _line_factorized_density_operator()
+    response = operator.materialize()
+    areas = np.ones(operator.patch_count, dtype=np.float64)
+    truth = np.asarray([[8.0, 3.0], [2.0, 11.0]], dtype=np.float64)
+    observed = np.einsum("mbgi,gi->mb", response, truth)
+    config = SurfaceMapConfig(
+        max_iterations=800,
+        check_interval=20,
+        tolerance=1.0e-8,
+        objective_tolerance=1.0e-9,
+    )
+
+    materialized = fit_surface_map_poisson(
+        observed,
+        response,
+        areas,
+        config=config,
+    )
+    factorized = fit_surface_map_poisson_operator(
+        observed,
+        operator,
+        areas,
+        config=config,
+        gpu_dtype="float64",
+    )
+
+    np.testing.assert_allclose(
+        factorized.densities_cps_1m_m2,
+        materialized.densities_cps_1m_m2,
+        rtol=2.0e-8,
+        atol=2.0e-8,
+    )
+    cache = operator.diagnostics["performance"]["solver"]["response_cache"]
+    assert cache["mode"] == "line_factorized_cpu_cache"
+    assert cache["cached_bytes"] < cache["dense_equivalent_bytes"]
+
+
+def test_line_factorized_cpu_cache_reuses_exact_and_selected_rows() -> None:
+    """CPU factor caches must reuse immutable factors across repeated fits."""
+    torch = pytest.importorskip("torch")
+    cache: dict[str, object] = {}
+    operator = _line_factorized_density_operator(
+        diagnostics={
+            "device_cache_key": "cpu-line-factor-test",
+            "measurement_row_keys": ["a", "b", "c"],
+        }
+    )
+    first_response, first_diagnostics, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    repeated_response, repeated_diagnostics, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    selected = operator.select_measurements([2, 0])
+    selected_response, selected_diagnostics, _, _ = _prepare_dense_torch_response(
+        selected,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+
+    assert first_response is not None
+    assert repeated_response is first_response
+    assert selected_response is not None
+    assert first_diagnostics["mode"] == "line_factorized_cpu_cache"
+    assert repeated_diagnostics["mode"] == "persistent_line_factor_cache_hit"
+    assert selected_diagnostics["mode"] == "persistent_line_factor_row_gather"
+
+
+def test_line_factorized_cpu_cache_reuses_factors_for_source_masks() -> None:
+    """Debias masks must reuse cached factors without changing products."""
+    torch = pytest.importorskip("torch")
+    cache: dict[str, object] = {}
+    operator = _line_factorized_density_operator(
+        diagnostics={
+            "device_cache_key": "cpu-line-factor-mask-test",
+            "measurement_row_keys": ["a", "b", "c"],
+        }
+    )
+    base_response, _, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    mask = np.asarray([[True, False], [False, True]])
+    masked = operator.masked_sources(mask)
+    masked_response, diagnostics, row_sums, column_sums = _prepare_dense_torch_response(
+        masked,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+
+    assert base_response is not None
+    assert masked_response is not None
+    assert masked_response.spatial_factors is base_response.spatial_factors
+    assert masked_response.pulse_shapes is base_response.pulse_shapes
+    assert diagnostics["mode"] == "persistent_line_factor_mask_view"
+    assert diagnostics["host_to_device_bytes"] == 0
+    source = torch.arange(1, masked.source_count + 1, dtype=torch.float64)
+    actual = _torch_response_product(
+        masked,
+        source,
+        transpose=False,
+        torch_module=torch,
+        dense_response=masked_response,
+    )
+    np.testing.assert_allclose(actual.numpy(), masked.matvec(source.numpy()))
+    expected_rows, expected_columns = masked.response_sums()
+    np.testing.assert_array_equal(row_sums, expected_rows)
+    np.testing.assert_array_equal(column_sums, expected_columns)
+
+
+def test_line_factorized_cpu_cache_reuses_masked_selected_rows() -> None:
+    """Bootstrap row gathers and debias masks must share resident factors."""
+    torch = pytest.importorskip("torch")
+    cache: dict[str, object] = {}
+    operator = _line_factorized_density_operator(
+        diagnostics={
+            "device_cache_key": "cpu-line-factor-mask-gather-test",
+            "measurement_row_keys": ["a", "b", "c"],
+        }
+    )
+    base_response, _, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    masked = operator.masked_sources(
+        np.asarray([[True, False], [True, False]])
+    ).select_measurements([2, 0, 2])
+    masked_response, diagnostics, _, _ = _prepare_dense_torch_response(
+        masked,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+
+    assert base_response is not None
+    assert masked_response is not None
+    assert masked_response.spatial_factors is base_response.spatial_factors
+    assert diagnostics["mode"] == "persistent_line_factor_masked_row_gather"
+    source = torch.arange(1, masked.source_count + 1, dtype=torch.float64)
+    actual = _torch_response_product(
+        masked,
+        source,
+        transpose=False,
+        torch_module=torch,
+        dense_response=masked_response,
+    )
+    np.testing.assert_allclose(actual.numpy(), masked.matvec(source.numpy()))
+
+
+def test_gpu_request_rejects_cpu_device_instead_of_silent_fallback() -> None:
+    """An explicit GPU solve must never execute silently on a CPU device."""
+    operator = _line_factorized_density_operator()
+    observed = np.ones(operator.observation_shape, dtype=np.float64)
+
+    with pytest.raises(ValueError, match="requires a CUDA"):
+        fit_surface_map_poisson_operator(
+            observed,
+            operator,
+            np.ones(operator.patch_count),
+            use_gpu=True,
+            gpu_device="cpu",
+            config=SurfaceMapConfig(max_iterations=1),
+        )
+
+
 def test_poisson_em_warm_start_accelerates_large_zero_initialized_fit() -> None:
     """EM initialization should remove the slow scale-up from the zero boundary."""
     response = np.asarray(
@@ -557,9 +790,12 @@ def test_poisson_em_warm_start_accelerates_large_zero_initialized_fit() -> None:
         rtol=1.0e-9,
         atol=1.0e-6,
     )
-    assert operator.diagnostics["performance"]["solver"][
-        "poisson_em_warm_start_iterations"
-    ] == 20
+    assert (
+        operator.diagnostics["performance"]["solver"][
+            "poisson_em_warm_start_iterations"
+        ]
+        == 20
+    )
 
 
 def test_poisson_em_polishes_nonzero_warm_start() -> None:
@@ -590,8 +826,7 @@ def test_poisson_em_polishes_nonzero_warm_start() -> None:
 
     initial_expected = np.einsum("mgi,gi->m", response, initial)
     initial_deviance = 2.0 * np.sum(
-        observed * np.log(observed / initial_expected)
-        - (observed - initial_expected)
+        observed * np.log(observed / initial_expected) - (observed - initial_expected)
     )
     assert result.deviance < initial_deviance * 0.1
 
@@ -680,6 +915,185 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
     ]
     assert cache_events
     assert cache_events[-1]["completed"] == cache_events[-1]["total"]
+
+
+def test_line_factorized_cpu_gpu_products_are_equivalent_when_available() -> None:
+    """CUDA line-factor forward and transpose products must equal CPU products."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    operator = _line_factorized_density_operator()
+    cpu_response, cpu_diagnostics, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+    )
+    gpu_response, gpu_diagnostics, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+    )
+    assert cpu_response is not None
+    assert gpu_response is not None
+    source = np.linspace(0.2, 1.1, operator.source_count)
+    residual = np.linspace(0.1, 0.9, operator.observation_count)
+
+    cpu_forward = _torch_response_product(
+        operator,
+        torch.as_tensor(source, dtype=torch.float64),
+        transpose=False,
+        torch_module=torch,
+        dense_response=cpu_response,
+    )
+    gpu_forward = _torch_response_product(
+        operator,
+        torch.as_tensor(source, dtype=torch.float64, device="cuda"),
+        transpose=False,
+        torch_module=torch,
+        dense_response=gpu_response,
+    )
+    cpu_transpose = _torch_response_product(
+        operator,
+        torch.as_tensor(residual, dtype=torch.float64),
+        transpose=True,
+        torch_module=torch,
+        dense_response=cpu_response,
+    )
+    gpu_transpose = _torch_response_product(
+        operator,
+        torch.as_tensor(residual, dtype=torch.float64, device="cuda"),
+        transpose=True,
+        torch_module=torch,
+        dense_response=gpu_response,
+    )
+
+    np.testing.assert_allclose(
+        gpu_forward.cpu().numpy(),
+        cpu_forward.numpy(),
+        rtol=1.0e-13,
+        atol=1.0e-14,
+    )
+    np.testing.assert_allclose(
+        gpu_transpose.cpu().numpy(),
+        cpu_transpose.numpy(),
+        rtol=1.0e-13,
+        atol=1.0e-14,
+    )
+    assert cpu_diagnostics["mode"] == "line_factorized_cpu_cache"
+    assert gpu_diagnostics["mode"] == "line_factorized_cuda_cache"
+    assert (
+        gpu_diagnostics["host_to_device_bytes"]
+        < gpu_diagnostics["dense_equivalent_bytes"]
+    )
+
+
+def test_line_factorized_cuda_cache_appends_and_gathers_rows() -> None:
+    """CUDA factor caches must append prefixes and gather bootstrap rows."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    spatial = _line_factorized_density_operator().spatial_factors
+    cache: dict[str, object] = {}
+    first = _line_factorized_density_operator(
+        spatial_factors=spatial[:1],
+        diagnostics={
+            "device_cache_key": "line-factor-test",
+            "measurement_row_keys": ["a"],
+        },
+    )
+    extended = _line_factorized_density_operator(
+        spatial_factors=spatial[:2],
+        diagnostics={
+            "device_cache_key": "line-factor-test",
+            "measurement_row_keys": ["a", "b"],
+        },
+    )
+    first_response, first_diagnostics, _, _ = _prepare_dense_torch_response(
+        first,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    extended_response, extended_diagnostics, _, _ = _prepare_dense_torch_response(
+        extended,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    gathered = extended.select_measurements([1, 0])
+    gathered_response, gathered_diagnostics, _, _ = _prepare_dense_torch_response(
+        gathered,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+
+    assert first_response is not None
+    assert extended_response is not None
+    assert gathered_response is not None
+    assert first_diagnostics["mode"] == "line_factorized_cuda_cache"
+    assert extended_diagnostics["mode"] == "line_factorized_cuda_prefix_append"
+    assert (
+        extended_diagnostics["host_to_device_bytes"]
+        < extended_diagnostics["required_bytes"]
+    )
+    assert gathered_diagnostics["mode"] == "persistent_line_factor_row_gather"
+    source = torch.arange(
+        1,
+        gathered.source_count + 1,
+        dtype=torch.float64,
+        device="cuda",
+    )
+    actual = _torch_response_product(
+        gathered,
+        source,
+        transpose=False,
+        torch_module=torch,
+        dense_response=gathered_response,
+    )
+    np.testing.assert_allclose(actual.cpu().numpy(), gathered.matvec(source.cpu()))
+
+    masked = extended.masked_sources(np.asarray([[True, False], [False, True]]))
+    masked_response, masked_diagnostics, _, _ = _prepare_dense_torch_response(
+        masked,
+        device=torch.device("cuda"),
+        dtype=torch.float64,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    assert masked_response is not None
+    assert masked_response.spatial_factors is extended_response.spatial_factors
+    assert masked_diagnostics["mode"] == "persistent_line_factor_mask_view"
+    masked_source = torch.arange(
+        1,
+        masked.source_count + 1,
+        dtype=torch.float64,
+        device="cuda",
+    )
+    masked_actual = _torch_response_product(
+        masked,
+        masked_source,
+        transpose=False,
+        torch_module=torch,
+        dense_response=masked_response,
+    )
+    np.testing.assert_allclose(
+        masked_actual.cpu().numpy(),
+        masked.matvec(masked_source.cpu()),
+        rtol=1.0e-13,
+        atol=1.0e-14,
+    )
 
 
 def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:
@@ -847,9 +1261,7 @@ def test_cuda_response_cache_evicts_stale_patch_layouts() -> None:
     assert len(entries) == 2
     keys = {identity[2] for identity in entries}
     assert keys == {"patch-layout-1", "patch-layout-2"}
-    diagnostics = operators[-1].diagnostics["performance"]["solver"][
-        "response_cache"
-    ]
+    diagnostics = operators[-1].diagnostics["performance"]["solver"]["response_cache"]
     assert diagnostics["persistent_cache_entry_limit"] == 2
     assert diagnostics["persistent_cache_evicted_entries"] == 1
 
