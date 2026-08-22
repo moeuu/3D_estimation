@@ -23,8 +23,9 @@ from runtime.cui import (
     start_cui_server,
 )
 from runtime.cui_components import (
+    CUIPanelSpec,
     CUIScene,
-    pf_reference_panel_specs,
+    shared_cui_panel_specs,
     write_cui_index,
 )
 from runtime.defaults import (
@@ -44,6 +45,19 @@ ROBOT_IMAGE_FILENAME = "latest_robot_2d.png"
 MLE_IMAGE_FILENAME = "latest_mle_3d.png"
 MLE_LABELED_IMAGE_FILENAME = "latest_mle_3d_labeled.png"
 SPECTRUM_IMAGE_FILENAME = "latest_spectrum.png"
+MLE_RESULT_PANEL_SPECS = (
+    CUIPanelSpec(
+        "mle-surface-map",
+        "Surface-MLE patch grid and hotspots",
+        MLE_IMAGE_FILENAME,
+    ),
+    CUIPanelSpec(
+        "mle-surface-map-labeled",
+        "Surface-MLE patch grid with hotspot labels",
+        MLE_LABELED_IMAGE_FILENAME,
+        2,
+    ),
+)
 
 _CUI_SERVER_HANDLES: dict[tuple[Path, str, int, str | None], CUIServerHandle] = {}
 _CUI_SERVER_LOCK = threading.Lock()
@@ -828,15 +842,10 @@ class OnlineMLEDashboard:
         self._write_index()
 
     def _write_index(self) -> None:
-        """Publish the shared PF-reference shell with MLE panel substitutions."""
+        """Publish MLE-owned result panels in the shared runtime shell."""
         self.index_path = write_cui_index(
             self.output_dir,
-            pf_reference_panel_specs(
-                estimator_title="Surface MLE 3D",
-                estimator_filename=MLE_IMAGE_FILENAME,
-                labeled_estimator_title=("Surface MLE 3D with source labels"),
-                labeled_estimator_filename=MLE_LABELED_IMAGE_FILENAME,
-            ),
+            shared_cui_panel_specs(MLE_RESULT_PANEL_SPECS),
             title="Rotating Shield MLE CUI View",
             refresh_interval_ms=2000,
             index_filename=DASHBOARD_INDEX_FILENAME,
@@ -881,7 +890,9 @@ __all__ = [
     "DASHBOARD_INDEX_FILENAME",
     "DEFAULT_DASHBOARD_HOST",
     "DEFAULT_DASHBOARD_PORT",
+    "MLE_IMAGE_FILENAME",
     "MLE_LABELED_IMAGE_FILENAME",
+    "MLE_RESULT_PANEL_SPECS",
     "OnlineMLEDashboard",
     "cui_browser_url",
     "ensure_dashboard_server",

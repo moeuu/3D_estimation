@@ -12,7 +12,12 @@ from urllib.request import urlopen
 import numpy as np
 import pytest
 from runtime.cui import CUIRoute, CUIServerHandle
-from runtime.cui_components import CUIScene, pf_reference_panel_specs, write_cui_index
+from runtime.cui_components import (
+    CUIPanelSpec,
+    CUIScene,
+    shared_cui_panel_specs,
+    write_cui_index,
+)
 
 from three_d_estimation import dashboard
 from three_d_estimation import cli
@@ -283,8 +288,10 @@ def test_ral_command_announces_cui_url_once(
     assert captured.err == ""
 
 
-def test_dashboard_publishes_pf_style_scientific_images(tmp_path: Path) -> None:
-    """The browser work surface must be the same PNG-first form as the PF CUI."""
+def test_dashboard_publishes_mle_surface_images_in_shared_shell(
+    tmp_path: Path,
+) -> None:
+    """The shared shell must preserve MLE-owned surface result semantics."""
     publisher = dashboard.OnlineMLEDashboard(
         tmp_path,
         scene=_scene(bounds=(10.0, 20.0, 10.0)),
@@ -318,14 +325,42 @@ def test_dashboard_publishes_pf_style_scientific_images(tmp_path: Path) -> None:
         html.index(filename) for filename in expected
     )
     assert "truth" not in html.lower()
+    assert all(
+        isinstance(panel, CUIPanelSpec)
+        for panel in dashboard.MLE_RESULT_PANEL_SPECS
+    )
+    assert tuple(
+        panel.panel_id for panel in dashboard.MLE_RESULT_PANEL_SPECS
+    ) == (
+        "mle-surface-map",
+        "mle-surface-map-labeled",
+    )
+    assert tuple(
+        panel.image_filename for panel in dashboard.MLE_RESULT_PANEL_SPECS
+    ) == (
+        dashboard.MLE_IMAGE_FILENAME,
+        dashboard.MLE_LABELED_IMAGE_FILENAME,
+    )
+    assert tuple(
+        panel.title for panel in dashboard.MLE_RESULT_PANEL_SPECS
+    ) == (
+        "Surface-MLE patch grid and hotspots",
+        "Surface-MLE patch grid with hotspot labels",
+    )
+    assert tuple(
+        panel.column_span for panel in dashboard.MLE_RESULT_PANEL_SPECS
+    ) == (1, 2)
+    shared_panels = shared_cui_panel_specs(dashboard.MLE_RESULT_PANEL_SPECS)
+    assert tuple(panel.panel_id for panel in shared_panels) == (
+        "overview",
+        "robot",
+        "mle-surface-map",
+        "mle-surface-map-labeled",
+        "spectrum",
+    )
     reference_index = write_cui_index(
         tmp_path / "reference-shell",
-        pf_reference_panel_specs(
-            estimator_title="Surface MLE 3D",
-            estimator_filename=dashboard.MLE_IMAGE_FILENAME,
-            labeled_estimator_title="Surface MLE 3D with source labels",
-            labeled_estimator_filename=dashboard.MLE_LABELED_IMAGE_FILENAME,
-        ),
+        shared_panels,
         title="Rotating Shield MLE CUI View",
         refresh_interval_ms=2000,
     )
