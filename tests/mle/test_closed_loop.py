@@ -314,6 +314,7 @@ class _FakeRuntimeClient:
         """Initialize a deterministic runtime handshake."""
         del args
         type(self).instance = self
+        _FakeRuntimeClient.instance = self
         self.private_scene_profile = kwargs.get("private_scene_profile")
         self.resume_stage_path = kwargs.get("resume_stage_path")
         self.resume_compatibility_path = kwargs.get("resume_compatibility_path")
@@ -471,6 +472,7 @@ class _FakeResumeRuntimeClient(_FakeRuntimeClient):
 
     def finalize_event(self) -> AdaptivePublishedEvent:
         """Return a typed published count including the resumed prefix."""
+        self.lifecycle_events.append("finalize")
         return AdaptivePublishedEvent(
             path="/tmp/adaptive-log",
             record_count=1 + len(self.requests),
@@ -550,10 +552,26 @@ class _FakeOnlineSession:
 
     def bind_finalized_measurement_log(self, path: Path) -> None:
         """Capture final-log binding."""
+        client = _FakeRuntimeClient.instance
+        assert client is not None
+        assert client.lifecycle_events[-1] == "finalize"
+        client.lifecycle_events.append("bind")
         self.bound_path = Path(path)
 
-    def finalize(self) -> SimpleNamespace:
-        """Return a completed online result."""
+    def complete_live_state(self) -> SimpleNamespace:
+        """Seal the scientific fit before runtime log publication."""
+        client = _FakeRuntimeClient.instance
+        assert client is not None
+        assert "finalize" not in client.lifecycle_events
+        client.lifecycle_events.append("complete_live_state")
+        return SimpleNamespace()
+
+    def publish_bound_result(self) -> SimpleNamespace:
+        """Publish the bound result without running another scientific fit."""
+        client = _FakeRuntimeClient.instance
+        assert client is not None
+        assert client.lifecycle_events[-1] == "bind"
+        client.lifecycle_events.append("publish_bound_result")
         return SimpleNamespace(dashboard_url=self.dashboard_url)
 
 
@@ -633,7 +651,12 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     assert client is not None
     assert client.private_scene_profile == "ral-cs4-co3-eu0"
     assert client.cui_overlay_requests == []
-    assert client.lifecycle_events[-1:] == ["finalize"]
+    assert client.lifecycle_events[-4:] == [
+        "complete_live_state",
+        "finalize",
+        "bind",
+        "publish_bound_result",
+    ]
     assert all(
         "truth" not in key and "overlay" not in key
         for key in _FakeOnlineSession.last_init_kwargs

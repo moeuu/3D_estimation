@@ -24,6 +24,7 @@ from .observation_batch import (
     observation_batch_from_records,
 )
 from .online import (
+    CompletedOnlineMLEState,
     OnlineMLERunResult,
     OnlineMLESession,
     OnlineStationReport,
@@ -68,6 +69,7 @@ from .types import (
 __all__ = [
     "PLANNING_METHOD",
     "CountResponseMatrices",
+    "CompletedOnlineMLEState",
     "ForwardConformanceResult",
     "MLEConfig",
     "MLEEstimate",

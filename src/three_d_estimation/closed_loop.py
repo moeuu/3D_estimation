@@ -601,12 +601,13 @@ def run_ral_closed_loop(
             if not station_complete:
                 raise RuntimeError("A runtime station ended without its final marker.")
             request = plan_next_station(record, candidates)
+        online.complete_live_state()
         published = client.finalize_log()
         log = validate_ral_measurement_log(published.path)
         if published.record_count != len(log.records):
             raise RuntimeError("Published runtime record count is inconsistent.")
         online.bind_finalized_measurement_log(log.path)
-        completed = online.finalize()
+        completed = online.publish_bound_result()
         station_count = len({record.station_id for record in log.records})
         return RALClosedLoopResult(
             measurement_log_path=log.path.resolve(),

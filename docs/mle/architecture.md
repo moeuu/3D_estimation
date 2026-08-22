@@ -13,8 +13,12 @@ It does not copy or synchronize runtime source.
 Production has one live estimator path. `OnlineMLESession` accepts each
 already-persisted runtime record. Production RA-L mode buffers all shield views at
 one point and performs one coarse all-history warm fit only when the durable station
-marker closes that measurement point. Finalization rebuilds the configured
-full-resolution grid and uncertainty result. After each completed station,
+marker closes that measurement point. `complete_live_state()` rebuilds and seals the
+configured full-resolution grid and uncertainty result before runtime publication.
+Only then may the controller publish the immutable MeasurementLog, bind its exact
+context and record digest with `bind_finalized_measurement_log()`, and serialize the
+already-sealed estimate with `publish_bound_result()`. The last two phases cannot fit
+or otherwise mutate scientific state. After each completed station,
 `OnlineMLESession.plan_next_action` ranks the current truth-free runtime candidate
 poses and Fe/Pb programs using local Fisher `D_s`-optimal design, explicit
 vertical/support ambiguity criteria, and the shared physical kernel. No command
@@ -35,8 +39,9 @@ history, asks the runtime for local candidate refinement when useful, and select
 next eight-measurement station program. No action list, station count, shield program,
 or record count appears in the scenario. The immutable log is validated and bound to
 the final MLE report only after the compound
-stability/coverage/ambiguity/information stop rule fires. See the [RA-L closed-loop
-runbook](ral_full_simulation.md).
+stability/coverage/ambiguity/information stop rule fires. The enforced order is
+scientific completion, runtime log publication, exact binding, then artifact
+publication. See the [RA-L closed-loop runbook](ral_full_simulation.md).
 
 ## Data contracts and dimensions
 

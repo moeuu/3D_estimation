@@ -18,7 +18,12 @@ raw observation contract are common.
 it. The MLE buffers every shield-view record without fitting an incomplete station.
 When the final view marks `station_complete`, it performs exactly one coarse
 all-history warm fit for that measurement point and publishes the durable report.
-The final call rebuilds the configured full-resolution map and uncertainty result.
+Live shutdown uses three explicit phases. `complete_live_state()` rebuilds and seals
+the configured full-resolution map while acquisition is still active;
+`bind_finalized_measurement_log()` then authenticates the immutable runtime log;
+`publish_bound_result()` only adds provenance and writes the final artifacts. No
+scientific fit is allowed after runtime log publication, and `OnlineMLESession` has
+no ambiguous `finalize()` method.
 The output is:
 
 ```text

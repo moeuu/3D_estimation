@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -232,6 +233,7 @@ class _FakeOnlineBackend:
         """Initialize empty runtime state."""
         self.records: list[MeasurementRecord] = []
         self.latest_estimate: MLEEstimate | None = None
+        self.finalize_calls = 0
 
     def initialize(self, context: RunContext) -> None:
         """Accept the runtime context without constructing physics."""
@@ -263,6 +265,7 @@ class _FakeOnlineBackend:
 
     def finalize(self) -> EstimatorResult:
         """Fit and return the final buffered history."""
+        self.finalize_calls += 1
         self.latest_estimate = _estimate(len(self.records))
         return EstimatorResult(
             final_snapshot=self.snapshot(),
@@ -300,16 +303,17 @@ class _FakeOnlineBackend:
 
 
 def test_online_session_publishes_each_causal_station_and_final_report(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Station reports must cover only records available at their cutoff."""
     output_dir = tmp_path / "online"
+    backend = _FakeOnlineBackend()
     session = OnlineMLESession(
         context=_context(),
         config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
         output_dir=output_dir,
-        backend=_FakeOnlineBackend(),
-        measurement_log_sha256="d" * 64,
+        backend=backend,
         dashboard_scene=_dashboard_scene(),
     )
 
@@ -320,7 +324,24 @@ def test_online_session_publishes_each_causal_station_and_final_report(
         np.asarray([[1.0, 0.5, 1.0]]),
         planning_config=MLEPlanningConfig(shield_program_length=1),
     )
-    completed = session.finalize()
+    sealed = session.complete_live_state()
+    assert session.complete_live_state() is sealed
+    assert backend.finalize_calls == 1
+    assert not (output_dir / "final").exists()
+
+    run_dir = (tmp_path / "measurement-log").resolve()
+    fake_log = SimpleNamespace(
+        path=run_dir,
+        run_id=session.context.run_id,
+        context=session.context,
+        records=session.records,
+        content_sha256="d" * 64,
+    )
+    monkeypatch.setattr(online_module, "load_measurement_log", lambda path: fake_log)
+    assert session.bind_finalized_measurement_log(run_dir) is fake_log
+    completed = session.publish_bound_result()
+    assert session.publish_bound_result() is completed
+    assert backend.finalize_calls == 1
 
     assert first_snapshot is not None
     assert second_snapshot is not None
@@ -427,6 +448,7 @@ def test_online_session_rejects_station_marker_disagreement(
 
 
 def test_online_session_exposes_no_truth_overlay_channel(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Estimator-owned session and dashboard APIs must have no truth channel."""
@@ -436,7 +458,6 @@ def test_online_session_exposes_no_truth_overlay_channel(
         config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
         output_dir=output_dir,
         backend=_FakeOnlineBackend(),
-        measurement_log_sha256="d" * 64,
         dashboard_scene=_dashboard_scene(),
     )
     assert not hasattr(session, "set_dashboard_cui_overlay")
@@ -444,13 +465,112 @@ def test_online_session_exposes_no_truth_overlay_channel(
     assert not hasattr(session.dashboard, "set_cui_overlay")
 
     session.receive_persisted(_record(0, 0, station_complete=True))
-    session.finalize()
+    session.complete_live_state()
+    run_dir = (tmp_path / "measurement-log").resolve()
+    fake_log = SimpleNamespace(
+        path=run_dir,
+        run_id=session.context.run_id,
+        context=session.context,
+        records=session.records,
+        content_sha256="d" * 64,
+    )
+    monkeypatch.setattr(online_module, "load_measurement_log", lambda path: fake_log)
+    session.bind_finalized_measurement_log(run_dir)
+    session.publish_bound_result()
     final_dashboard = json.loads((output_dir / "dashboard_data.json").read_text())
     state = json.loads((output_dir / ONLINE_STATE_FILENAME).read_text())
 
     assert final_dashboard["status"] == "finalized"
     assert "truth" not in json.dumps(final_dashboard, sort_keys=True).lower()
     assert "truth" not in json.dumps(state, sort_keys=True).lower()
+
+
+def test_online_session_enforces_three_phase_finalization_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Binding and publication must surround no scientific estimator work."""
+    backend = _FakeOnlineBackend()
+    session = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "online",
+        backend=backend,
+        enable_dashboard=False,
+    )
+    session.receive_persisted(_record(0, 0, station_complete=True))
+    run_dir = (tmp_path / "measurement-log").resolve()
+    fake_log = SimpleNamespace(
+        path=run_dir,
+        run_id=session.context.run_id,
+        context=session.context,
+        records=session.records,
+        content_sha256="d" * 64,
+    )
+    monkeypatch.setattr(online_module, "load_measurement_log", lambda path: fake_log)
+
+    assert not hasattr(session, "finalize")
+    with pytest.raises(RuntimeError, match="Complete the live estimator state"):
+        session.bind_finalized_measurement_log(run_dir)
+    with pytest.raises(RuntimeError, match="Complete the live estimator state"):
+        session.publish_bound_result()
+
+    session.complete_live_state()
+    assert backend.finalize_calls == 1
+    with pytest.raises(RuntimeError, match="Bind the finalized MeasurementLog"):
+        session.publish_bound_result()
+
+    session.bind_finalized_measurement_log(run_dir)
+    session.publish_bound_result()
+    assert backend.finalize_calls == 1
+
+    with pytest.raises(RuntimeError, match="already complete"):
+        session.receive_persisted(_record(1, 1, station_complete=True))
+    with pytest.raises(RuntimeError, match="already complete"):
+        session.plan_next_action(np.asarray([[1.0, 0.5, 1.0]]))
+
+
+@pytest.mark.parametrize("tampering", ("context", "records"))
+def test_finalized_log_binding_rejects_exact_live_history_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tampering: str,
+) -> None:
+    """Final-log binding must reject any changed context or record digest."""
+    session = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "online",
+        backend=_FakeOnlineBackend(),
+        enable_dashboard=False,
+    )
+    session.receive_persisted(_record(0, 0, station_complete=True))
+    session.complete_live_state()
+    run_dir = (tmp_path / "measurement-log").resolve()
+    changed_context = RunContext.from_payload(
+        {
+            **session.context.to_payload(),
+            "repository_commit": "f" * 40,
+        }
+    )
+    fake_log = SimpleNamespace(
+        path=run_dir,
+        run_id=session.context.run_id,
+        context=(
+            changed_context if tampering == "context" else session.context
+        ),
+        records=(
+            (_record(0, 0, station_complete=True, detector_pose_xyz=(1.5, 0.5, 1.0)),)
+            if tampering == "records"
+            else session.records
+        ),
+        content_sha256="d" * 64,
+    )
+    monkeypatch.setattr(online_module, "load_measurement_log", lambda path: fake_log)
+
+    expected = "runtime context changed" if tampering == "context" else "live history"
+    with pytest.raises(ValueError, match=expected):
+        session.bind_finalized_measurement_log(run_dir)
 
 
 def test_online_dashboard_uses_runtime_resolved_file_obstacle_scene(

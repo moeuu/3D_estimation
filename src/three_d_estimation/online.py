@@ -124,6 +124,14 @@ class OnlineMLERunResult:
     dashboard_url: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CompletedOnlineMLEState:
+    """Hold the sealed scientific result before final-log publication."""
+
+    result: EstimatorResult
+    final_estimate: MLEEstimate
+
+
 def _save_report(
     estimate: MLEEstimate,
     output_dir: Path,
@@ -284,6 +292,8 @@ class OnlineMLESession:
         self._station_reports: list[OnlineStationReport] = []
         self._station_estimates: list[MLEEstimate] = []
         self._last_completed_record_count = 0
+        self._completed_state: CompletedOnlineMLEState | None = None
+        self._bound_log: MeasurementLog | None = None
         self._final_result: OnlineMLERunResult | None = None
         self._failed = False
         self._latest_published_estimate: MLEEstimate | None = None
@@ -351,11 +361,16 @@ class OnlineMLESession:
         return estimate if isinstance(estimate, MLEEstimate) else None
 
     def _ensure_active(self) -> None:
-        """Reject work after failure or finalization."""
+        """Reject estimator work after failure or scientific completion."""
         if self._failed:
             raise RuntimeError("OnlineMLESession is failed and cannot continue.")
-        if self._final_result is not None:
-            raise RuntimeError("OnlineMLESession is already finalized.")
+        if self._completed_state is not None:
+            raise RuntimeError("OnlineMLESession live state is already complete.")
+
+    def _ensure_healthy(self) -> None:
+        """Reject lifecycle transitions after an estimator failure."""
+        if self._failed:
+            raise RuntimeError("OnlineMLESession is failed and cannot continue.")
 
     def _online_estimate(
         self,
@@ -548,16 +563,16 @@ class OnlineMLESession:
             self._failed = True
             raise
 
-    def finalize(self) -> OnlineMLERunResult:
-        """Fit, publish, and return the final complete online history."""
-        if self._final_result is not None:
-            return self._final_result
-        self._ensure_active()
+    def complete_live_state(self) -> CompletedOnlineMLEState:
+        """Run and seal the final fit before runtime log publication."""
+        if self._completed_state is not None:
+            return self._completed_state
+        self._ensure_healthy()
         if not self.records:
-            raise RuntimeError("OnlineMLESession has no measurements to finalize.")
+            raise RuntimeError("OnlineMLESession has no measurements to complete.")
         if self._last_completed_record_count != len(self.records):
             raise RuntimeError(
-                "Cannot finalize before the current runtime station is complete."
+                "Cannot complete before the current runtime station is complete."
             )
         try:
             base_result = self._session.finalize()
@@ -566,8 +581,70 @@ class OnlineMLESession:
                 raise TypeError(
                     "Online backend must expose an MLEEstimate after final fit."
                 )
+            completed = CompletedOnlineMLEState(
+                result=base_result,
+                final_estimate=estimate,
+            )
+            self._completed_state = completed
+            return completed
+        except BaseException:
+            self._failed = True
+            raise
+
+    process_persisted_measurement = receive_persisted
+
+    def bind_finalized_measurement_log(
+        self,
+        run_dir: str | Path,
+    ) -> MeasurementLog:
+        """Verify and bind the immutable log for the sealed live history."""
+        self._ensure_healthy()
+        if self._completed_state is None:
+            raise RuntimeError(
+                "Complete the live estimator state before binding a finalized log."
+            )
+        resolved_run_dir = Path(run_dir).expanduser().resolve()
+        if self._bound_log is not None:
+            if self._bound_log.path != resolved_run_dir:
+                raise RuntimeError(
+                    "OnlineMLESession is already bound to another MeasurementLog."
+                )
+            return self._bound_log
+        log = load_measurement_log(resolved_run_dir)
+        if log.run_id != self.context.run_id:
+            raise ValueError("Finalized MeasurementLog belongs to another run_id.")
+        if canonical_json_sha256(log.context.to_payload()) != canonical_json_sha256(
+            self.context.to_payload()
+        ):
+            raise ValueError("Finalized MeasurementLog runtime context changed.")
+        if len(log.records) != len(self.records) or (
+            measurement_records_digest(log.records)
+            != measurement_records_digest(self.records)
+        ):
+            raise ValueError(
+                "Finalized MeasurementLog differs from the persisted live history."
+            )
+        self.measurement_log_sha256 = log.content_sha256
+        self.forward_model_manifest_sha256 = _forward_manifest_sha256(log.path)
+        self._bound_log = log
+        return log
+
+    def publish_bound_result(self) -> OnlineMLERunResult:
+        """Annotate and serialize a sealed result bound to an immutable log."""
+        if self._final_result is not None:
+            return self._final_result
+        self._ensure_healthy()
+        if self._completed_state is None:
+            raise RuntimeError(
+                "Complete the live estimator state before publishing its result."
+            )
+        if self._bound_log is None or self.measurement_log_sha256 is None:
+            raise RuntimeError(
+                "Bind the finalized MeasurementLog before publishing its result."
+            )
+        try:
             annotated = self._online_estimate(
-                estimate,
+                self._completed_state.final_estimate,
                 fit_kind="online_final_all_history",
                 include_final_log_hash=True,
             )
@@ -578,6 +655,7 @@ class OnlineMLESession:
                 self.config,
             )
             state_path = self.output_dir / ONLINE_STATE_FILENAME
+            base_result = self._completed_state.result
             result = EstimatorResult(
                 final_snapshot=base_result.final_snapshot,
                 diagnostics={
@@ -603,7 +681,7 @@ class OnlineMLESession:
                 },
             )
             self._persist_state(status="finalized", final_report=final_paths)
-            completed = OnlineMLERunResult(
+            published = OnlineMLERunResult(
                 result=result,
                 final_estimate=annotated,
                 final_report_paths=final_paths,
@@ -611,35 +689,11 @@ class OnlineMLESession:
                 state_path=state_path,
                 dashboard_url=self.dashboard_url,
             )
-            self._final_result = completed
-            return completed
+            self._final_result = published
+            return published
         except BaseException:
             self._failed = True
             raise
-
-    process_persisted_measurement = receive_persisted
-
-    def bind_finalized_measurement_log(
-        self,
-        run_dir: str | Path,
-    ) -> MeasurementLog:
-        """Bind and verify the immutable log produced by this live session."""
-        self._ensure_active()
-        log = load_measurement_log(Path(run_dir).expanduser().resolve())
-        if log.run_id != self.context.run_id:
-            raise ValueError("Finalized MeasurementLog belongs to another run_id.")
-        if log.context.runtime_config_sha256 != self.context.runtime_config_sha256:
-            raise ValueError("Finalized MeasurementLog runtime context changed.")
-        if len(log.records) != len(self.records) or (
-            measurement_records_digest(log.records)
-            != measurement_records_digest(self.records)
-        ):
-            raise ValueError(
-                "Finalized MeasurementLog differs from the persisted live history."
-            )
-        self.measurement_log_sha256 = log.content_sha256
-        self.forward_model_manifest_sha256 = _forward_manifest_sha256(log.path)
-        return log
 
     def plan_next_action(
         self,
@@ -707,6 +761,7 @@ class OnlineMLESession:
 
 
 __all__ = [
+    "CompletedOnlineMLEState",
     "ONLINE_STATE_FILENAME",
     "OnlineMLERunResult",
     "OnlineMLESession",
