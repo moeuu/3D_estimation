@@ -11,6 +11,66 @@ from typing import Mapping
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _commit_digest(value: str) -> str | None:
+    """Return one normalized Git object digest or ``None`` when malformed."""
+    candidate = value.strip().lower()
+    if len(candidate) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in candidate
+    ):
+        return None
+    return candidate
+
+
+def _git_reference_directories(git_directory: Path) -> tuple[Path, ...]:
+    """Return private and shared reference roots for one Git directory."""
+    directories = [git_directory]
+    common_file = git_directory / "commondir"
+    if common_file.is_file():
+        common_text = common_file.read_text(encoding="utf-8").strip()
+        if common_text:
+            common_directory = Path(common_text)
+            if not common_directory.is_absolute():
+                common_directory = git_directory / common_directory
+            common_directory = common_directory.resolve()
+            if common_directory != git_directory:
+                directories.append(common_directory)
+    return tuple(directories)
+
+
+def _reference_commit(
+    reference: str,
+    reference_directories: tuple[Path, ...],
+) -> str | None:
+    """Resolve one symbolic Git reference from loose or packed storage."""
+    reference_path = Path(reference)
+    if (
+        not reference.startswith("refs/")
+        or reference_path.is_absolute()
+        or ".." in reference_path.parts
+    ):
+        return None
+    for directory in reference_directories:
+        loose = directory / reference_path
+        if loose.is_file():
+            digest = _commit_digest(loose.read_text(encoding="utf-8"))
+            if digest is not None:
+                return digest
+    for directory in reference_directories:
+        packed = directory / "packed-refs"
+        if not packed.is_file():
+            continue
+        for line in packed.read_text(encoding="utf-8").splitlines():
+            if line.startswith(("#", "^")) or not line.strip():
+                continue
+            fields = line.split(maxsplit=1)
+            if len(fields) != 2 or fields[1].strip() != reference:
+                continue
+            digest = _commit_digest(fields[0])
+            if digest is not None:
+                return digest
+    return None
+
+
 def repository_commit(root: str | Path = _REPOSITORY_ROOT) -> str:
     """Return the local Git commit without invoking Git or another repository."""
     repository = Path(root)
@@ -18,26 +78,24 @@ def repository_commit(root: str | Path = _REPOSITORY_ROOT) -> str:
     if git_entry.is_file():
         text = git_entry.read_text(encoding="utf-8").strip()
         if text.startswith("gitdir:"):
-            git_entry = (repository / text.removeprefix("gitdir:").strip()).resolve()
+            git_directory = Path(text.removeprefix("gitdir:").strip())
+            if not git_directory.is_absolute():
+                git_directory = repository / git_directory
+            git_entry = git_directory.resolve()
     if git_entry.is_dir():
         head = (git_entry / "HEAD").read_text(encoding="utf-8").strip()
         if head.startswith("ref:"):
             reference = head.removeprefix("ref:").strip()
-            loose = git_entry / reference
-            if loose.is_file():
-                value = loose.read_text(encoding="utf-8").strip()
-                if value:
-                    return value
-            packed = git_entry / "packed-refs"
-            if packed.is_file():
-                for line in packed.read_text(encoding="utf-8").splitlines():
-                    if line.startswith(("#", "^")) or not line.strip():
-                        continue
-                    value, name = line.split(" ", 1)
-                    if name.strip() == reference:
-                        return value.strip()
-        elif head:
-            return head
+            commit = _reference_commit(
+                reference,
+                _git_reference_directories(git_entry),
+            )
+            if commit is not None:
+                return commit
+        else:
+            commit = _commit_digest(head)
+            if commit is not None:
+                return commit
     return "unknown-standalone-build"
 
 
