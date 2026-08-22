@@ -1,4 +1,4 @@
-# Shared MeasurementLog v2 boundary
+# Shared MeasurementLog boundary
 
 `MeasurementLog` is the estimator-independent boundary between acquisition and the
 surface MLE. The versioned `rotating-shield-simulation-runtime` package exclusively

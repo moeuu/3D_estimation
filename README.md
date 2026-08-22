@@ -2,7 +2,7 @@
 
 This repository owns only the 3-D surface maximum-likelihood estimator. Physical
 acquisition, Geant4, detector/shield/obstacle physics, spectrum generation, and raw
-MeasurementLog v2 publication are provided by the versioned
+MeasurementLog publication are provided by the
 `rotating-shield-simulation-runtime` dependency.
 
 Sharing the runtime does not mean sharing estimator settings. MLE keeps its own
@@ -54,7 +54,7 @@ published runtime log:
 
 ```bash
 uv run estimate-radiation-mle online-replay \
-  --run-dir /path/to/measurement-log-v2 \
+  --run-dir /path/to/measurement-log \
   --mle-config configs/mle/default_spectral.json \
   --output-dir /path/to/mle-online \
   --cpu --json
@@ -112,7 +112,7 @@ The same operation is available for a saved station report:
 
 ```bash
 uv run estimate-radiation-mle plan-next \
-  --run-dir /path/to/measurement-log-v2 \
+  --run-dir /path/to/measurement-log \
   --estimate /path/to/mle-online/stations/station_000003_step_00000015 \
   --mle-config configs/mle/default_spectral.json \
   --planning-config configs/mle/default_planning.json \
@@ -178,14 +178,14 @@ Fit one authoritative cold spectral MLE from a finalized raw log:
 
 ```bash
 uv run estimate-radiation-mle fit-spectrum \
-  --run-dir /path/to/measurement-log-v2 \
+  --run-dir /path/to/measurement-log \
   --mle-config configs/mle/default_spectral.json \
   --output-dir /path/to/mle-spectral \
   --cpu --json
 ```
 
 The `replay` command is retained only for an explicitly derived count observation
-contract. It does not derive isotope counts from raw MeasurementLog v2 spectra.
+contract. It does not derive isotope counts from raw MeasurementLog spectra.
 
 For a final unseen-environment evaluation after regularization and calibration have
 been frozen:

@@ -26,7 +26,7 @@ from three_d_estimation.types import ObservationBatch
 
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURE = ROOT / "fixtures" / "shared_measurement_log_v2" / "measurement_log"
+FIXTURE = ROOT / "fixtures" / "shared_measurement_log" / "measurement_log"
 
 
 def _fixture_config(mode: str) -> MLEConfig:
@@ -151,7 +151,7 @@ def test_shared_fixture_preserves_pose_timing_and_shield_blocks() -> None:
 
 
 def test_spectral_replay_uses_full_dictionary_and_provenance() -> None:
-    """Raw MeasurementLog v2 drives spectral MLE over every surface patch."""
+    """Raw MeasurementLog data drives spectral MLE over every surface patch."""
     estimates = {
         "spectral": run_replay(
             FIXTURE,

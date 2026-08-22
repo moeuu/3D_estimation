@@ -6,7 +6,7 @@ This document describes the implemented all-history surface maximum-likelihood e
 
 Production acquisition is not owned by this repository. The versioned
 `rotating-shield-simulation-runtime` package produces and durably stages truth-free raw
-MeasurementLog v2 records. This estimator imports that package's public record,
+MeasurementLog schema-2 records. This estimator imports that package's public record,
 observation-model, continuous-kernel, asset-resolution, and log-reader APIs. It does
 not copy or synchronize runtime source.
 

@@ -7,7 +7,7 @@ plan and it never imports PF code or simulation physics.
 ## Ownership and private scenario
 
 The runtime owns external Geant4, detector and shield geometry, obstacle transport,
-spectra, source realization, raw observations, and MeasurementLog v2 publication.
+spectra, source realization, raw observations, and MeasurementLog publication.
 The private scenario contains only physical-scene and run identity inputs:
 
 - the selected private profile's realized source positions and strengths;
@@ -289,7 +289,7 @@ An already completed compatible RA-L log can be analyzed without acquisition:
 
 ```bash
 uv run estimate-radiation-mle ral-full-simulation \
-  --run-dir /path/to/measurement-log-v2 \
+  --run-dir /path/to/measurement-log \
   --output-dir results/ral-runs/ral-mix9-mle \
   --json
 ```

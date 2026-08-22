@@ -17,6 +17,6 @@ The migration retains original filenames, directory structure, line endings,
 empty files, partial files, and marker columns. This preservation guarantees
 historical fidelity, not data quality or completeness.
 
-These artifacts are not MeasurementLog v2 inputs and are not consumed by the
+These artifacts are not MeasurementLog inputs and are not consumed by the
 maintained estimator example. Use `../shield_aware_surface_mle.ipynb` for the
 current executable workflow.

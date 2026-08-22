@@ -4,12 +4,12 @@
 
 This repository owns only the 3-D surface-MLE estimator. Geant4, environment,
 detector, shield, obstacle transport, spectrum physics, observation generation,
-and raw MeasurementLog v2 ownership belong to the sibling
+and raw MeasurementLog ownership belong to the sibling
 `Rotating-shield-simulation-runtime` package.
 
 ## Repository isolation
 
-- Depend on the versioned `rotating-shield-simulation-runtime` package rather
+- Depend on the pinned `rotating-shield-simulation-runtime` package rather
   than copying its implementation.
 - Do not vendor `native`, `measurement`, `sim`, `spectrum`, environment assets,
   source layouts, obstacle layouts, or MeasurementLog writers here.

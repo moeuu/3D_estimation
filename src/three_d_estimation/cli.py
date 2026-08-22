@@ -123,7 +123,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--run-dir",
         type=Path,
         required=True,
-        help="Finalized shared-runtime MeasurementLog v2 directory.",
+        help="Finalized shared-runtime MeasurementLog directory.",
     )
     online_parser.add_argument(
         "--mle-config",

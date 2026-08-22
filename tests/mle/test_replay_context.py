@@ -1,4 +1,4 @@
-"""Tests for consuming shared raw MeasurementLog v2 data."""
+"""Tests for consuming shared raw MeasurementLog data."""
 
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from three_d_estimation.replay import prepare_replay
 
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURE = ROOT / "fixtures/shared_measurement_log_v2/measurement_log"
+FIXTURE = ROOT / "fixtures/shared_measurement_log/measurement_log"
 
 
 def test_prepare_replay_consumes_shared_raw_log_without_local_simulator() -> None:
