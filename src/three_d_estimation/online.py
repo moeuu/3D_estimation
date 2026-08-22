@@ -9,7 +9,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
 
 from runtime import CUIScene, DigestIdentity, ResolvedForwardContext
 from runtime.cui import CUIRoute, cui_route_from_records
@@ -171,57 +170,6 @@ def _forward_manifest_sha256(run_root: Path | None) -> str | None:
         return None
     path = run_root / "forward_model_manifest.json"
     return sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-
-
-def _resolved_config(
-    config: MLEConfig | Mapping[str, Any] | str | Path | None,
-    log: MeasurementLog,
-) -> tuple[MLEConfig, str]:
-    """Resolve online configuration and its caller-visible source digest."""
-    if config is None:
-        resolved = MLEConfig(
-            mode="spectral",
-            isotope_names=log.context.isotopes,
-        )
-        source_sha256 = canonical_json_sha256(resolved.to_dict())
-    elif isinstance(config, MLEConfig):
-        resolved = config
-        source_sha256 = canonical_json_sha256(resolved.to_dict())
-    elif isinstance(config, Mapping):
-        resolved = MLEConfig.from_dict(config)
-        source_sha256 = canonical_json_sha256(dict(config))
-    elif isinstance(config, (str, Path)):
-        path = Path(config)
-        resolved = MLEConfig.load(path)
-        source_sha256 = sha256(path.read_bytes()).hexdigest()
-    else:
-        raise TypeError("config must be MLEConfig, a mapping, a JSON path, or None.")
-    if tuple(resolved.isotope_names) != tuple(log.context.isotopes):
-        raise ValueError(
-            "Online MLE isotope_names must exactly match the runtime log order."
-        )
-    return resolved, source_sha256
-
-
-def _station_boundary(
-    records: Sequence[MeasurementRecord],
-    index: int,
-) -> bool:
-    """Validate and return whether one record closes its runtime station."""
-    record = records[index]
-    expected = index + 1 == len(records) or (
-        records[index + 1].station_id != record.station_id
-    )
-    marker = record.metadata.get("station_complete")
-    if marker is not None and not isinstance(marker, bool):
-        raise ValueError("Runtime station_complete metadata must be boolean.")
-    actual = marker is True
-    if actual != expected:
-        raise ValueError(
-            "Runtime records must carry one station_complete=true marker on "
-            "the final record of every station."
-        )
-    return expected
 
 
 def _dashboard_trajectory(
@@ -758,53 +706,9 @@ class OnlineMLESession:
         return annotated
 
 
-def run_online_replay(
-    run_dir: str | Path,
-    *,
-    config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
-    output_dir: str | Path,
-    overwrite: bool = False,
-    enable_dashboard: bool = True,
-    serve_dashboard: bool = False,
-    dashboard_host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
-    dashboard_port: int = DEFAULT_DASHBOARD_PORT,
-    dashboard_public_host: str | None = None,
-    dashboard_url_hook: Callable[[str], None] | None = None,
-) -> OnlineMLERunResult:
-    """Replay a finalized runtime log through the live station-update path."""
-    resolved_run_dir = Path(run_dir).resolve()
-    log = load_measurement_log(resolved_run_dir)
-    resolved_config, config_source_sha256 = _resolved_config(config, log)
-    if log.content_sha256 is None:
-        raise ValueError("Runtime MeasurementLog is missing its content SHA-256.")
-    session = OnlineMLESession(
-        context=log.context,
-        config=resolved_config,
-        output_dir=output_dir,
-        run_root=resolved_run_dir,
-        config_source_sha256=config_source_sha256,
-        measurement_log_sha256=log.content_sha256,
-        overwrite=overwrite,
-        enable_dashboard=enable_dashboard,
-        serve_dashboard=serve_dashboard,
-        dashboard_host=dashboard_host,
-        dashboard_port=dashboard_port,
-        dashboard_public_host=dashboard_public_host,
-    )
-    if session.dashboard_url is not None and dashboard_url_hook is not None:
-        dashboard_url_hook(session.dashboard_url)
-    for index, record in enumerate(log.records):
-        session.receive_persisted(
-            record,
-            station_complete=_station_boundary(log.records, index),
-        )
-    return session.finalize()
-
-
 __all__ = [
     "ONLINE_STATE_FILENAME",
     "OnlineMLERunResult",
     "OnlineMLESession",
     "OnlineStationReport",
-    "run_online_replay",
 ]

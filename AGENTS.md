@@ -15,6 +15,9 @@ and raw MeasurementLog ownership belong to the sibling
   source layouts, obstacle layouts, or MeasurementLog writers here.
 - Keep MLE solver, regularization, response-matrix assembly, warm starts, and
   MLE reporting under `src/three_d_estimation/`.
+- Do not add finalized-MeasurementLog all-history fitting commands or offline
+  estimator runners. Production estimation advances through observations
+  delivered durably to `OnlineMLESession`.
 - Simulation acquisition is invoked through the shared runtime CLI, never by a
   local simulator implementation.
 
@@ -35,8 +38,8 @@ and raw MeasurementLog ownership belong to the sibling
   physics in the estimator.
 - Preserve spectra, bin edges, variances, detector poses, live times, and Fe/Pb
   orientation indices in measurement logs.
-- Production observations must come from a simulator or an imported log, not
-  from expected-count substitutions.
+- Production observations must be delivered by the shared runtime, not from
+  expected-count substitutions.
 
 ## Performance
 

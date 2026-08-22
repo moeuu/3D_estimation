@@ -26,7 +26,7 @@ FIXTURE = ROOT / "fixtures" / "shared_measurement_log" / "measurement_log"
 def test_log_conversion_delegates_canonical_arrays_to_runtime(
     monkeypatch: Any,
 ) -> None:
-    """Replay conversion should obtain every core array from MeasurementLog."""
+    """Record conversion should obtain every core array from MeasurementLog."""
     log = load_measurement_log(FIXTURE)
     original = MeasurementLog.array_view
     calls: list[MeasurementLog] = []

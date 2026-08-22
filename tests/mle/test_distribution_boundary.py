@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import tomllib
 from pathlib import Path
 
@@ -52,10 +53,27 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
         for name, target in project.get("scripts", {}).items()
     )
     assert not any(
-        "service" in name.lower()
-        for name in project.get("optional-dependencies", {})
+        "service" in name.lower() for name in project.get("optional-dependencies", {})
     )
     assert not (ROOT / "src" / "three_d_estimation" / "service.py").exists()
+    assert not (ROOT / "src" / "three_d_estimation" / "holdout.py").exists()
+    assert not (ROOT / "src" / "three_d_estimation" / "replay.py").exists()
+    assert not (ROOT / "scripts" / "run_mle_replay.py").exists()
+
+
+def test_completed_log_estimator_api_is_absent() -> None:
+    """The installed package must not expose completed-log fit launchers."""
+    import three_d_estimation
+    import three_d_estimation.online as online
+    import three_d_estimation.ral as ral
+
+    assert importlib.util.find_spec("three_d_estimation.replay") is None
+    assert importlib.util.find_spec("three_d_estimation.holdout") is None
+    for name in ("ReplayContext", "ReplayResult", "prepare_replay", "run_replay"):
+        assert not hasattr(three_d_estimation, name)
+    assert not hasattr(online, "run_online_replay")
+    assert not hasattr(ral, "RALFullSimulationResult")
+    assert not hasattr(ral, "run_ral_full_simulation")
 
 
 def test_package_discovery_contains_only_mle_code() -> None:

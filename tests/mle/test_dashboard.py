@@ -282,7 +282,7 @@ def test_ral_command_announces_cui_url_once(
         ]
     )
 
-    assert cli._run_ral_full_simulation(args) == 0
+    assert cli._run_ral_live_acquisition(args) == 0
     captured = capsys.readouterr()
     assert captured.out.count(f"CUI split visualization URL: {url}\n") == 1
     assert captured.err == ""

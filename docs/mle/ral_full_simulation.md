@@ -233,17 +233,19 @@ families with shrinkage, and uses the calibrated negative-binomial dispersion. T
 runtime only owns this common calibration contract; all MLE nuisance selection and
 likelihood behavior remain in this repository.
 
-## Regularization, uncertainty, and final holdout
+## Regularization and uncertainty
 
 `ral_regularization_tuning.json` performs grouped station/same-XY validation over the
-L1/TV grid and applies the one-standard-error rule. Tuning and final environment IDs
-must differ. The selected weights are then frozen in the final profile.
+L1/TV grid and applies the one-standard-error rule. Its `tuning_environment_id`
+records the calibration context; the selected weights are then frozen in the final
+profile.
 
 Final uncertainty includes an active-support Laplace covariance, station-block
 bootstrap, patch selection frequencies, cluster centroid and integrated-strength
 intervals, isotope/surface mass probabilities, z intervals, and ceiling probability.
-The final `ral-holdout` command additionally verifies that tuning, discrepancy
-calibration, and the unseen Geant4 evaluation environment are disjoint before fitting.
+An independent evaluator, outside this estimator process, is responsible for checking
+that tuning, discrepancy calibration, and an unseen Geant4 evaluation environment are
+disjoint.
 
 ## Readiness check
 
@@ -285,18 +287,3 @@ tmux new-session -d -s ral_mle \
    --output-dir results/ral-runs/ral-mix9-mle \
    > results/ral-runs/ral-mix9-mle.log 2>&1"
 ```
-
-## Replay an existing physical log
-
-An already completed compatible RA-L log can be analyzed without acquisition:
-
-```bash
-uv run estimate-radiation-mle ral-full-simulation \
-  --run-dir /path/to/measurement-log \
-  --output-dir results/ral-runs/ral-mix9-mle \
-  --json
-```
-
-Log validation enforces the Geant4/full-transport/isotope contract and causal station
-markers. It deliberately does not enforce a station count, views per station, record
-count, or fixed live time.

@@ -23,7 +23,11 @@ from runtime.records import (
 from .config import MLEConfig
 from .lineage import validate_covered_records_lineage
 from .observation_batch import subset_observation_batch
-from .replay import ReplayContext, prepare_replay, validate_warm_start_artifact
+from .estimator_context import (
+    EstimatorContext,
+    prepare_estimator_context,
+    validate_warm_start_artifact,
+)
 from .reporting import mle_report_sha256
 from .response_builder import build_count_responses
 from .types import MLEEstimate, SurfacePatch
@@ -415,7 +419,7 @@ def _validate_snapshot_predictions(
 def _validate_snapshot(
     snapshot: dict[str, object],
     *,
-    context: ReplayContext,
+    context: EstimatorContext,
     estimate: MLEEstimate,
     report_digest: str,
 ) -> tuple[int, int, list[dict[str, object]]]:
@@ -438,9 +442,8 @@ def _validate_snapshot(
         raise ValueError("MLESnapshot fit_diagnostics must be an object.")
     _validate_warm_start_mapping(snapshot["warm_start"])
 
-    replay = context
-    log = replay.log
-    batch = replay.batch
+    log = context.log
+    batch = context.batch
     cutoff_step = _nonnegative_integer(
         snapshot["data_cutoff_step"], name="data_cutoff_step"
     )
@@ -497,11 +500,11 @@ def _validate_snapshot(
         "measurement_run_id": log.context.run_id,
         "measurement_log_schema_version": log.context.schema_version,
         "forward_model_manifest_sha256": sha256(
-            (replay.run_dir / "forward_model_manifest.json").read_bytes()
+            (context.measurement_log_path / "forward_model_manifest.json").read_bytes()
         ).hexdigest(),
-        "config_sha256": replay.config_sha256,
+        "config_sha256": context.config_sha256,
         "resolved_config_sha256": log.context.runtime_config_sha256,
-        "resolved_estimator_config_sha256": replay.resolved_estimator_config_sha256,
+        "resolved_estimator_config_sha256": (context.resolved_estimator_config_sha256),
     }
     for name, expected in expected_current.items():
         if snapshot_provenance.get(name) != expected:
@@ -559,7 +562,7 @@ def score_future_count_candidates(
     snapshot: str | Path,
 ) -> dict[str, object]:
     """Score frozen snapshot clusters using only observations after cutoff."""
-    context = prepare_replay(run_dir, config=config)
+    context = prepare_estimator_context(run_dir, config=config)
     if context.config.mode != "count":
         raise ValueError("Future candidate scoring requires count MLE configuration.")
     if context.batch.isotope_counts is None:

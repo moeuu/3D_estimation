@@ -1320,9 +1320,6 @@ class SurfaceMLEEstimator:
                         **selection.to_dict(),
                         "grouping": self.config.cv_grouping,
                         "tuning_environment_id": (self.config.tuning_environment_id),
-                        "final_holdout_environment_id": (
-                            self.config.final_holdout_environment_id
-                        ),
                     },
                 },
             )

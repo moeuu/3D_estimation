@@ -10,17 +10,13 @@ MeasurementLog schema-2 records. This estimator imports that package's public re
 observation-model, continuous-kernel, asset-resolution, and log-reader APIs. It does
 not copy or synchronize runtime source.
 
-There are three estimator execution paths:
+There are two estimator execution paths:
 
 1. `OnlineMLESession` accepts each already-persisted runtime record. Production RA-L
    mode buffers all shield views at one point and performs one coarse all-history
    warm fit only when the durable station marker closes that measurement point.
    Finalization rebuilds the configured full-resolution grid and uncertainty result.
-2. `fit-spectrum` validates a complete immutable MeasurementLog, performs a cold
-   all-history fit, and publishes one authoritative final report. `online-replay`
-   drives the live station-update path from a finalized log for deterministic causal
-   testing.
-3. `OnlineMLESession.plan_next_action` and the `plan-next` CLI rank truth-free
+2. `OnlineMLESession.plan_next_action` and the `plan-next` CLI rank truth-free
    runtime candidate poses and Fe/Pb programs from a station-complete spectral MLE.
    They use local Fisher `D_s`-optimal design, explicit vertical/support ambiguity
    criteria, and the shared physical kernel.
@@ -49,7 +45,7 @@ The notation used below is:
 
 | Symbol | Meaning |
 | --- | --- |
-| `M` | finalized measurements |
+| `M` | durably staged measurements in the current causal prefix |
 | `B` | spectrum energy bins |
 | `G` | active surface patches |
 | `I` | isotope channels, in manifest/config order |
@@ -57,7 +53,8 @@ The notation used below is:
 | `E` | physical shared-edge graph edges |
 | `N` | fitted nuisance coefficients |
 
-Replay converts the measurement log into one validated `ObservationBatch`:
+The online backend and neutral prefix-scoring context convert runtime records into
+one validated `ObservationBatch`:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
@@ -71,8 +68,8 @@ Replay converts the measurement log into one validated `ObservationBatch`:
 | `isotope_covariances` | `M × I × I`, optional | preserved extraction covariance |
 
 All records must use exactly the same energy edges. Count and covariance fields must
-either be available consistently for all records or be absent. Count-domain replay
-requires `isotope_counts`; spectral replay uses `spectrum_counts`. Count mode supports
+either be available consistently for all records or be absent. Count-domain fitting
+requires `isotope_counts`; spectral live fitting uses `spectrum_counts`. Count mode supports
 the historical Poisson diagnostic and covariance-aware Gaussian or multivariate
 Student-t fitting. Covariance matrices are regularized, condition-checked, and used
 jointly across isotope channels. Spectral MLE remains the authoritative result because
@@ -121,7 +118,7 @@ Patches have stable IDs, optional parent IDs, and refinement levels. Solver adja
 
 ## Shared physical kernel
 
-Both replay modes and the online backend call the shared runtime's
+The online backend and neutral prefix-scoring/planning context call the shared runtime's
 `RuntimeObservationModel` and `ContinuousKernel`. Their response includes
 detector/source geometry, finite detector and aperture settings, selected Fe/Pb shield
 geometry and attenuation, obstacle path attenuation, optional buildup, and calibrated
@@ -270,10 +267,9 @@ Hotspot extraction thresholds each isotope relative to its own peak, forms conne
 
 `regularization_selection: grouped_cv` evaluates the configured L1/TV grid using
 whole station or same-XY-height groups. It selects the strongest regularization within
-one standard error of the minimum validation deviance when requested. Final holdout
-execution requires `regularization_selection: fixed`, distinct tuning/holdout run and
-environment IDs, a different environment manifest, and exclusion of the holdout
-environment from discrepancy calibration.
+one standard error of the minimum validation deviance when requested. Evaluation on
+an unseen environment is a separate post-estimation concern and is not an estimator
+command that refits a completed log.
 
 Final uncertainty is explicitly conditional on the selected support. The active
 response columns form a regularized Fisher/Laplace covariance; a hard parameter cap

@@ -43,7 +43,7 @@ For `M` records and `B` energy bins, `observations.npz` contains:
 
 Spectra are exact non-negative event counts. Schema v2 deliberately has no projected
 isotope counts, fitted spectrum variances, or isotope covariance arrays. Production
-MLE therefore uses `fit-spectrum` or the spectral online backend. The count-domain
+MLE therefore uses the spectral online backend. The count-domain
 solver remains available only for an explicitly derived/imported count contract; it
 must not project raw v2 spectra itself.
 
@@ -65,9 +65,7 @@ explicit station flag against the durable record metadata. Non-final station vie
 buffered without solving. At a station boundary the backend fits the complete prefix,
 using the prior station solution only as numerical initialization.
 
-`online-replay` validates a finalized log and checks that exactly the final record of
-every station carries the marker before driving the same update path. Each station
-report records:
+Each live station report records:
 
 - covered step IDs;
 - cutoff step and station;
@@ -93,9 +91,9 @@ semantics. The current native contract includes:
 - line-resolved isotope energies, weights, and Fe/Pb attenuation; and
 - obstacle path and live-time response semantics.
 
-Replay and the online backend reconstruct `RuntimeObservationModel` and
-`ContinuousKernel` from this validated runtime context. They do not maintain a second
-copy of detector, shield, obstacle, or spectrum physics.
+The online backend and neutral prefix-scoring/planning context reconstruct
+`RuntimeObservationModel` and `ContinuousKernel` from this validated runtime context.
+They do not maintain a second copy of detector, shield, obstacle, or spectrum physics.
 
 ## Source-rate semantics
 

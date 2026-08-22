@@ -49,18 +49,8 @@ online_mle.receive_persisted(
 )
 ```
 
-For deterministic validation of the same online update path against an already
-published runtime log:
-
-```bash
-uv run estimate-radiation-mle online-replay \
-  --run-dir /path/to/measurement-log \
-  --mle-config configs/mle/default_spectral.json \
-  --output-dir /path/to/mle-online \
-  --cpu --json
-```
-
-This command starts the live dashboard server by default and immediately prints a
+The live `ral-full-simulation` launcher starts the dashboard server by default and
+immediately prints a
 clickable `CUI split visualization URL: http://HOST:PORT/index.html` before the first station
 fit. If the requested port belongs to an older run, the launcher selects the next
 free port instead of displaying stale files. The page refreshes from atomically
@@ -127,8 +117,8 @@ for the criterion, candidate JSON contract, and limitations.
 
 ## RA-L full simulation
 
-The physical RA-L profile is owned by the shared runtime; this repository now has a
-strict launcher for runtime acquisition followed by spectral MLE replay. Verify the
+The physical RA-L profile is owned by the shared runtime; this repository provides a
+strict launcher for runtime acquisition under live spectral MLE control. Verify the
 complete Geant4/model/config chain without starting a long run:
 
 ```bash
@@ -153,9 +143,9 @@ For the Cs-137 x4, Co-60 x3, Eu-154 x0 absent-isotope case, generate runtime pro
 `ral-cs4-co3-eu0` and pass `--private-scene-profile ral-cs4-co3-eu0` when starting
 the live launcher.
 
-Use `--run-dir` instead of `--scenario` to replay an existing completed RA-L
-MeasurementLog. New acquisition uses `rotating-shield-sim run-adaptive-session`.
-The online coarse MLE fits once after the current shield program closes its station;
+The launcher accepts only a private live scenario and uses
+`rotating-shield-sim run-adaptive-session`. The online coarse MLE fits once after
+the current shield program closes its station;
 intermediate spectra are buffered without changing the estimate. It can then ask the
 runtime to refine promising 3-D candidate neighborhoods, rerank the returned
 reachable poses, and select the next position and eight-measurement Fe/Pb program.
@@ -172,37 +162,8 @@ low expected information gain must all pass. `--max-measurements` remains only a
 safety bound.
 
 See [RA-L full-simulation launcher](docs/mle/ral_full_simulation.md) for ownership,
-persistent `tmux` execution, existing-log replay, and the adaptive-controller boundary.
-
-## Final-log replay
-
-Fit one authoritative cold spectral MLE from a finalized raw log:
-
-```bash
-uv run estimate-radiation-mle fit-spectrum \
-  --run-dir /path/to/measurement-log \
-  --mle-config configs/mle/default_spectral.json \
-  --output-dir /path/to/mle-spectral \
-  --cpu --json
-```
-
-The `replay` command is retained only for an explicitly derived count observation
-contract. It does not derive isotope counts from raw MeasurementLog spectra.
-
-For a final unseen-environment evaluation after regularization and calibration have
-been frozen:
-
-```bash
-uv run estimate-radiation-mle ral-holdout \
-  --tuning-run-dir /path/to/independent-tuning-log \
-  --holdout-run-dir /path/to/new-geant4-log \
-  --mle-config configs/mle/ral_full_spectral.json \
-  --output-dir /path/to/final-holdout-report
-```
-
-This command fails closed if run IDs, environment realization IDs, or environment
-manifests are reused, if regularization is still being tuned, or if the final holdout
-was used to calibrate model discrepancy.
+persistent `tmux` execution, recovery of the same adaptive session, and the
+adaptive-controller boundary.
 
 ## Repository layout
 

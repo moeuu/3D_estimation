@@ -123,7 +123,7 @@ def estimator_provenance(
     config_sha256: str | None = None,
     resolved_estimator_config_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Return mandatory pure-MLE provenance with optional replay identities."""
+    """Return mandatory pure-MLE provenance with optional runtime identities."""
     normalized_variant = str(variant).strip().lower()
     if normalized_variant not in {"count", "spectral"}:
         raise ValueError("variant must be 'count' or 'spectral'.")

@@ -501,7 +501,7 @@ class SurfacePatchSet:
 
 @dataclass(frozen=True, slots=True)
 class ObservationBatch:
-    """Store all estimator-independent observations for a replay fit."""
+    """Store estimator-independent observations for an incremental update."""
 
     detector_positions_xyz: NDArray[np.float64]
     detector_quaternions_wxyz: NDArray[np.float64]

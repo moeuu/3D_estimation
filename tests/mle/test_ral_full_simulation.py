@@ -17,7 +17,6 @@ from three_d_estimation.cli import (
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.ral import (
     _runtime_config_errors,
-    _validated_mle_output_path,
     preflight_ral_full_simulation,
 )
 
@@ -109,20 +108,8 @@ def test_ral_runtime_contract_rejects_shortcuts() -> None:
     assert any("weighted_transport" in error for error in errors)
 
 
-def test_ral_mle_output_cannot_mutate_the_measurement_log(
-    tmp_path: Path,
-) -> None:
-    """MLE artifacts must stay outside the runtime's immutable log tree."""
-    run_dir = tmp_path / "measurement-log"
-
-    with pytest.raises(ValueError, match="outside the immutable"):
-        _validated_mle_output_path(run_dir / "mle", run_dir)
-
-    assert _validated_mle_output_path(tmp_path / "mle", run_dir) == (tmp_path / "mle")
-
-
-def test_ral_full_simulation_cli_supports_scenario_and_existing_log() -> None:
-    """One command should cover live closed-loop acquisition and replay."""
+def test_ral_full_simulation_cli_supports_only_live_acquisition() -> None:
+    """The RA-L launcher must expose only private live acquisition inputs."""
     parser = build_argument_parser()
     preflight = parser.parse_args(["ral-full-simulation", "--preflight-only", "--json"])
     adaptive = parser.parse_args(
@@ -140,30 +127,21 @@ def test_ral_full_simulation_cli_supports_scenario_and_existing_log() -> None:
             "/tmp/ral-mle",
         ]
     )
-    replay = parser.parse_args(
-        [
-            "ral-full-simulation",
-            "--run-dir",
-            "/runtime/measurement-log",
-            "--output-dir",
-            "/tmp/ral-mle",
-            "--final-only",
-        ]
-    )
-
     assert preflight.preflight_only is True
     assert adaptive.scenario == Path("/private/ral-scenario.json")
     assert adaptive.private_scene_profile == "ral-cs4-co3-eu0"
     assert adaptive.resume_stage == Path("/tmp/.measurement-log.stream-17")
-    assert adaptive.resume_compatibility == Path(
-        "/tmp/resume-compatibility.json"
-    )
+    assert adaptive.resume_compatibility == Path("/tmp/resume-compatibility.json")
     assert not hasattr(adaptive, "plan")
     assert adaptive.max_measurements == 256
     assert adaptive.minimum_information_gain_nats is None
     assert adaptive.low_information_patience is None
-    assert replay.run_dir == Path("/runtime/measurement-log")
-    assert replay.final_only is True
+    for removed_arguments in (
+        ("--run-dir", "/runtime/measurement-log"),
+        ("--final-only",),
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["ral-full-simulation", *removed_arguments])
 
 
 def test_mle_config_rejects_invalid_online_and_laplace_controls() -> None:

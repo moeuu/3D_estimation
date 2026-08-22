@@ -9,7 +9,6 @@
   "cv_one_standard_error": true,
   "cv_tv_weights": [0.0002, 0.0006, 0.002, 0.006],
   "debias_refit": false,
-  "final_holdout_environment_id": "ral-holdout-unseen",
   "fit_background_nuisance": true,
   "fit_scatter_nuisance": true,
   "gpu_device": "cuda",

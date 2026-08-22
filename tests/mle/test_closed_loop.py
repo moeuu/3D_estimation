@@ -757,7 +757,7 @@ def test_closed_loop_cui_remains_truth_free(
     assert all("truth" not in request for request in client.requests)
 
 
-def test_closed_loop_replays_resume_prefix_then_plans_next_station(
+def test_closed_loop_restores_resume_prefix_then_plans_next_station(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:

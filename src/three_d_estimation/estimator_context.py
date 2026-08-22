@@ -1,11 +1,10 @@
-"""Standalone orchestration for replaying versioned measurement logs."""
+"""Validated runtime context for MLE prefix planning and scoring."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from hashlib import sha256
-from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +19,8 @@ from runtime.measurement_log import MeasurementLog, load_measurement_log
 from runtime.records import canonical_json_bytes, canonical_json_sha256
 
 from .config import MLEConfig
-from .estimator import SurfaceMLEEstimator
-from runtime.prefix import (
-    covered_station_boundaries_sha256,
-)
-from .lineage import covered_records_lineage, validate_covered_records_lineage
+from .lineage import validate_covered_records_lineage
 from .observation_batch import observation_batch_from_log
-from .provenance import estimator_provenance
 from .reporting import (
     DIAGNOSTICS_FILENAME,
     ESTIMATE_FILENAME,
@@ -37,14 +31,11 @@ from .reporting import (
 from .types import MLEEstimate, ObservationBatch
 
 
-ReplaySaveHook = Callable[[MLEEstimate, Path], object]
+@dataclass(frozen=True, slots=True)
+class EstimatorContext:
+    """Hold validated objects needed to score one current measurement prefix."""
 
-
-@dataclass(frozen=True)
-class ReplayContext:
-    """All validated local objects required for one all-history replay fit."""
-
-    run_dir: Path
+    measurement_log_path: Path
     log: MeasurementLog
     batch: ObservationBatch
     config: MLEConfig
@@ -58,18 +49,9 @@ class ReplayContext:
     resolved_estimator_config_sha256: str
 
 
-@dataclass(frozen=True)
-class ReplayResult:
-    """Return a fitted estimate together with its fully resolved replay context."""
-
-    estimate: MLEEstimate
-    context: ReplayContext
-    saved_output: object | None = None
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WarmStartArtifact:
-    """Validated warm-start estimate and immutable artifact lineage."""
+    """Hold a validated prior estimate and its immutable causal lineage."""
 
     estimate: MLEEstimate
     report_sha256: str
@@ -83,7 +65,7 @@ def _resolve_mle_config(
     config: MLEConfig | Mapping[str, Any] | str | Path | None,
     batch: ObservationBatch,
 ) -> MLEConfig:
-    """Resolve a public MLEConfig and enforce logged isotope ordering."""
+    """Resolve an MLE config and enforce the measurement isotope ordering."""
     if config is None:
         mode = "count" if batch.isotope_counts is not None else "spectral"
         resolved = MLEConfig(mode=mode, isotope_names=batch.isotope_names)
@@ -105,15 +87,15 @@ def _resolve_mle_config(
     return resolved
 
 
-def prepare_replay(
-    run_dir: str | Path,
+def prepare_estimator_context(
+    measurement_log_path: str | Path,
     *,
     config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
     config_source_sha256: str | None = None,
-) -> ReplayContext:
-    """Load a measurement log and resolve shared runtime forward physics."""
-    resolved_run_dir = Path(run_dir).resolve()
-    log = load_measurement_log(resolved_run_dir)
+) -> EstimatorContext:
+    """Resolve runtime physics and MLE identities for one measurement prefix."""
+    resolved_log_path = Path(measurement_log_path).resolve()
+    log = load_measurement_log(resolved_log_path)
     batch = observation_batch_from_log(log)
     mle_config = _resolve_mle_config(config, batch)
     if config_source_sha256 is not None:
@@ -133,8 +115,8 @@ def prepare_replay(
         gpu_device=str(mle_config.gpu_device),
         gpu_dtype=str(mle_config.gpu_dtype),
     )
-    return ReplayContext(
-        run_dir=resolved_run_dir,
+    return EstimatorContext(
+        measurement_log_path=resolved_log_path,
         log=log,
         batch=batch,
         config=mle_config,
@@ -147,21 +129,6 @@ def prepare_replay(
         config_sha256=config_sha256,
         resolved_estimator_config_sha256=resolved_estimator_config_sha256,
     )
-
-
-def _available_reporting_hook() -> ReplaySaveHook | None:
-    """Return an optional reporting hook without requiring a reporting module."""
-    try:
-        module = import_module("three_d_estimation.reporting")
-    except ModuleNotFoundError as exc:
-        if exc.name != "three_d_estimation.reporting":
-            raise
-        return None
-    for name in ("save_estimate", "save_mle_estimate"):
-        candidate = getattr(module, name, None)
-        if callable(candidate):
-            return candidate
-    return None
 
 
 def _report_directory(path: str | Path) -> Path:
@@ -180,56 +147,11 @@ def _lineage_integer(value: object, *, name: str) -> int:
     return result
 
 
-def _prefix_attestation(log: MeasurementLog) -> str:
-    """Return and validate an optional materialized-prefix attestation."""
-    raw = log.context.metadata.get("measurement_log_prefix")
-    if raw is None:
-        return "finalized_measurement_log"
-    if not isinstance(raw, Mapping):
-        raise ValueError("measurement_log_prefix metadata must be an object.")
-    final = log.records[-1]
-    expected = {
-        "schema_version": 1,
-        "source_run_id": log.context.run_id,
-        "data_cutoff_step": final.step_id,
-        "data_cutoff_station": final.station_id,
-    }
-    for name, value in expected.items():
-        if raw.get(name) != value:
-            raise ValueError(
-                f"measurement_log_prefix metadata {name} does not match the log."
-            )
-    validate_covered_records_lineage(
-        raw,
-        log.records,
-        location="measurement_log_prefix",
-    )
-    attestation = raw.get("station_boundary_attestation")
-    if attestation not in {
-        "writer_metadata",
-        "external_validated_schedule",
-        "covered_prefix_markers_v1",
-    }:
-        raise ValueError(
-            "measurement_log_prefix has an unsupported station boundary attestation."
-        )
-    if attestation == "covered_prefix_markers_v1":
-        expected_boundary_hash = covered_station_boundaries_sha256(
-            log.records,
-            source_run_id=log.context.run_id,
-        )
-        if raw.get("covered_station_boundaries_sha256") != expected_boundary_hash:
-            raise ValueError(
-                "measurement_log_prefix covered station-boundary hash is invalid."
-            )
-    return str(attestation)
-
-
 def _warm_start_lineage(
-    context: ReplayContext,
+    context: EstimatorContext,
     estimate: MLEEstimate,
 ) -> dict[str, object]:
-    """Validate causal prefix ancestry and return normalized warm lineage."""
+    """Validate causal prefix ancestry and return normalized prior lineage."""
     raw = estimate.diagnostics.get("causal_lineage")
     if not isinstance(raw, Mapping):
         raise ValueError("Warm-start report lacks causal_lineage diagnostics.")
@@ -256,16 +178,16 @@ def _warm_start_lineage(
         raise ValueError("Warm-start cutoff and record_count lineage are inconsistent.")
     if record_count >= len(context.log.records):
         raise ValueError(
-            "Warm-start input must be a strict causal prefix of the replay log."
+            "Warm-start input must be a strict causal prefix of current data."
         )
     current_prefix = context.log.records[:record_count]
     current_steps = tuple(record.step_id for record in current_prefix)
     if current_steps != covered_steps:
         raise ValueError(
-            "Warm-start covered_step_ids are not an exact replay-log prefix."
+            "Warm-start covered_step_ids are not an exact current-log prefix."
         )
     if current_prefix[-1].station_id != cutoff_station:
-        raise ValueError("Warm-start cutoff station does not match the replay log.")
+        raise ValueError("Warm-start cutoff station does not match current data.")
     if context.log.records[record_count].station_id == cutoff_station:
         raise ValueError("Warm-start cutoff is not a station-complete prefix.")
     expected_records_digest = validate_covered_records_lineage(
@@ -298,10 +220,10 @@ def _warm_start_lineage(
 
 
 def validate_warm_start_artifact(
-    context: ReplayContext,
+    context: EstimatorContext,
     initial_estimate_path: str | Path,
 ) -> WarmStartArtifact:
-    """Load an artifact warm start and fail closed on every identity boundary."""
+    """Load a prior estimate and fail closed on every identity boundary."""
     directory = _report_directory(initial_estimate_path)
     estimate = load_mle_estimate(directory)
     diagnostics = estimate.diagnostics
@@ -325,9 +247,11 @@ def validate_warm_start_artifact(
         diagnostics.get("mode") != context.config.mode
         or provenance.get("estimator_variant") != context.config.mode
     ):
-        raise ValueError("Warm-start estimator mode is incompatible with this fit.")
+        raise ValueError("Warm-start estimator mode is incompatible with this context.")
     if tuple(estimate.isotope_names) != tuple(context.batch.isotope_names):
-        raise ValueError("Warm-start isotope ordering is incompatible with this fit.")
+        raise ValueError(
+            "Warm-start isotope ordering is incompatible with this context."
+        )
     stored_config = load_mle_config_payload(directory)
     if stored_config is None:
         raise ValueError("Warm-start report lacks a resolved MLE configuration.")
@@ -335,7 +259,7 @@ def validate_warm_start_artifact(
     if stored_config_digest != context.resolved_estimator_config_sha256:
         raise ValueError("Warm-start resolved MLE configuration is incompatible.")
     forward_digest = sha256(
-        (context.run_dir / "forward_model_manifest.json").read_bytes()
+        (context.measurement_log_path / "forward_model_manifest.json").read_bytes()
     ).hexdigest()
     expected_identities = {
         "measurement_log_schema_version": context.log.context.schema_version,
@@ -343,7 +267,7 @@ def validate_warm_start_artifact(
         "measurement_repository_commit": context.log.context.repository_commit,
         "resolved_config_sha256": context.log.context.runtime_config_sha256,
         "forward_model_manifest_sha256": forward_digest,
-        "resolved_estimator_config_sha256": (context.resolved_estimator_config_sha256),
+        "resolved_estimator_config_sha256": context.resolved_estimator_config_sha256,
     }
     for name, expected in expected_identities.items():
         if provenance.get(name) != expected:
@@ -367,129 +291,9 @@ def validate_warm_start_artifact(
     )
 
 
-def _causal_lineage(
-    context: ReplayContext,
-    warm_start: WarmStartArtifact | None,
-) -> dict[str, object]:
-    """Build deterministic all-history fit lineage for one replay result."""
-    records = context.log.records
-    records_lineage = covered_records_lineage(records)
-    lineage: dict[str, object] = {
-        "schema_version": 2,
-        "covered_step_ids": [record.step_id for record in records],
-        "data_cutoff_step": records[-1].step_id,
-        "data_cutoff_station": records[-1].station_id,
-        "record_count": len(records),
-        **records_lineage,
-        "station_boundary_attestation": _prefix_attestation(context.log),
-        "fit_kind": (
-            "cold_start_all_history" if warm_start is None else "warm_start_all_history"
-        ),
-        "warm_start": None,
-    }
-    if warm_start is not None:
-        prior = warm_start.causal_lineage
-        lineage["warm_start"] = {
-            "report_sha256": warm_start.report_sha256,
-            "estimate_sha256": warm_start.estimate_sha256,
-            "diagnostics_sha256": warm_start.diagnostics_sha256,
-            "data_cutoff_step": prior["data_cutoff_step"],
-            "data_cutoff_station": prior["data_cutoff_station"],
-            "record_count": prior["record_count"],
-            "covered_records_digest": prior["covered_records_digest"],
-            "covered_records_sha256": prior["covered_records_sha256"],
-            "measurement_log_sha256": warm_start.measurement_log_sha256,
-        }
-    return lineage
-
-
-def run_replay(
-    run_dir: str | Path,
-    *,
-    config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
-    output_dir: str | Path | None = None,
-    save_hook: ReplaySaveHook | None = None,
-    config_source_sha256: str | None = None,
-    initial_estimate_path: str | Path | None = None,
-) -> ReplayResult:
-    """Prepare, fit, and optionally persist one standalone replay result.
-
-    ``initial_estimate_path`` is used only to initialize the optimizer after
-    exact causal-lineage and model compatibility checks. The objective is
-    always recomputed over the complete current MeasurementLog.
-    """
-    context = prepare_replay(
-        run_dir,
-        config=config,
-        config_source_sha256=config_source_sha256,
-    )
-    _prefix_attestation(context.log)
-    warm_start = (
-        None
-        if initial_estimate_path is None
-        else validate_warm_start_artifact(context, initial_estimate_path)
-    )
-    estimate = SurfaceMLEEstimator(context.config).fit(
-        context.batch,
-        context.environment,
-        context.kernel,
-        obstacle_grid=context.obstacle_grid,
-        initial_estimate=None if warm_start is None else warm_start.estimate,
-    )
-    if isinstance(estimate, MLEEstimate):
-        measurement_log_digest = context.log.content_sha256
-        if measurement_log_digest is None:
-            raise ValueError("Loaded MeasurementLog is missing its content SHA-256.")
-        forward_model_manifest_sha256 = sha256(
-            (context.run_dir / "forward_model_manifest.json").read_bytes()
-        ).hexdigest()
-        provenance = estimator_provenance(
-            variant=context.config.mode,
-            measurement_log_schema_version=context.log.context.schema_version,
-            measurement_run_id=context.log.context.run_id,
-            measurement_repository_commit=context.log.context.repository_commit,
-            resolved_config_sha256=context.log.context.runtime_config_sha256,
-            forward_model_manifest_sha256=forward_model_manifest_sha256,
-            measurement_log_sha256=measurement_log_digest,
-            config_sha256=context.config_sha256,
-            resolved_estimator_config_sha256=(context.resolved_estimator_config_sha256),
-        )
-        lineage = _causal_lineage(context, warm_start)
-        provenance["causal_lineage"] = lineage
-        estimate = replace(
-            estimate,
-            diagnostics={
-                **estimate.diagnostics,
-                "provenance": provenance,
-                "causal_lineage": lineage,
-                "estimator_family": provenance["estimator_family"],
-                "estimator_variant": provenance["estimator_variant"],
-                "candidate_domain": provenance["candidate_domain"],
-                "uses_pf_state": provenance["uses_pf_state"],
-                "uses_pf_candidates": provenance["uses_pf_candidates"],
-                "measurement_run_id": context.log.context.run_id,
-                "measurement_log_schema_version": context.log.context.schema_version,
-            },
-        )
-    saved_output = None
-    if output_dir is not None:
-        hook = save_hook if save_hook is not None else _available_reporting_hook()
-        if hook is not None:
-            saved_output = hook(estimate, Path(output_dir))
-    elif save_hook is not None:
-        raise ValueError("output_dir is required when save_hook is provided.")
-    return ReplayResult(
-        estimate=estimate,
-        context=context,
-        saved_output=saved_output,
-    )
-
-
 __all__ = [
-    "ReplayContext",
-    "ReplayResult",
+    "EstimatorContext",
     "WarmStartArtifact",
-    "prepare_replay",
-    "run_replay",
+    "prepare_estimator_context",
     "validate_warm_start_artifact",
 ]

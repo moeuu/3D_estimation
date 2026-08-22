@@ -211,7 +211,7 @@ class EstimatorResult:
 
 @runtime_checkable
 class EstimatorBackend(Protocol):
-    """Minimum estimator contract used by acquisition and replay sessions."""
+    """Minimum estimator contract used by acquisition and prefix-scoring sessions."""
 
     def initialize(self, context: RunContext) -> None:
         """Initialize the estimator for one run."""

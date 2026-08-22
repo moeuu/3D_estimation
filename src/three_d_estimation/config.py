@@ -31,7 +31,6 @@ class MLEConfig:
     cv_grouping: Literal["station_id", "same_xy_height"] = "station_id"
     cv_one_standard_error: bool = True
     tuning_environment_id: str | None = None
-    final_holdout_environment_id: str | None = None
     uncertainty_enable: bool = False
     laplace_support_threshold_fraction: float = 1.0e-3
     laplace_max_active_parameters: int = 256
@@ -146,17 +145,6 @@ class MLEConfig:
             or not self.tuning_environment_id.strip()
         ):
             raise ValueError("tuning_environment_id must be null or nonempty.")
-        if self.final_holdout_environment_id is not None and (
-            not isinstance(self.final_holdout_environment_id, str)
-            or not self.final_holdout_environment_id.strip()
-        ):
-            raise ValueError("final_holdout_environment_id must be null or nonempty.")
-        if (
-            self.tuning_environment_id is not None
-            and self.final_holdout_environment_id is not None
-            and self.tuning_environment_id == self.final_holdout_environment_id
-        ):
-            raise ValueError("Tuning and final holdout environments must differ.")
         if (
             not np.isfinite(self.count_student_t_degrees_of_freedom)
             or float(self.count_student_t_degrees_of_freedom) <= 2.0

@@ -515,25 +515,11 @@ def test_online_dashboard_uses_runtime_resolved_file_obstacle_scene(
     )
 
 
-def test_online_cli_serves_dashboard_by_default() -> None:
-    """The PF-style online command must expose explicit URL controls."""
-    args = build_argument_parser().parse_args(
-        ["online-replay", "--run-dir", "/tmp/runtime-log"]
-    )
-
-    assert args.no_dashboard is False
-    assert args.no_serve is False
-    assert args.dashboard_host == "0.0.0.0"
-    assert args.dashboard_port == 8877
-    assert args.dashboard_public_host is None
-
+@pytest.mark.parametrize(
+    "command",
+    ("replay", "fit-spectrum", "online-replay", "online", "ral-holdout"),
+)
+def test_finalized_log_fit_commands_are_not_cli_surfaces(command: str) -> None:
+    """Offline full-log fitting commands must not return to the public CLI."""
     with pytest.raises(SystemExit):
-        build_argument_parser().parse_args(
-            [
-                "ral-full-simulation",
-                "--run-dir",
-                "/tmp/runtime-log",
-                "--cui-truth-display-mode",
-                "hidden",
-            ]
-        )
+        build_argument_parser().parse_args([command])

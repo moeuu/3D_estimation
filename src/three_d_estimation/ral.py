@@ -1,26 +1,19 @@
-"""Strict RA-L full-simulation launch and replay integration."""
+"""Strict RA-L live-acquisition preflight and publication validation."""
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
-from runtime.defaults import (
-    DEFAULT_CUI_SPLIT_VIEW_HOST,
-    DEFAULT_CUI_SPLIT_VIEW_PORT,
-)
 from runtime.measurement_log import MeasurementLog, load_measurement_log
 from sim.runtime import load_runtime_config
 
 from .config import MLEConfig
 from .information_planner import MLEPlanningConfig
-from .online import run_online_replay
-from .replay import run_replay
-from .reporting import save_mle_estimate
 
 RAL_ISOTOPES = ("Co-60", "Cs-137", "Eu-154")
 
@@ -72,32 +65,6 @@ class RALPreflightResult:
                 "fit_scope": "station_complete",
                 "stop_policy": "compound_mle_convergence_with_safety_bound",
             },
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RALFullSimulationResult:
-    """Identify one validated RA-L log and its completed MLE report."""
-
-    measurement_log_path: Path
-    mle_output_dir: Path
-    run_id: str
-    record_count: int
-    execution_mode: str
-    dashboard_url: str | None
-
-    def to_dict(self) -> dict[str, object]:
-        """Return strict JSON pipeline result data."""
-        return {
-            "schema_version": 1,
-            "status": "complete",
-            "profile": "ral_mix9_surface_mle_v1",
-            "measurement_log_path": self.measurement_log_path.as_posix(),
-            "mle_output_dir": self.mle_output_dir.as_posix(),
-            "run_id": self.run_id,
-            "record_count": self.record_count,
-            "execution_mode": self.execution_mode,
-            "dashboard_url": self.dashboard_url,
         }
 
 
@@ -300,77 +267,8 @@ def validate_ral_measurement_log(run_dir: str | Path) -> MeasurementLog:
     return log
 
 
-def _validated_mle_output_path(
-    output_dir: str | Path,
-    measurement_log_path: str | Path,
-) -> Path:
-    """Resolve an MLE target and keep it outside the immutable runtime log."""
-    target = Path(output_dir).expanduser().resolve()
-    log_path = Path(measurement_log_path).expanduser().resolve()
-    if target == log_path or log_path in target.parents:
-        raise ValueError(
-            "MLE output must be outside the immutable MeasurementLog directory."
-        )
-    return target
-
-
-def run_ral_full_simulation(
-    run_dir: str | Path,
-    *,
-    mle_config_path: str | Path,
-    output_dir: str | Path,
-    overwrite: bool = False,
-    final_only: bool = False,
-    enable_dashboard: bool = True,
-    serve_dashboard: bool = True,
-    dashboard_host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
-    dashboard_port: int = DEFAULT_CUI_SPLIT_VIEW_PORT,
-    dashboard_public_host: str | None = None,
-    dashboard_url_hook: Callable[[str], None] | None = None,
-) -> RALFullSimulationResult:
-    """Validate a runtime RA-L log and execute its authoritative MLE replay."""
-    log = validate_ral_measurement_log(run_dir)
-    target = _validated_mle_output_path(output_dir, log.path)
-    config_path = Path(mle_config_path).expanduser().resolve()
-    if final_only:
-        replay = run_replay(log.path, config=config_path)
-        save_mle_estimate(
-            target,
-            replay.estimate,
-            config=replay.context.config,
-            overwrite=overwrite,
-        )
-        execution_mode = "final_cold_spectral_mle"
-        dashboard_url = None
-    else:
-        replay = run_online_replay(
-            log.path,
-            config=config_path,
-            output_dir=target,
-            overwrite=overwrite,
-            enable_dashboard=enable_dashboard,
-            serve_dashboard=serve_dashboard,
-            dashboard_host=dashboard_host,
-            dashboard_port=dashboard_port,
-            dashboard_public_host=dashboard_public_host,
-            dashboard_url_hook=dashboard_url_hook,
-        )
-        execution_mode = "online_station_complete_spectral_mle"
-        dashboard_url = replay.dashboard_url
-    return RALFullSimulationResult(
-        measurement_log_path=log.path.resolve(),
-        mle_output_dir=target,
-        run_id=log.run_id,
-        record_count=len(log.records),
-        execution_mode=execution_mode,
-        dashboard_url=dashboard_url,
-    )
-
-
 __all__ = [
-    "RALFullSimulationResult",
     "RALPreflightResult",
     "preflight_ral_full_simulation",
-    "run_ral_full_simulation",
     "validate_ral_measurement_log",
 ]

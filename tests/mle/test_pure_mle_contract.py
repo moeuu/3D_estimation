@@ -21,7 +21,7 @@ from three_d_estimation.estimator import (
     _union_group_labels,
 )
 from three_d_estimation.observation_batch import observation_batch_from_log
-from three_d_estimation.replay import prepare_replay, run_replay
+from three_d_estimation.estimator_context import prepare_estimator_context
 from three_d_estimation.types import ObservationBatch
 
 
@@ -150,55 +150,6 @@ def test_shared_fixture_preserves_pose_timing_and_shield_blocks() -> None:
     )
 
 
-def test_spectral_replay_uses_full_dictionary_and_provenance() -> None:
-    """Raw MeasurementLog data drives spectral MLE over every surface patch."""
-    estimates = {
-        "spectral": run_replay(
-            FIXTURE,
-            config=_fixture_config("spectral"),
-        ).estimate
-    }
-    for mode, estimate in estimates.items():
-        diagnostics = estimate.diagnostics
-        assert diagnostics["full_surface_dictionary_used"] is True
-        assert diagnostics["candidate_domain"] == "complete_surface_dictionary"
-        patch_count = diagnostics["base_surface_dictionary_patch_count"]
-        assert isinstance(patch_count, int) and patch_count == 6
-        assert diagnostics["base_surface_dictionary_patch_ids"] == list(
-            range(patch_count)
-        )
-        assert len(estimate.patches) == patch_count
-        surface_kinds = {patch.surface_kind for patch in estimate.patches}
-        assert surface_kinds == {"floor", "ceiling", "wall"}
-        provenance = diagnostics["provenance"]
-        assert provenance["estimator_family"] == "surface_mle"
-        assert provenance["estimator_variant"] == mode
-        assert provenance["uses_pf_state"] is False
-        assert provenance["uses_pf_candidates"] is False
-        for name in (
-            "estimator_commit",
-            "measurement_log_sha256",
-            "config_sha256",
-            "resolved_estimator_config_sha256",
-            "forward_model_manifest_sha256",
-        ):
-            assert isinstance(provenance[name], str) and provenance[name]
-        assert provenance["measurement_log_sha256"] == measurement_log_sha256(FIXTURE)
-
-
-def test_same_log_replay_is_numerically_and_diagnostically_deterministic() -> None:
-    """The same bytes, configuration, and seed produce identical MLE output."""
-    first = run_replay(FIXTURE, config=_fixture_config("spectral")).estimate
-    second = run_replay(FIXTURE, config=_fixture_config("spectral")).estimate
-    np.testing.assert_array_equal(first.density_by_isotope, second.density_by_isotope)
-    np.testing.assert_array_equal(
-        first.patch_strength_by_isotope,
-        second.patch_strength_by_isotope,
-    )
-    assert first.objective_value == second.objective_value
-    assert first.diagnostics == second.diagnostics
-
-
 def test_raw_and_resolved_estimator_config_hashes_have_distinct_semantics(
     tmp_path: Path,
 ) -> None:
@@ -209,7 +160,7 @@ def test_raw_and_resolved_estimator_config_hashes_have_distinct_semantics(
         + "\n\n",
         encoding="utf-8",
     )
-    context = prepare_replay(FIXTURE, config=config_path)
+    context = prepare_estimator_context(FIXTURE, config=config_path)
     assert context.config_sha256 == sha256(config_path.read_bytes()).hexdigest()
     assert (
         context.resolved_estimator_config_sha256
@@ -254,7 +205,7 @@ def test_measurement_log_digest_covers_full_raw_inventory_and_rejects_truth(
 def test_forward_model_manifest_hash_or_identifier_mismatch_fails_clearly(
     tmp_path: Path,
 ) -> None:
-    """Replay refuses a self-consistent file inventory with changed model physics."""
+    """The runtime loader refuses an inventory with changed model physics."""
     corrupted = tmp_path / "measurement_log"
     shutil.copytree(FIXTURE, corrupted)
     forward_path = corrupted / "forward_model_manifest.json"

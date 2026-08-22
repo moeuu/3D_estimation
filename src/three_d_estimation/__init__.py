@@ -11,6 +11,12 @@ from .conformance import (
 from .dashboard import OnlineMLEDashboard, ensure_dashboard_server
 from .estimator import SurfaceMLEEstimator, fit_surface_mle
 from .estimator_backend import SurfaceMLEBackend
+from .estimator_context import (
+    EstimatorContext,
+    WarmStartArtifact,
+    prepare_estimator_context,
+    validate_warm_start_artifact,
+)
 from .future_scoring import (
     covered_station_boundaries_sha256,
     save_future_candidate_scores,
@@ -33,22 +39,11 @@ from .online import (
     OnlineMLERunResult,
     OnlineMLESession,
     OnlineStationReport,
-    run_online_replay,
 )
 from .ral import (
-    RALFullSimulationResult,
     RALPreflightResult,
     preflight_ral_full_simulation,
-    run_ral_full_simulation,
     validate_ral_measurement_log,
-)
-from .replay import (
-    ReplayContext,
-    ReplayResult,
-    WarmStartArtifact,
-    prepare_replay,
-    run_replay,
-    validate_warm_start_artifact,
 )
 from .reporting import (
     MLEReportPaths,
@@ -85,6 +80,7 @@ from .types import (
 __all__ = [
     "PLANNING_METHOD",
     "CountResponseMatrices",
+    "EstimatorContext",
     "ForwardConformanceResult",
     "MLEConfig",
     "MLEEstimate",
@@ -98,10 +94,7 @@ __all__ = [
     "OnlineMLESession",
     "OnlineStationReport",
     "RALClosedLoopResult",
-    "RALFullSimulationResult",
     "RALPreflightResult",
-    "ReplayContext",
-    "ReplayResult",
     "SpectralResponseResult",
     "SurfaceMLEBackend",
     "SurfaceMLEEstimator",
@@ -131,12 +124,9 @@ __all__ = [
     "observation_batch_from_records",
     "plan_next_measurement",
     "preflight_ral_full_simulation",
-    "prepare_replay",
+    "prepare_estimator_context",
     "refine_surface_patches",
-    "run_online_replay",
     "run_ral_closed_loop",
-    "run_ral_full_simulation",
-    "run_replay",
     "save_forward_conformance",
     "save_future_candidate_scores",
     "save_mle_estimate",

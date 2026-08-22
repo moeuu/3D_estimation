@@ -29,7 +29,7 @@ from spectrum.response_matrix import (
 )
 import three_d_estimation.spectral_response_builder as spectral_builder
 from three_d_estimation.config import MLEConfig
-from three_d_estimation.replay import prepare_replay
+from three_d_estimation.estimator_context import prepare_estimator_context
 from three_d_estimation.spectral_response_builder import (
     build_spectral_nuisance_response,
     build_spectral_response,
@@ -1023,7 +1023,7 @@ def test_real_runtime_kernel_is_spawn_safe_and_bitwise_exact() -> None:
         / "shared_measurement_log"
         / "measurement_log"
     )
-    replay = prepare_replay(
+    context = prepare_estimator_context(
         fixture,
         config=MLEConfig(
             mode="spectral",
@@ -1035,16 +1035,16 @@ def test_real_runtime_kernel_is_spawn_safe_and_bitwise_exact() -> None:
         ),
     )
     assert (
-        type(replay.kernel.additive_scatter_response)
+        type(context.kernel.additive_scatter_response)
         is AdditiveNoncollidedTransportResponse
     )
-    kernel = replace(replay.kernel, gpu_dtype="float64")
+    kernel = replace(context.kernel, gpu_dtype="float64")
     observations = _observations(
-        replay.batch.detector_positions_xyz[:1],
-        replay.batch.energy_bin_edges_keV,
-        live_times_s=replay.batch.live_times_s[:1],
-        fe_indices=replay.batch.fe_indices[:1],
-        pb_indices=replay.batch.pb_indices[:1],
+        context.batch.detector_positions_xyz[:1],
+        context.batch.energy_bin_edges_keV,
+        live_times_s=context.batch.live_times_s[:1],
+        fe_indices=context.batch.fe_indices[:1],
+        pb_indices=context.batch.pb_indices[:1],
     )
     patches = _patches(
         np.asarray(

@@ -1,4 +1,4 @@
-"""Command-line interface for standalone surface MLE replay and reporting."""
+"""Command-line interface for live surface MLE control and reporting."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
-from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +15,6 @@ from runtime.defaults import (
     DEFAULT_CUI_SPLIT_VIEW_HOST,
     DEFAULT_CUI_SPLIT_VIEW_PORT,
 )
-from runtime.measurement_log import load_measurement_log
 
 from .closed_loop import (
     MLEStopConfig,
@@ -25,24 +23,19 @@ from .closed_loop import (
 )
 from .config import MLEConfig
 from .conformance import compute_forward_conformance, save_forward_conformance
+from .estimator_context import prepare_estimator_context
 from .future_scoring import (
     save_future_candidate_scores,
     score_future_count_candidates,
 )
-from .holdout import run_ral_holdout
 from .information_planner import (
     MLEPlanningConfig,
     plan_next_measurement,
     save_mle_planning_result,
 )
 from .observation_batch import subset_observation_batch
-from .online import run_online_replay
-from .ral import (
-    preflight_ral_full_simulation,
-    run_ral_full_simulation,
-)
-from .replay import prepare_replay, run_replay
-from .reporting import load_mle_estimate, save_mle_estimate
+from .ral import preflight_ral_full_simulation
+from .reporting import load_mle_estimate
 
 ROOT = Path(__file__).resolve().parents[2]
 RAL_MLE_CONFIG = ROOT / "configs" / "mle" / "ral_full_spectral.json"
@@ -56,144 +49,13 @@ def _print_cui_dashboard_url(url: str, *, json_output: bool) -> None:
     print(f"{CUI_URL_MESSAGE_PREFIX} {url}", file=stream, flush=True)
 
 
-def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add arguments shared by count and spectral replay commands."""
-    parser.add_argument(
-        "--run-dir",
-        type=Path,
-        required=True,
-        help="Versioned measurement-log directory.",
-    )
-    parser.add_argument(
-        "--mle-config", type=Path, default=None, help="MLE JSON configuration file."
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Result directory (default: RUN_DIR/mle_count or mle_spectral).",
-    )
-    parser.add_argument(
-        "--overwrite", action="store_true", help="Replace an existing result directory."
-    )
-    device = parser.add_mutually_exclusive_group()
-    device.add_argument(
-        "--gpu", action="store_true", help="Use the local CUDA kernel when available."
-    )
-    device.add_argument(
-        "--cpu", action="store_true", help="Force CPU response construction."
-    )
-    parser.add_argument(
-        "--no-debias",
-        action="store_true",
-        help="Disable the support-selected unregularized refit.",
-    )
-    parser.add_argument(
-        "--json", action="store_true", help="Print the fit summary as JSON."
-    )
-    parser.add_argument(
-        "--initial-estimate",
-        type=Path,
-        default=None,
-        help="Prior station-complete MLE report used only as a warm initialization.",
-    )
-
-
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Build the top-level replay/report command parser."""
+    """Build the top-level live-control and report command parser."""
     parser = argparse.ArgumentParser(
         prog="estimate-radiation-mle",
         description="Standalone rotating-shield surface maximum-likelihood estimation.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    replay_parser = subparsers.add_parser(
-        "replay",
-        help="Fit count-domain MLE from response_poisson isotope counts.",
-    )
-    _add_fit_arguments(replay_parser)
-    spectral_parser = subparsers.add_parser(
-        "fit-spectrum",
-        help="Fit line-resolved MLE directly from raw spectra.",
-    )
-    _add_fit_arguments(spectral_parser)
-    online_parser = subparsers.add_parser(
-        "online-replay",
-        aliases=["online"],
-        help=(
-            "Causally replay a runtime log and publish an all-history MLE "
-            "at every station boundary."
-        ),
-    )
-    online_parser.add_argument(
-        "--run-dir",
-        type=Path,
-        required=True,
-        help="Finalized shared-runtime MeasurementLog directory.",
-    )
-    online_parser.add_argument(
-        "--mle-config",
-        type=Path,
-        default=None,
-        help="Spectral MLE JSON configuration file.",
-    )
-    online_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Online report directory (default: RUN_DIR/mle_online).",
-    )
-    online_parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace an existing online report directory.",
-    )
-    online_device = online_parser.add_mutually_exclusive_group()
-    online_device.add_argument(
-        "--gpu",
-        action="store_true",
-        help="Use the shared runtime CUDA kernel when available.",
-    )
-    online_device.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force CPU response construction.",
-    )
-    online_parser.add_argument(
-        "--no-debias",
-        action="store_true",
-        help="Disable the support-selected unregularized refit.",
-    )
-    online_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the final online summary as JSON.",
-    )
-    online_parser.add_argument(
-        "--no-dashboard",
-        action="store_true",
-        help="Do not write the self-refreshing browser dashboard.",
-    )
-    online_parser.add_argument(
-        "--no-serve",
-        action="store_true",
-        help="Write dashboard files without starting the URL server.",
-    )
-    online_parser.add_argument(
-        "--dashboard-host",
-        default=DEFAULT_CUI_SPLIT_VIEW_HOST,
-        help=f"Dashboard server bind host (default: {DEFAULT_CUI_SPLIT_VIEW_HOST}).",
-    )
-    online_parser.add_argument(
-        "--dashboard-port",
-        type=int,
-        default=DEFAULT_CUI_SPLIT_VIEW_PORT,
-        help=f"Dashboard server TCP port (default: {DEFAULT_CUI_SPLIT_VIEW_PORT}).",
-    )
-    online_parser.add_argument(
-        "--dashboard-public-host",
-        default=None,
-        help="Browser-visible host printed in the dashboard URL.",
-    )
     ral_parser = subparsers.add_parser(
         "ral-full-simulation",
         help=(
@@ -201,8 +63,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "runtime session."
         ),
     )
-    ral_source = ral_parser.add_mutually_exclusive_group()
-    ral_source.add_argument(
+    ral_parser.add_argument(
         "--scenario",
         type=Path,
         default=None,
@@ -239,12 +100,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "adaptive resume."
         ),
     )
-    ral_source.add_argument(
-        "--run-dir",
-        type=Path,
-        default=None,
-        help="Existing completed RA-L MeasurementLog to validate and replay.",
-    )
     ral_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -279,11 +134,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--preflight-only",
         action="store_true",
         help="Verify Geant4/runtime/MLE readiness without starting acquisition.",
-    )
-    ral_parser.add_argument(
-        "--final-only",
-        action="store_true",
-        help="For --run-dir only, run one cold final MLE instead of causal replay.",
     )
     ral_parser.add_argument(
         "--max-measurements",
@@ -463,14 +313,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="Earlier MLESnapshot v2 JSON artifact.",
     )
-    holdout_parser = subparsers.add_parser(
-        "ral-holdout",
-        help="Run final spectral MLE on a proven unseen Geant4 environment.",
-    )
-    holdout_parser.add_argument("--tuning-run-dir", type=Path, required=True)
-    holdout_parser.add_argument("--holdout-run-dir", type=Path, required=True)
-    holdout_parser.add_argument("--mle-config", type=Path, required=True)
-    holdout_parser.add_argument("--output-dir", type=Path, required=True)
     score_parser.add_argument(
         "--output",
         type=Path,
@@ -486,23 +328,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print the complete score as JSON."
     )
     return parser
-
-
-def _config_for_command(args: argparse.Namespace, mode: str) -> MLEConfig:
-    """Load or derive a configuration and apply explicit CLI overrides."""
-    if args.mle_config is None:
-        log = load_measurement_log(args.run_dir)
-        config = MLEConfig(mode=mode, isotope_names=log.context.isotopes)
-    else:
-        config = MLEConfig.load(args.mle_config)
-        config = replace(config, mode=mode)
-    if args.gpu:
-        config = replace(config, use_gpu=True)
-    elif args.cpu:
-        config = replace(config, use_gpu=False)
-    if args.no_debias:
-        config = replace(config, debias_refit=False)
-    return config
 
 
 def _estimate_summary(
@@ -532,42 +357,6 @@ def _estimate_summary(
     }
 
 
-def _run_fit(args: argparse.Namespace, mode: str) -> int:
-    """Run one replay command, save all outputs, and print a summary."""
-    config = _config_for_command(args, mode)
-    config_source_sha256 = (
-        None
-        if args.mle_config is None
-        else sha256(args.mle_config.read_bytes()).hexdigest()
-    )
-    replay_result = run_replay(
-        args.run_dir,
-        config=config,
-        config_source_sha256=config_source_sha256,
-        initial_estimate_path=args.initial_estimate,
-    )
-    estimate = replay_result.estimate
-    output_dir = args.output_dir or args.run_dir / f"mle_{mode}"
-    save_mle_estimate(
-        output_dir,
-        estimate,
-        config=config,
-        overwrite=bool(args.overwrite),
-    )
-    summary = _estimate_summary(estimate, output_dir)
-    if args.json:
-        print(json.dumps(summary, indent=2, sort_keys=True))
-    else:
-        print(f"mode: {summary['mode']}")
-        print(f"patches: {summary['patch_count']}")
-        print(f"objective: {summary['objective']:.8g}")
-        print(f"poisson_deviance: {summary['poisson_deviance']:.8g}")
-        print(f"iterations: {summary['iterations']}")
-        print(f"converged: {summary['converged']}")
-        print(f"output_dir: {summary['output_dir']}")
-    return 0
-
-
 def _run_report(args: argparse.Namespace) -> int:
     """Load a saved estimate and print its summary without refitting."""
     estimate = load_mle_estimate(args.estimate)
@@ -582,52 +371,7 @@ def _run_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_online(args: argparse.Namespace) -> int:
-    """Run station-causal runtime-log replay and print its final summary."""
-    config = _config_for_command(args, "spectral")
-    output_dir = args.output_dir or args.run_dir / "mle_online"
-
-    def announce_dashboard(url: str) -> None:
-        """Print the live URL without corrupting JSON standard output."""
-        _print_cui_dashboard_url(url, json_output=bool(args.json))
-
-    online_result = run_online_replay(
-        args.run_dir,
-        config=config,
-        output_dir=output_dir,
-        overwrite=bool(args.overwrite),
-        enable_dashboard=not args.no_dashboard,
-        serve_dashboard=not args.no_dashboard and not args.no_serve,
-        dashboard_host=args.dashboard_host,
-        dashboard_port=args.dashboard_port,
-        dashboard_public_host=args.dashboard_public_host,
-        dashboard_url_hook=announce_dashboard,
-    )
-    summary = _estimate_summary(online_result.final_estimate, output_dir)
-    summary.update(
-        {
-            "execution_mode": "online_station_complete",
-            "station_report_count": len(online_result.station_reports),
-            "station_cutoff_steps": [
-                report.data_cutoff_step for report in online_result.station_reports
-            ],
-            "state_path": str(online_result.state_path),
-            "dashboard_url": online_result.dashboard_url,
-        }
-    )
-    if args.json:
-        print(json.dumps(summary, indent=2, sort_keys=True))
-    else:
-        print(f"mode: {summary['mode']}")
-        print(f"stations: {summary['station_report_count']}")
-        print(f"patches: {summary['patch_count']}")
-        print(f"objective: {summary['objective']:.8g}")
-        print(f"converged: {summary['converged']}")
-        print(f"output_dir: {summary['output_dir']}")
-    return 0
-
-
-def _run_ral_full_simulation(args: argparse.Namespace) -> int:
+def _run_ral_live_acquisition(args: argparse.Namespace) -> int:
     """Preflight and run the strict runtime-acquisition plus MLE pipeline."""
     preflight = preflight_ral_full_simulation(
         mle_config_path=args.mle_config,
@@ -652,14 +396,8 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
         )
     if args.output_dir is None:
         raise ValueError("ral-full-simulation requires --output-dir.")
-    if args.scenario is None and args.run_dir is None:
-        raise ValueError(
-            "ral-full-simulation requires a private --scenario or completed --run-dir."
-        )
-    if args.scenario is not None and args.final_only:
-        raise ValueError("Live MLE closed-loop acquisition cannot use --final-only.")
-    if args.resume_stage is not None and args.scenario is None:
-        raise ValueError("--resume-stage requires a private --scenario.")
+    if args.scenario is None:
+        raise ValueError("ral-full-simulation requires a private --scenario.")
     if args.resume_compatibility is not None and args.resume_stage is None:
         raise ValueError("--resume-compatibility requires --resume-stage.")
 
@@ -672,58 +410,41 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
         stream = sys.stderr if args.json else sys.stdout
         print(line, file=stream, flush=True)
 
-    if args.scenario is not None:
-        stop_config = MLEStopConfig.load(args.stop_config)
-        if args.minimum_information_gain_nats is not None:
-            stop_config = replace(
-                stop_config,
-                maximum_expected_information_gain_nats=(
-                    args.minimum_information_gain_nats
-                ),
-            )
-        if args.low_information_patience is not None:
-            stop_config = replace(
-                stop_config,
-                low_information_patience=args.low_information_patience,
-            )
-        result = run_ral_closed_loop(
-            args.scenario,
-            runtime_root=preflight.runtime_root,
-            private_scene_profile=args.private_scene_profile,
-            resume_stage_path=args.resume_stage,
-            resume_compatibility_path=args.resume_compatibility,
-            mle_config_path=args.mle_config,
-            planning_config_path=args.planning_config,
-            output_dir=args.output_dir,
-            max_measurements=args.max_measurements,
-            minimum_information_gain_nats=(
-                stop_config.maximum_expected_information_gain_nats
-            ),
-            low_information_patience=stop_config.low_information_patience,
-            stop_config=stop_config,
-            overwrite=bool(args.overwrite),
-            enable_dashboard=not args.no_dashboard,
-            serve_dashboard=not args.no_dashboard and not args.no_serve,
-            dashboard_host=args.dashboard_host,
-            dashboard_port=args.dashboard_port,
-            dashboard_public_host=args.dashboard_public_host,
-            dashboard_url_hook=announce_dashboard,
-            output_hook=relay_runtime,
+    stop_config = MLEStopConfig.load(args.stop_config)
+    if args.minimum_information_gain_nats is not None:
+        stop_config = replace(
+            stop_config,
+            maximum_expected_information_gain_nats=(args.minimum_information_gain_nats),
         )
-    else:
-        result = run_ral_full_simulation(
-            args.run_dir.expanduser().resolve(),
-            mle_config_path=args.mle_config,
-            output_dir=args.output_dir,
-            overwrite=bool(args.overwrite),
-            final_only=bool(args.final_only),
-            enable_dashboard=not args.no_dashboard,
-            serve_dashboard=not args.no_dashboard and not args.no_serve,
-            dashboard_host=args.dashboard_host,
-            dashboard_port=args.dashboard_port,
-            dashboard_public_host=args.dashboard_public_host,
-            dashboard_url_hook=announce_dashboard,
+    if args.low_information_patience is not None:
+        stop_config = replace(
+            stop_config,
+            low_information_patience=args.low_information_patience,
         )
+    result = run_ral_closed_loop(
+        args.scenario,
+        runtime_root=preflight.runtime_root,
+        private_scene_profile=args.private_scene_profile,
+        resume_stage_path=args.resume_stage,
+        resume_compatibility_path=args.resume_compatibility,
+        mle_config_path=args.mle_config,
+        planning_config_path=args.planning_config,
+        output_dir=args.output_dir,
+        max_measurements=args.max_measurements,
+        minimum_information_gain_nats=(
+            stop_config.maximum_expected_information_gain_nats
+        ),
+        low_information_patience=stop_config.low_information_patience,
+        stop_config=stop_config,
+        overwrite=bool(args.overwrite),
+        enable_dashboard=not args.no_dashboard,
+        serve_dashboard=not args.no_dashboard and not args.no_serve,
+        dashboard_host=args.dashboard_host,
+        dashboard_port=args.dashboard_port,
+        dashboard_public_host=args.dashboard_public_host,
+        dashboard_url_hook=announce_dashboard,
+        output_hook=relay_runtime,
+    )
     payload = result.to_dict()
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -796,7 +517,7 @@ def _run_plan_next(args: argparse.Namespace) -> int:
         mle_config = replace(mle_config, use_gpu=True)
     elif args.cpu:
         mle_config = replace(mle_config, use_gpu=False)
-    context = prepare_replay(args.run_dir, config=mle_config)
+    context = prepare_estimator_context(args.run_dir, config=mle_config)
     estimate = load_mle_estimate(args.estimate)
     provenance = estimate.diagnostics.get("provenance", {})
     if isinstance(provenance, dict):
@@ -906,14 +627,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments and execute the requested standalone operation."""
     parser = build_argument_parser()
     args = parser.parse_args(None if argv is None else list(argv))
-    if args.command == "replay":
-        return _run_fit(args, "count")
-    if args.command == "fit-spectrum":
-        return _run_fit(args, "spectral")
-    if args.command in {"online-replay", "online"}:
-        return _run_online(args)
     if args.command == "ral-full-simulation":
-        return _run_ral_full_simulation(args)
+        return _run_ral_live_acquisition(args)
     if args.command == "plan-next":
         return _run_plan_next(args)
     if args.command == "report":
@@ -922,15 +637,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_forward_conformance(args)
     if args.command == "score-future":
         return _run_score_future(args)
-    if args.command == "ral-holdout":
-        result = run_ral_holdout(
-            args.tuning_run_dir,
-            args.holdout_run_dir,
-            config_path=args.mle_config,
-            output_dir=args.output_dir,
-        )
-        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
-        return 0
     parser.error(f"Unknown command: {args.command}")
     return 2
 
