@@ -14,38 +14,17 @@ import pytest
 
 from runtime.measurement_log import load_measurement_log, measurement_log_sha256
 from runtime.records import canonical_json_bytes
-from three_d_estimation.config import MLEConfig
 from three_d_estimation.estimator import (
     SurfaceMLEEstimator,
     _split_fit_indices,
     _union_group_labels,
 )
-from three_d_estimation.observation_batch import observation_batch_from_log
-from three_d_estimation.estimator_context import prepare_estimator_context
+from three_d_estimation.observation_batch import observation_batch_from_records
 from three_d_estimation.types import ObservationBatch
 
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "fixtures" / "shared_measurement_log" / "measurement_log"
-
-
-def _fixture_config(mode: str) -> MLEConfig:
-    """Return a fast deterministic configuration for the shared fixture."""
-    return MLEConfig(
-        mode=mode,
-        isotope_names=("Co-60", "Cs-137", "Eu-154"),
-        patch_spacing_m=(6.0, 6.0, 3.0),
-        quadrature_order=1,
-        obstacle_height_m=1.2,
-        max_iterations=30,
-        check_interval=5,
-        debias_refit=False,
-        fit_background_nuisance=False,
-        fit_scatter_nuisance=False,
-        held_out_fraction=0.0,
-        use_gpu=False,
-        random_seed=19,
-    )
 
 
 def _grouping_batch() -> ObservationBatch:
@@ -136,9 +115,13 @@ def test_group_labels_keep_station_views_together_for_every_default_mode() -> No
 
 
 def test_shared_fixture_preserves_pose_timing_and_shield_blocks() -> None:
-    """MeasurementLog conversion retains every raw record and timing field."""
+    """Live record conversion retains every raw record and timing field."""
     log = load_measurement_log(FIXTURE)
-    batch = observation_batch_from_log(log)
+    batch = observation_batch_from_records(
+        log.records,
+        log.context.isotopes,
+        context=log.context,
+    )
     assert batch.detector_positions_xyz.shape == (12, 3)
     assert set(batch.detector_positions_xyz[:, 2]) == {0.4}
     np.testing.assert_array_equal(batch.step_ids, np.arange(12))
@@ -148,25 +131,6 @@ def test_shared_fixture_preserves_pose_timing_and_shield_blocks() -> None:
     assert batch.shield_program_block_ids == tuple(
         f"station:{station_id}" for station_id in np.repeat(np.arange(6), 2)
     )
-
-
-def test_raw_and_resolved_estimator_config_hashes_have_distinct_semantics(
-    tmp_path: Path,
-) -> None:
-    """Preserve source-file bytes separately from the resolved semantic mapping."""
-    config_path = tmp_path / "mle.json"
-    config_path.write_text(
-        json.dumps(_fixture_config("spectral").to_dict(), separators=(", ", ": "))
-        + "\n\n",
-        encoding="utf-8",
-    )
-    context = prepare_estimator_context(FIXTURE, config=config_path)
-    assert context.config_sha256 == sha256(config_path.read_bytes()).hexdigest()
-    assert (
-        context.resolved_estimator_config_sha256
-        == sha256(canonical_json_bytes(context.config.to_dict())).hexdigest()
-    )
-    assert context.config_sha256 != context.resolved_estimator_config_sha256
 
 
 def test_measurement_log_digest_covers_full_raw_inventory_and_rejects_truth(

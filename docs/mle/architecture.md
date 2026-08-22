@@ -7,8 +7,8 @@ This document describes the implemented all-history surface maximum-likelihood e
 Production acquisition is not owned by this repository. The versioned
 `rotating-shield-simulation-runtime` package produces and durably stages truth-free raw
 MeasurementLog schema-2 records. This estimator imports that package's public record,
-observation-model, continuous-kernel, asset-resolution, and log-reader APIs. It does
-not copy or synchronize runtime source.
+observation-model, continuous-kernel, asset-resolution, and final-log validation APIs.
+It does not copy or synchronize runtime source.
 
 Production has one live estimator path. `OnlineMLESession` accepts each
 already-persisted runtime record. Production RA-L mode buffers all shield views at
@@ -52,8 +52,8 @@ The notation used below is:
 | `E` | physical shared-edge graph edges |
 | `N` | fitted nuisance coefficients |
 
-The online backend and the runtime-context validator convert runtime records into one
-validated `ObservationBatch`:
+The online backend converts the records already delivered by the runtime into one
+validated `ObservationBatch` through a pathless runtime array view:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
@@ -117,8 +117,8 @@ Patches have stable IDs, optional parent IDs, and refinement levels. Solver adja
 
 ## Shared physical kernel
 
-The online backend and runtime-context validator call the shared runtime's
-`RuntimeObservationModel` and `ContinuousKernel`. Their response includes
+The online backend builds the shared runtime's `RuntimeObservationModel` and
+`ContinuousKernel` directly from the live `RunContext`. Their response includes
 detector/source geometry, finite detector and aperture settings, selected Fe/Pb shield
 geometry and attenuation, obstacle path attenuation, optional buildup, and calibrated
 transport-response terms. File-backed assets are resolved by the runtime package from

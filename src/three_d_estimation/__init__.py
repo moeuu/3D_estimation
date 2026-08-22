@@ -11,12 +11,6 @@ from .conformance import (
 from .dashboard import OnlineMLEDashboard, ensure_dashboard_server
 from .estimator import SurfaceMLEEstimator, fit_surface_mle
 from .estimator_backend import SurfaceMLEBackend
-from .estimator_context import (
-    EstimatorContext,
-    WarmStartArtifact,
-    prepare_estimator_context,
-    validate_warm_start_artifact,
-)
 from .information_planner import (
     PLANNING_METHOD,
     MLEPlanningAction,
@@ -27,7 +21,6 @@ from .information_planner import (
     select_fisher_action,
 )
 from .observation_batch import (
-    observation_batch_from_log,
     observation_batch_from_records,
 )
 from .online import (
@@ -75,7 +68,6 @@ from .types import (
 __all__ = [
     "PLANNING_METHOD",
     "CountResponseMatrices",
-    "EstimatorContext",
     "ForwardConformanceResult",
     "MLEConfig",
     "MLEEstimate",
@@ -98,7 +90,6 @@ __all__ = [
     "SurfaceMapResult",
     "SurfacePatch",
     "SurfacePatchSet",
-    "WarmStartArtifact",
     "build_count_response",
     "build_count_responses",
     "build_default_config",
@@ -114,11 +105,9 @@ __all__ = [
     "load_forward_conformance_axes",
     "load_mle_estimate",
     "mle_report_sha256",
-    "observation_batch_from_log",
     "observation_batch_from_records",
     "plan_next_measurement",
     "preflight_ral_full_simulation",
-    "prepare_estimator_context",
     "refine_surface_patches",
     "run_ral_closed_loop",
     "save_forward_conformance",
@@ -126,5 +115,4 @@ __all__ = [
     "save_mle_planning_result",
     "select_fisher_action",
     "validate_ral_measurement_log",
-    "validate_warm_start_artifact",
 ]

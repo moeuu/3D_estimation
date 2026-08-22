@@ -1,4 +1,4 @@
-"""Conversion between versioned measurement logs and validated MLE batches."""
+"""Conversion from live runtime records to validated MLE batches."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from collections.abc import Sequence
 import numpy as np
 
 from runtime.measurement_log import (
-    MeasurementLog,
     MeasurementLogArrayView,
     MeasurementLogView,
 )
@@ -171,17 +170,6 @@ def observation_batch_from_records(
         rows,
         names,
     )
-
-
-def observation_batch_from_log(log: MeasurementLog) -> ObservationBatch:
-    """Convert a loaded versioned measurement log into an MLE batch."""
-    if not isinstance(log, MeasurementLog):
-        raise TypeError("log must be a MeasurementLog.")
-    rows = tuple(log.records)
-    if not rows:
-        raise ValueError("At least one MeasurementRecord is required.")
-    names = tuple(log.context.isotopes)
-    return _observation_batch_from_array_view(log.array_view(), rows, names)
 
 
 def subset_observation_batch(

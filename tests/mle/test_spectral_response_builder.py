@@ -15,7 +15,9 @@ from measurement.continuous_kernels import ContinuousKernel
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import OctantShield, generate_octant_orientations
+from runtime import ResolvedForwardContext
 from runtime.discrepancy_calibration import DiscrepancyCalibration
+from runtime.measurement_log import load_measurement_log
 from spectrum.additive_scatter import (
     AdditiveNoncollidedTransportResponse,
     PhysicsOnlyNoncollidedTransportResponse,
@@ -28,8 +30,7 @@ from spectrum.response_matrix import (
     detector_response_kernel_for_incident_gamma,
 )
 import three_d_estimation.spectral_response_builder as spectral_builder
-from three_d_estimation.config import MLEConfig
-from three_d_estimation.estimator_context import prepare_estimator_context
+from three_d_estimation.observation_batch import observation_batch_from_records
 from three_d_estimation.spectral_response_builder import (
     build_spectral_nuisance_response,
     build_spectral_response,
@@ -1023,28 +1024,29 @@ def test_real_runtime_kernel_is_spawn_safe_and_bitwise_exact() -> None:
         / "shared_measurement_log"
         / "measurement_log"
     )
-    context = prepare_estimator_context(
-        fixture,
-        config=MLEConfig(
-            mode="spectral",
-            isotope_names=("Co-60", "Cs-137", "Eu-154"),
-            patch_spacing_m=(6.0, 6.0, 3.0),
-            max_iterations=2,
-            debias_refit=False,
-            use_gpu=False,
-        ),
+    log = load_measurement_log(fixture)
+    forward_context = ResolvedForwardContext.from_log(log)
+    kernel = forward_context.build_continuous_kernel(
+        use_gpu=False,
+        gpu_device="cuda",
+        gpu_dtype="float32",
+    )
+    batch = observation_batch_from_records(
+        log.records,
+        log.context.isotopes,
+        context=log.context,
     )
     assert (
-        type(context.kernel.additive_scatter_response)
+        type(kernel.additive_scatter_response)
         is AdditiveNoncollidedTransportResponse
     )
-    kernel = replace(context.kernel, gpu_dtype="float64")
+    kernel = replace(kernel, gpu_dtype="float64")
     observations = _observations(
-        context.batch.detector_positions_xyz[:1],
-        context.batch.energy_bin_edges_keV,
-        live_times_s=context.batch.live_times_s[:1],
-        fe_indices=context.batch.fe_indices[:1],
-        pb_indices=context.batch.pb_indices[:1],
+        batch.detector_positions_xyz[:1],
+        batch.energy_bin_edges_keV,
+        live_times_s=batch.live_times_s[:1],
+        fe_indices=batch.fe_indices[:1],
+        pb_indices=batch.pb_indices[:1],
     )
     patches = _patches(
         np.asarray(

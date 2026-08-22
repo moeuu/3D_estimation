@@ -56,6 +56,7 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
         "service" in name.lower() for name in project.get("optional-dependencies", {})
     )
     assert not (ROOT / "src" / "three_d_estimation" / "service.py").exists()
+    assert not (ROOT / "src" / "three_d_estimation" / "estimator_context.py").exists()
     assert not (ROOT / "src" / "three_d_estimation" / "holdout.py").exists()
     assert not (ROOT / "src" / "three_d_estimation" / "future_scoring.py").exists()
     assert not (ROOT / "src" / "three_d_estimation" / "replay.py").exists()
@@ -65,20 +66,28 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
 def test_completed_log_estimator_api_is_absent() -> None:
     """The installed package must not expose completed-log fit launchers."""
     import three_d_estimation
+    import three_d_estimation.observation_batch as observation_batch
     import three_d_estimation.online as online
     import three_d_estimation.ral as ral
 
     assert importlib.util.find_spec("three_d_estimation.replay") is None
     assert importlib.util.find_spec("three_d_estimation.holdout") is None
     assert importlib.util.find_spec("three_d_estimation.future_scoring") is None
+    assert importlib.util.find_spec("three_d_estimation.estimator_context") is None
     for name in ("ReplayContext", "ReplayResult", "prepare_replay", "run_replay"):
         assert not hasattr(three_d_estimation, name)
     for name in (
+        "EstimatorContext",
+        "WarmStartArtifact",
         "covered_station_boundaries_sha256",
+        "observation_batch_from_log",
+        "prepare_estimator_context",
         "save_future_candidate_scores",
         "score_future_count_candidates",
+        "validate_warm_start_artifact",
     ):
         assert not hasattr(three_d_estimation, name)
+    assert not hasattr(observation_batch, "observation_batch_from_log")
     assert not hasattr(online, "run_online_replay")
     assert not hasattr(ral, "RALFullSimulationResult")
     assert not hasattr(ral, "run_ral_full_simulation")
