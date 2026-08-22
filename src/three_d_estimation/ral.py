@@ -9,6 +9,10 @@ from hashlib import sha256
 from pathlib import Path
 
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
+from runtime.defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_HOST,
+    DEFAULT_CUI_SPLIT_VIEW_PORT,
+)
 from runtime.measurement_log import MeasurementLog, load_measurement_log
 from sim.runtime import load_runtime_config
 
@@ -319,8 +323,8 @@ def run_ral_full_simulation(
     final_only: bool = False,
     enable_dashboard: bool = True,
     serve_dashboard: bool = True,
-    dashboard_host: str = "0.0.0.0",
-    dashboard_port: int = 8878,
+    dashboard_host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
+    dashboard_port: int = DEFAULT_CUI_SPLIT_VIEW_PORT,
     dashboard_public_host: str | None = None,
     dashboard_url_hook: Callable[[str], None] | None = None,
 ) -> RALFullSimulationResult:

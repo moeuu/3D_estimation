@@ -18,8 +18,11 @@ The private scenario contains only physical-scene and run identity inputs:
 
 An adaptive scenario has no `actions` field. It does not contain a station count, a
 views-per-station value, a measurement-position list, or a shield-angle list. Source
-truth remains inside the runtime process. The estimator receives only a truth-free
-run context, reachable candidate positions, motion costs, and persisted raw spectra.
+truth remains outside the estimator protocol. The estimator receives only a
+truth-free run context, reachable candidate positions, motion costs, and persisted
+raw spectra. The estimator-owned CUI has no truth-overlay channel. Evaluation
+overlays belong to a separate post-estimation evaluator that consumes only finalized
+artifacts.
 
 The standard physical profile remains runtime-owned:
 

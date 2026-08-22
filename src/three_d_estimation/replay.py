@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from importlib import import_module
-import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -16,18 +13,9 @@ import numpy as np
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
-from measurement.observation_model import (
-    RuntimeObservationModel,
-    build_runtime_observation_model,
-    continuous_kernel_from_observation_model,
-)
-from measurement.obstacle_assets import (
-    ObstacleComponent,
-    line_transport_model_from_components,
-    transport_model_from_components,
-)
+from measurement.observation_model import RuntimeObservationModel
 from measurement.obstacles import ObstacleGrid
-from runtime.forward_model_manifest import resolve_file_backed_model_asset
+from runtime import ResolvedForwardContext
 from runtime.measurement_log import MeasurementLog, load_measurement_log
 from runtime.records import canonical_json_bytes, canonical_json_sha256
 
@@ -35,8 +23,8 @@ from .config import MLEConfig
 from .estimator import SurfaceMLEEstimator
 from runtime.prefix import (
     covered_station_boundaries_sha256,
-    measurement_records_sha256,
 )
+from .lineage import covered_records_lineage, validate_covered_records_lineage
 from .observation_batch import observation_batch_from_log
 from .provenance import estimator_provenance
 from .reporting import (
@@ -47,9 +35,6 @@ from .reporting import (
     mle_report_sha256,
 )
 from .types import MLEEstimate, ObservationBatch
-
-
-_SOURCE_RATE_MODEL = "detector_cps_1m"
 
 
 ReplaySaveHook = Callable[[MLEEstimate, Path], object]
@@ -63,6 +48,7 @@ class ReplayContext:
     log: MeasurementLog
     batch: ObservationBatch
     config: MLEConfig
+    forward_context: ResolvedForwardContext
     environment: EnvironmentConfig
     obstacle_grid: ObstacleGrid | None
     resolved_obstacle_path: Path | None
@@ -91,312 +77,6 @@ class WarmStartArtifact:
     diagnostics_sha256: str
     measurement_log_sha256: str
     causal_lineage: dict[str, object]
-
-
-def _normalized_source_rate_model(value: object, *, origin: str) -> str:
-    """Validate detector-count-rate source-strength semantics."""
-    normalized = str(value).strip().lower()
-    if normalized != _SOURCE_RATE_MODEL:
-        raise ValueError(
-            f"{origin} source_rate_model must be {_SOURCE_RATE_MODEL!r}; got {value!r}."
-        )
-    return normalized
-
-
-def _sequence_of_floats(
-    value: object,
-    *,
-    name: str,
-    length: int,
-    positive: bool,
-) -> tuple[float, ...]:
-    """Parse a finite fixed-length numeric sequence."""
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValueError(f"{name} must be a sequence of {length} numbers.")
-    if len(value) != length:
-        raise ValueError(f"{name} must contain exactly {length} numbers.")
-    parsed = tuple(float(item) for item in value)
-    if any(not math.isfinite(item) for item in parsed):
-        raise ValueError(f"{name} must contain only finite numbers.")
-    if positive and any(item <= 0.0 for item in parsed):
-        raise ValueError(f"{name} must contain only positive numbers.")
-    return parsed
-
-
-def _environment_dimensions(
-    payload: Mapping[str, object],
-) -> tuple[float, float, float] | None:
-    """Extract room dimensions from one environment/runtime mapping."""
-    if all(key in payload for key in ("size_x", "size_y", "size_z")):
-        return _sequence_of_floats(
-            [payload["size_x"], payload["size_y"], payload["size_z"]],
-            name="environment size_x/size_y/size_z",
-            length=3,
-            positive=True,
-        )
-    if all(key in payload for key in ("size_x_m", "size_y_m", "size_z_m")):
-        return _sequence_of_floats(
-            [payload["size_x_m"], payload["size_y_m"], payload["size_z_m"]],
-            name="environment size_x_m/size_y_m/size_z_m",
-            length=3,
-            positive=True,
-        )
-    for key in ("room_size_xyz", "size_xyz"):
-        if key in payload:
-            return _sequence_of_floats(
-                payload[key],
-                name=key,
-                length=3,
-                positive=True,
-            )
-    return None
-
-
-def _environment_mappings(
-    environment_payload: Mapping[str, object],
-    runtime_config: Mapping[str, object],
-) -> tuple[Mapping[str, object], ...]:
-    """Return explicit environment mappings in decreasing precedence order."""
-    candidates: list[Mapping[str, object]] = [environment_payload]
-    nested_environment = environment_payload.get("environment")
-    if isinstance(nested_environment, Mapping):
-        candidates.append(nested_environment)
-    runtime_environment = runtime_config.get("environment")
-    if isinstance(runtime_environment, Mapping):
-        candidates.append(runtime_environment)
-    candidates.append(runtime_config)
-    return tuple(candidates)
-
-
-def _resolve_environment_config(log: MeasurementLog) -> EnvironmentConfig:
-    """Construct EnvironmentConfig from persisted environment/runtime payloads."""
-    mappings = _environment_mappings(
-        log.context.environment, log.context.runtime_config
-    )
-    dimensions = None
-    for payload in mappings:
-        dimensions = _environment_dimensions(payload)
-        if dimensions is not None:
-            break
-    if dimensions is None:
-        raise ValueError(
-            "Measurement log does not contain room dimensions. Expected size_x/size_y/"
-            "size_z or room_size_xyz in environment/runtime config."
-        )
-
-    detector_position = None
-    for payload in mappings:
-        for key in ("detector_position", "detector_position_xyz"):
-            if key in payload and payload[key] is not None:
-                detector_position = _sequence_of_floats(
-                    payload[key],
-                    name=key,
-                    length=3,
-                    positive=False,
-                )
-                break
-        if detector_position is not None:
-            break
-    return EnvironmentConfig(
-        size_x=dimensions[0],
-        size_y=dimensions[1],
-        size_z=dimensions[2],
-        detector_position=detector_position,
-    )
-
-
-def _axis_aligned_obstacle_grid(
-    payloads: Sequence[object],
-    *,
-    environment_payload: Mapping[str, object],
-    isotopes: tuple[str, ...],
-) -> ObstacleGrid | None:
-    """Convert neutral axis-aligned boxes into local surface/transport geometry."""
-    if not payloads:
-        return None
-    components: list[ObstacleComponent] = []
-    footprints: list[tuple[float, float, float, float]] = []
-    for index, raw_payload in enumerate(payloads):
-        if not isinstance(raw_payload, Mapping):
-            raise ValueError(f"environment obstacles[{index}] must be an object.")
-        if raw_payload.get("kind") != "axis_aligned_box":
-            raise ValueError("Only axis_aligned_box neutral obstacles are supported.")
-        lower = _sequence_of_floats(
-            raw_payload.get("min_xyz_m"),
-            name=f"obstacles[{index}].min_xyz_m",
-            length=3,
-            positive=False,
-        )
-        upper = _sequence_of_floats(
-            raw_payload.get("max_xyz_m"),
-            name=f"obstacles[{index}].max_xyz_m",
-            length=3,
-            positive=False,
-        )
-        size = tuple(upper[axis] - lower[axis] for axis in range(3))
-        if any(value <= 0.0 for value in size):
-            raise ValueError("Neutral obstacle max_xyz_m must exceed min_xyz_m.")
-        material = str(raw_payload.get("material", "")).strip()
-        if not material:
-            raise ValueError("Neutral obstacle material must be non-empty.")
-        components.append(
-            ObstacleComponent(
-                name=str(raw_payload.get("object_id", f"obstacle-{index}")),
-                center_xyz=tuple(
-                    0.5 * (lower[axis] + upper[axis]) for axis in range(3)
-                ),
-                size_xyz=size,
-                material=material,
-            )
-        )
-        footprints.append((lower[0], lower[1], size[0], size[1]))
-
-    cell_size = float(footprints[0][2])
-    if any(
-        not np.isclose(width, cell_size, rtol=1.0e-9, atol=1.0e-12)
-        or not np.isclose(height, cell_size, rtol=1.0e-9, atol=1.0e-12)
-        for _, _, width, height in footprints
-    ):
-        raise ValueError(
-            "Neutral obstacle footprints must be equal square cells for surface patches."
-        )
-    origin_xyz = _sequence_of_floats(
-        environment_payload.get("surface_origin_xyz_m", (0.0, 0.0, 0.0)),
-        name="surface_origin_xyz_m",
-        length=3,
-        positive=False,
-    )
-    dimensions = _environment_dimensions(environment_payload)
-    if dimensions is None:
-        raise ValueError("Neutral obstacle geometry requires room dimensions.")
-    grid_shape_float = (
-        dimensions[0] / cell_size,
-        dimensions[1] / cell_size,
-    )
-    grid_shape = tuple(int(round(value)) for value in grid_shape_float)
-    if any(
-        not np.isclose(value, rounded, rtol=1.0e-9, atol=1.0e-12)
-        for value, rounded in zip(grid_shape_float, grid_shape, strict=True)
-    ):
-        raise ValueError("Room dimensions must align to neutral obstacle cell size.")
-    blocked_cells: list[tuple[int, int]] = []
-    for x_min, y_min, _, _ in footprints:
-        indices_float = (
-            (x_min - origin_xyz[0]) / cell_size,
-            (y_min - origin_xyz[1]) / cell_size,
-        )
-        indices = tuple(int(round(value)) for value in indices_float)
-        if any(
-            not np.isclose(value, rounded, rtol=1.0e-9, atol=1.0e-12)
-            for value, rounded in zip(indices_float, indices, strict=True)
-        ):
-            raise ValueError(
-                "Neutral obstacle footprints must align to the surface grid."
-            )
-        blocked_cells.append(indices)
-    boxes, mu_by_isotope = transport_model_from_components(
-        components,
-        isotopes=isotopes,
-    )
-    line_mu_by_isotope = line_transport_model_from_components(
-        components,
-        isotopes=isotopes,
-    )
-    return ObstacleGrid(
-        origin=(origin_xyz[0], origin_xyz[1]),
-        cell_size=cell_size,
-        grid_shape=(grid_shape[0], grid_shape[1]),
-        blocked_cells=tuple(blocked_cells),
-        transport_boxes_m=boxes,
-        transport_mu_by_isotope=mu_by_isotope,
-        transport_line_mu_by_isotope=line_mu_by_isotope,
-    )
-
-
-def _embedded_obstacle_grid(
-    environment_payload: Mapping[str, object],
-    *,
-    isotopes: tuple[str, ...],
-) -> ObstacleGrid | None:
-    """Return local geometry from an embedded grid or neutral box list."""
-    candidates: list[object] = []
-    for key in ("obstacle_grid", "obstacle_layout", "obstacles"):
-        if key in environment_payload and environment_payload[key] is not None:
-            candidates.append(environment_payload[key])
-    if "grid_shape" in environment_payload and "blocked_cells" in environment_payload:
-        candidates.append(environment_payload)
-    if not candidates:
-        return None
-    if len(candidates) > 1:
-        raise ValueError(
-            "environment.json contains multiple embedded obstacle layouts."
-        )
-    payload = candidates[0]
-    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
-        return _axis_aligned_obstacle_grid(
-            payload,
-            environment_payload=environment_payload,
-            isotopes=isotopes,
-        )
-    if not isinstance(payload, Mapping):
-        raise ValueError("Embedded obstacle layout must be an object or box array.")
-    return ObstacleGrid.from_dict(dict(payload))
-
-
-def _resolve_local_obstacle_path(run_dir: Path, path_value: object) -> Path:
-    """Resolve an obstacle layout inside the log or shared runtime assets."""
-    return resolve_file_backed_model_asset(
-        path_value,
-        field_name="obstacle_layout_path",
-        run_root=run_dir,
-    )
-
-
-def _resolve_obstacle_grid(
-    log: MeasurementLog,
-    run_dir: Path,
-) -> tuple[ObstacleGrid | None, Path | None]:
-    """Resolve embedded, run-local, or repository-local obstacle data."""
-    embedded = _embedded_obstacle_grid(
-        log.context.environment,
-        isotopes=log.context.isotopes,
-    )
-    if embedded is not None:
-        return embedded, None
-    path_value = log.context.obstacle_layout_path
-    if path_value is None or not str(path_value).strip():
-        return None, None
-    resolved = _resolve_local_obstacle_path(run_dir, path_value)
-    try:
-        return ObstacleGrid.load(resolved), resolved
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Could not load obstacle layout {resolved}: {exc}") from exc
-
-
-def _safe_runtime_model_payload(
-    runtime_config: Mapping[str, object],
-    run_dir: Path,
-) -> dict[str, object]:
-    """Return the immutable observation model embedded by the shared runtime."""
-    del run_dir
-    payload = deepcopy(dict(runtime_config))
-    configured_rate_model = payload.get("source_rate_model")
-    if configured_rate_model is not None:
-        _normalized_source_rate_model(
-            configured_rate_model,
-            origin="runtime config",
-        )
-    payload["source_rate_model"] = _SOURCE_RATE_MODEL
-
-    if any(str(key).startswith("pf_") for key in payload):
-        raise ValueError(
-            "MeasurementLog runtime_config contains estimator-owned PF settings."
-        )
-    if "full_spectrum_generative_model" not in payload:
-        raise ValueError(
-            "MeasurementLog must embed full_spectrum_generative_model."
-        )
-    return payload
 
 
 def _resolve_mle_config(
@@ -431,13 +111,9 @@ def prepare_replay(
     config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
     config_source_sha256: str | None = None,
 ) -> ReplayContext:
-    """Load a measurement log and construct its fully local forward model."""
+    """Load a measurement log and resolve shared runtime forward physics."""
     resolved_run_dir = Path(run_dir).resolve()
     log = load_measurement_log(resolved_run_dir)
-    _normalized_source_rate_model(
-        log.context.source_rate_model,
-        origin="measurement log",
-    )
     batch = observation_batch_from_log(log)
     mle_config = _resolve_mle_config(config, batch)
     if config_source_sha256 is not None:
@@ -451,30 +127,22 @@ def prepare_replay(
     else:
         config_sha256 = sha256(canonical_json_bytes(mle_config.to_dict())).hexdigest()
     resolved_estimator_config_sha256 = canonical_json_sha256(mle_config.to_dict())
-    environment = _resolve_environment_config(log)
-    obstacle_grid, obstacle_path = _resolve_obstacle_grid(log, resolved_run_dir)
-    runtime_config = _safe_runtime_model_payload(
-        log.context.runtime_config,
-        resolved_run_dir,
-    )
-    observation_model = build_runtime_observation_model(
-        runtime_config,
-        isotopes=batch.isotope_names,
-    )
-    kernel = continuous_kernel_from_observation_model(
-        observation_model,
-        obstacle_grid=obstacle_grid,
+    forward_context = ResolvedForwardContext.from_log(log)
+    kernel = forward_context.build_continuous_kernel(
         use_gpu=bool(mle_config.use_gpu),
+        gpu_device=str(mle_config.gpu_device),
+        gpu_dtype=str(mle_config.gpu_dtype),
     )
     return ReplayContext(
         run_dir=resolved_run_dir,
         log=log,
         batch=batch,
         config=mle_config,
-        environment=environment,
-        obstacle_grid=obstacle_grid,
-        resolved_obstacle_path=obstacle_path,
-        observation_model=observation_model,
+        forward_context=forward_context,
+        environment=forward_context.environment,
+        obstacle_grid=forward_context.obstacle_grid,
+        resolved_obstacle_path=forward_context.resolved_obstacle_path,
+        observation_model=forward_context.observation_model,
         kernel=kernel,
         config_sha256=config_sha256,
         resolved_estimator_config_sha256=resolved_estimator_config_sha256,
@@ -531,6 +199,11 @@ def _prefix_attestation(log: MeasurementLog) -> str:
             raise ValueError(
                 f"measurement_log_prefix metadata {name} does not match the log."
             )
+    validate_covered_records_lineage(
+        raw,
+        log.records,
+        location="measurement_log_prefix",
+    )
     attestation = raw.get("station_boundary_attestation")
     if attestation not in {
         "writer_metadata",
@@ -560,6 +233,8 @@ def _warm_start_lineage(
     raw = estimate.diagnostics.get("causal_lineage")
     if not isinstance(raw, Mapping):
         raise ValueError("Warm-start report lacks causal_lineage diagnostics.")
+    if raw.get("schema_version") != 2:
+        raise ValueError("Warm-start causal_lineage must use schema version 2.")
     raw_steps = raw.get("covered_step_ids")
     if not isinstance(raw_steps, Sequence) or isinstance(raw_steps, (str, bytes)):
         raise ValueError("Warm-start covered_step_ids must be an integer array.")
@@ -593,11 +268,11 @@ def _warm_start_lineage(
         raise ValueError("Warm-start cutoff station does not match the replay log.")
     if context.log.records[record_count].station_id == cutoff_station:
         raise ValueError("Warm-start cutoff is not a station-complete prefix.")
-    expected_records_digest = measurement_records_sha256(current_prefix)
-    if raw.get("covered_records_sha256") != expected_records_digest:
-        raise ValueError(
-            "Warm-start covered record content is not a prefix of the replay log."
-        )
+    expected_records_digest = validate_covered_records_lineage(
+        raw,
+        current_prefix,
+        location="warm_start.causal_lineage",
+    )
     attestation = raw.get("station_boundary_attestation")
     if attestation not in {
         "writer_metadata",
@@ -615,7 +290,8 @@ def _warm_start_lineage(
         "data_cutoff_step": cutoff_step,
         "data_cutoff_station": cutoff_station,
         "record_count": record_count,
-        "covered_records_sha256": expected_records_digest,
+        "covered_records_digest": expected_records_digest.to_payload(),
+        "covered_records_sha256": expected_records_digest.sha256,
         "station_boundary_attestation": attestation,
         "fit_kind": fit_kind,
     }
@@ -697,13 +373,14 @@ def _causal_lineage(
 ) -> dict[str, object]:
     """Build deterministic all-history fit lineage for one replay result."""
     records = context.log.records
+    records_lineage = covered_records_lineage(records)
     lineage: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "covered_step_ids": [record.step_id for record in records],
         "data_cutoff_step": records[-1].step_id,
         "data_cutoff_station": records[-1].station_id,
         "record_count": len(records),
-        "covered_records_sha256": measurement_records_sha256(records),
+        **records_lineage,
         "station_boundary_attestation": _prefix_attestation(context.log),
         "fit_kind": (
             "cold_start_all_history" if warm_start is None else "warm_start_all_history"
@@ -719,6 +396,7 @@ def _causal_lineage(
             "data_cutoff_step": prior["data_cutoff_step"],
             "data_cutoff_station": prior["data_cutoff_station"],
             "record_count": prior["record_count"],
+            "covered_records_digest": prior["covered_records_digest"],
             "covered_records_sha256": prior["covered_records_sha256"],
             "measurement_log_sha256": warm_start.measurement_log_sha256,
         }

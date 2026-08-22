@@ -61,7 +61,7 @@ uv run estimate-radiation-mle online-replay \
 ```
 
 This command starts the live dashboard server by default and immediately prints a
-clickable `CUI dashboard URL: http://HOST:PORT/index.html` before the first station
+clickable `CUI split visualization URL: http://HOST:PORT/index.html` before the first station
 fit. If the requested port belongs to an older run, the launcher selects the next
 free port instead of displaying stale files. The page refreshes from atomically
 published MLE snapshots;
@@ -160,8 +160,10 @@ intermediate spectra are buffered without changing the estimate. It can then ask
 runtime to refine promising 3-D candidate neighborhoods, rerank the returned
 reachable poses, and select the next position and eight-measurement Fe/Pb program.
 No station count, view count, record count,
-measurement route, or station list is fixed in advance. Source truth is never opened
-by the MLE process.
+measurement route, or station list is fixed in advance. Source truth is never passed
+to the MLE estimator, planner, or estimator-owned CUI process. The live CUI is
+truth-free; evaluation overlays must be produced by a separate post-estimation
+evaluator after the estimator result is final.
 
 The RA-L stop decision is compound: convergence/KKT, independent 3-D pose and height
 coverage, elevation span, held-history deviance/map/cluster stability, response
@@ -186,6 +188,23 @@ uv run estimate-radiation-mle fit-spectrum \
 
 The `replay` command is retained only for an explicitly derived count observation
 contract. It does not derive isotope counts from raw MeasurementLog spectra.
+
+The independent estimator service has exactly two process verbs:
+
+```bash
+radiation-surface-mle-service capabilities --response /path/to/capabilities.json
+radiation-surface-mle-service execute \
+  --request /path/to/request.json \
+  --response /path/to/response.json
+```
+
+`capabilities` advertises the single versioned surface-MLE estimate operation,
+MeasurementLog schema 2, and the accepted MLE config/result contracts. `execute`
+accepts authenticated file references and publishes an authenticated result
+directory. The shared package defines only this wire and artifact contract: the MLE
+solver, regularization, warm starts, and report construction remain in this
+repository. The service advertises `accepts_truth=false` and rejects truth-bearing
+requests; truth-free MeasurementLog records are its only observation input.
 
 For a final unseen-environment evaluation after regularization and calibration have
 been frozen:

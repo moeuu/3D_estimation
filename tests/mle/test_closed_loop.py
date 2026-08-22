@@ -9,6 +9,12 @@ from typing import Any
 import numpy as np
 import pytest
 from runtime.adaptive_client import (
+    AdaptiveCandidatesEvent,
+    AdaptivePublishedEvent,
+    AdaptiveReadyEvent,
+    AdaptiveRecordEvent,
+    AdaptiveRefineRequest,
+    AdaptiveStepRequest,
     adaptive_step_request,
     parse_adaptive_record,
     parse_candidate_snapshot,
@@ -314,6 +320,8 @@ class _FakeRuntimeClient:
         self.requests: list[dict[str, object]] = []
         self.refinement_requests: list[dict[str, object]] = []
         self.cui_overlay_requests: list[bool] = []
+        self.lifecycle_events: list[str] = []
+        self.closed = False
         self.context = _context_payload()
         self.candidates = {
             "candidate_poses_xyz": [[0.5, 0.5, 1.0]],
@@ -322,129 +330,177 @@ class _FakeRuntimeClient:
             "current_pair_id": 0,
         }
 
-    def read_event(self) -> dict[str, object]:
-        """Return the initial runtime event."""
-        return {
-            "type": "ready",
-            "schema_version": 1,
-            "context": self.context,
-            "candidates": self.candidates,
-            "bootstrap": {
-                "candidate_index": 0,
-                "fe_orientation_index": 0,
-                "pb_orientation_index": 0,
-            },
-        }
+    def read_ready_event(self) -> AdaptiveReadyEvent:
+        """Return the typed initial runtime event."""
+        return AdaptiveReadyEvent.from_payload(
+            {
+                "type": "ready",
+                "schema_version": 1,
+                "context": self.context,
+                "candidates": self.candidates,
+                "bootstrap": {
+                    "candidate_index": 0,
+                    "fe_orientation_index": 0,
+                    "pb_orientation_index": 0,
+                },
+            }
+        )
 
-    def request(self, request: dict[str, object]) -> dict[str, object]:
-        """Return a record for exactly the supplied action."""
-        if request.get("type") == "refine":
-            self.refinement_requests.append(dict(request))
-            return {"type": "candidates", "candidates": self.candidates}
-        self.requests.append(dict(request))
+    def handshake(self) -> AdaptiveReadyEvent:
+        """Return the typed handshake through the concise client API."""
+        return self.read_ready_event()
+
+    def request_refinement(
+        self,
+        request: AdaptiveRefineRequest,
+    ) -> AdaptiveCandidatesEvent:
+        """Return typed candidates for one typed refinement request."""
+        assert isinstance(request, AdaptiveRefineRequest)
+        self.refinement_requests.append(request.to_payload())
+        return AdaptiveCandidatesEvent.from_payload(
+            {"type": "candidates", "candidates": self.candidates}
+        )
+
+    def refine_candidates(
+        self,
+        request: AdaptiveRefineRequest,
+    ) -> AdaptiveCandidatesEvent:
+        """Return refined candidates through the concise client API."""
+        return self.request_refinement(request)
+
+    def request_step(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Return a typed record for exactly the supplied typed action."""
+        assert isinstance(request, AdaptiveStepRequest)
+        payload = request.to_payload()
+        self.requests.append(payload)
+        self.lifecycle_events.append("record")
         step_id = len(self.requests) - 1
-        return {
-            "type": "record",
-            "record": _record_payload(
-                step_id,
-                int(request["station_id"]),
-                station_complete=bool(request["station_complete"]),
-            ),
-            "candidates": self.candidates,
-        }
+        return AdaptiveRecordEvent.from_payload(
+            {
+                "type": "record",
+                "record": _record_payload(
+                    step_id,
+                    request.station_id,
+                    station_complete=request.station_complete,
+                ),
+                "candidates": self.candidates,
+            }
+        )
+
+    def acquire(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Return one record through the concise client API."""
+        return self.request_step(request)
 
     def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
-        """Return display-only private truth outside estimator events."""
+        """Fail if the estimator-owned controller requests realized truth."""
         self.cui_overlay_requests.append(include_truth)
-        return {
-            "type": "cui_overlay",
-            "schema_version": 1,
-            "truth": {
-                "schema_version": 1,
-                "semantics": "evaluation_cui_overlay_only_not_estimator_input",
-                "true_sources": {
-                    "Co-60": [[1.0, 1.0, 0.0]],
-                    "Cs-137": [],
-                    "Eu-154": [],
-                },
-                "true_strengths": {
-                    "Co-60": [1000.0],
-                    "Cs-137": [],
-                    "Eu-154": [],
-                },
-            },
-        }
+        self.lifecycle_events.append("cui_overlay")
+        raise AssertionError("MLE closed loop must not request a truth overlay.")
 
-    def finalize(self) -> dict[str, object]:
-        """Return the final immutable log location."""
-        return {
-            "type": "published",
-            "path": "/tmp/adaptive-log",
-            "record_count": len(self.requests),
-        }
+    def finalize_event(self) -> AdaptivePublishedEvent:
+        """Return the typed final immutable log location."""
+        self.lifecycle_events.append("finalize")
+        return AdaptivePublishedEvent(
+            path="/tmp/adaptive-log",
+            record_count=len(self.requests),
+        )
 
-    def abort(self) -> None:
-        """Provide the client cleanup surface."""
+    def finalize_log(self) -> AdaptivePublishedEvent:
+        """Publish the log and close the fake client session."""
+        event = self.finalize_event()
+        self.closed = True
+        return event
+
+    def terminate(self) -> None:
+        """Record bounded cleanup of an incomplete fake client session."""
+        if not self.closed:
+            self.lifecycle_events.append("terminate")
+            self.closed = True
+
+    def __enter__(self) -> _FakeRuntimeClient:
+        """Return this fake under deterministic context ownership."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        """Terminate this fake when it has not already finalized."""
+        del exc_type, exc, traceback
+        self.terminate()
 
 
 class _FakeResumeRuntimeClient(_FakeRuntimeClient):
     """Return a one-station prefix before accepting continued acquisition."""
 
-    def read_event(self) -> dict[str, object]:
-        """Return one schema-v2 resumed runtime event."""
+    def read_ready_event(self) -> AdaptiveReadyEvent:
+        """Return one typed schema-v2 resumed runtime event."""
         prefix = _record_payload(0, 0, station_complete=True)
-        return {
-            "type": "ready",
-            "schema_version": 2,
-            "context": self.context,
-            "candidates": self.candidates,
-            "resume": {
-                "record_count": 1,
-                "records": [prefix],
-                "next_station_id": 1,
-            },
-        }
+        return AdaptiveReadyEvent.from_payload(
+            {
+                "type": "ready",
+                "schema_version": 2,
+                "context": self.context,
+                "candidates": self.candidates,
+                "resume": {
+                    "record_count": 1,
+                    "records": [prefix],
+                    "next_station_id": 1,
+                },
+            }
+        )
 
-    def request(self, request: dict[str, object]) -> dict[str, object]:
-        """Continue record identifiers after the resumed prefix."""
-        if request.get("type") == "refine":
-            return super().request(request)
-        self.requests.append(dict(request))
+    def request_step(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Continue typed record identifiers after the resumed prefix."""
+        assert isinstance(request, AdaptiveStepRequest)
+        self.requests.append(request.to_payload())
         step_id = len(self.requests)
-        return {
-            "type": "record",
-            "record": _record_payload(
-                step_id,
-                int(request["station_id"]),
-                station_complete=bool(request["station_complete"]),
-            ),
-            "candidates": self.candidates,
-        }
+        return AdaptiveRecordEvent.from_payload(
+            {
+                "type": "record",
+                "record": _record_payload(
+                    step_id,
+                    request.station_id,
+                    station_complete=request.station_complete,
+                ),
+                "candidates": self.candidates,
+            }
+        )
 
-    def finalize(self) -> dict[str, object]:
-        """Return a published count including the resumed prefix."""
-        return {
-            "type": "published",
-            "path": "/tmp/adaptive-log",
-            "record_count": 1 + len(self.requests),
-        }
+    def finalize_event(self) -> AdaptivePublishedEvent:
+        """Return a typed published count including the resumed prefix."""
+        return AdaptivePublishedEvent(
+            path="/tmp/adaptive-log",
+            record_count=1 + len(self.requests),
+        )
+
+
+class _FailingRuntimeClient(_FakeRuntimeClient):
+    """Fail one acquisition to exercise context-owned bounded cleanup."""
+
+    def acquire(self, request: AdaptiveStepRequest) -> AdaptiveRecordEvent:
+        """Raise after recording that acquisition reached the runtime boundary."""
+        assert isinstance(request, AdaptiveStepRequest)
+        self.lifecycle_events.append("acquire-failed")
+        raise RuntimeError("injected adaptive acquisition failure")
 
 
 class _FakeOnlineSession:
     """Expose the online MLE operations used by the controller."""
 
-    last_dashboard_cui_overlay: object = None
+    last_init_kwargs: dict[str, object] = {}
     last_instance: _FakeOnlineSession | None = None
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         """Initialize record capture and a dashboard sentinel."""
         del args
-        self.dashboard_cui_overlay = kwargs.get("dashboard_cui_overlay")
-        type(self).last_dashboard_cui_overlay = self.dashboard_cui_overlay
+        type(self).last_init_kwargs = dict(kwargs)
         type(self).last_instance = self
         self.records: list[object] = []
         self.planning_calls: list[dict[str, object]] = []
-        self.dashboard_url = "http://127.0.0.1:8878/"
+        self.dashboard_url = "http://127.0.0.1:8877/index.html"
         self.bound_path: Path | None = None
 
     def receive_persisted(self, record: object, *, station_complete: bool) -> None:
@@ -576,10 +632,12 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     assert isinstance(result, RALClosedLoopResult)
     assert client is not None
     assert client.private_scene_profile == "ral-cs4-co3-eu0"
-    assert client.cui_overlay_requests == [True]
-    overlay = _FakeOnlineSession.last_dashboard_cui_overlay
-    assert isinstance(overlay, dict)
-    assert len(overlay["truth"]["true_sources"]["Co-60"]) == 1
+    assert client.cui_overlay_requests == []
+    assert client.lifecycle_events[-1:] == ["finalize"]
+    assert all(
+        "truth" not in key and "overlay" not in key
+        for key in _FakeOnlineSession.last_init_kwargs
+    )
     assert len(client.requests) == 2
     assert client.requests[0]["station_id"] == 0
     assert client.requests[1]["station_id"] == 1
@@ -587,21 +645,116 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     assert result.record_count == 2
     assert result.stop_reason == "maximum_measurement_safety_bound"
     assert any(
-        "Progress: phase=candidate_search completed=1/2 (50.0%)"
-        in line
+        "Progress: phase=candidate_search completed=1/2 (50.0%)" in line
         and "elapsed=3.0s eta=3.0s" in line
         for line in output_lines
     )
     solver_lines = [
-        line
-        for line in output_lines
-        if "phase=mle_solver_iterations:test" in line
+        line for line in output_lines if "phase=mle_solver_iterations:test" in line
     ]
-    assert [line.split("completed=", 1)[1].split(" ", 1)[0] for line in solver_lines] == [
+    assert [
+        line.split("completed=", 1)[1].split(" ", 1)[0] for line in solver_lines
+    ] == [
         "0/100",
         "40/100",
         "100/100",
     ]
+
+
+def test_closed_loop_context_terminates_an_incomplete_runtime(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """An acquisition exception must leave cleanup to the client context."""
+    from three_d_estimation import closed_loop
+
+    mle_path = tmp_path / "mle.json"
+    planning_path = tmp_path / "planning.json"
+    mle_path.write_text("{}\n", encoding="utf-8")
+    planning_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        closed_loop,
+        "AdaptiveRuntimeClient",
+        _FailingRuntimeClient,
+    )
+    monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
+    monkeypatch.setattr(
+        closed_loop.MLEConfig,
+        "load",
+        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
+    )
+    monkeypatch.setattr(
+        closed_loop.MLEPlanningConfig,
+        "load",
+        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
+    )
+
+    with pytest.raises(RuntimeError, match="injected adaptive acquisition failure"):
+        run_ral_closed_loop(
+            tmp_path / "private-scenario.json",
+            runtime_root=tmp_path,
+            mle_config_path=mle_path,
+            planning_config_path=planning_path,
+            output_dir=tmp_path / "output",
+            max_measurements=1,
+            output_hook=lambda line: None,
+        )
+
+    client = _FailingRuntimeClient.instance
+    assert client is not None
+    assert client.lifecycle_events == ["acquire-failed", "terminate"]
+
+
+def test_closed_loop_cui_remains_truth_free(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The estimator-owned CUI must never request or persist realized truth."""
+    from three_d_estimation import closed_loop
+
+    mle_path = tmp_path / "mle.json"
+    planning_path = tmp_path / "planning.json"
+    mle_path.write_text("{}\n", encoding="utf-8")
+    planning_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
+    monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
+    monkeypatch.setattr(
+        closed_loop.MLEConfig,
+        "load",
+        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
+    )
+    monkeypatch.setattr(
+        closed_loop.MLEPlanningConfig,
+        "load",
+        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
+    )
+    fake_log = SimpleNamespace(
+        path=Path("/tmp/adaptive-log"),
+        run_id="adaptive-test",
+        records=(SimpleNamespace(station_id=0),),
+    )
+    monkeypatch.setattr(
+        closed_loop, "validate_ral_measurement_log", lambda path: fake_log
+    )
+
+    run_ral_closed_loop(
+        tmp_path / "private-scenario.json",
+        runtime_root=tmp_path,
+        mle_config_path=mle_path,
+        planning_config_path=planning_path,
+        output_dir=tmp_path / "output",
+        max_measurements=1,
+        output_hook=lambda line: None,
+    )
+
+    client = _FakeRuntimeClient.instance
+    assert client is not None
+    assert client.cui_overlay_requests == []
+    assert all(
+        "truth" not in key and "overlay" not in key
+        for key in _FakeOnlineSession.last_init_kwargs
+    )
+    assert all("truth" not in request for request in client.requests)
 
 
 def test_closed_loop_replays_resume_prefix_then_plans_next_station(
@@ -624,9 +777,7 @@ def test_closed_loop_replays_resume_prefix_then_plans_next_station(
     monkeypatch.setattr(
         closed_loop.MLEConfig,
         "load",
-        lambda path: SimpleNamespace(
-            isotope_names=("Co-60", "Cs-137", "Eu-154")
-        ),
+        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
     )
     monkeypatch.setattr(
         closed_loop.MLEPlanningConfig,
@@ -685,9 +836,7 @@ def test_two_stage_closed_loop_screens_before_runtime_refinement(
     monkeypatch.setattr(
         closed_loop.MLEConfig,
         "load",
-        lambda path: SimpleNamespace(
-            isotope_names=("Co-60", "Cs-137", "Eu-154")
-        ),
+        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
     )
     monkeypatch.setattr(
         closed_loop.MLEPlanningConfig,
@@ -721,9 +870,7 @@ def test_two_stage_closed_loop_screens_before_runtime_refinement(
 
     client = _FakeRuntimeClient.instance
     assert client is not None
-    assert client.refinement_requests == [
-        {"type": "refine", "candidate_indices": [0]}
-    ]
+    assert client.refinement_requests == [{"type": "refine", "candidate_indices": [0]}]
     session = _FakeOnlineSession.last_instance
     assert session is not None
     session_calls = session.planning_calls

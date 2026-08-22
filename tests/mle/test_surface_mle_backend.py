@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from pathlib import Path
 from types import MappingProxyType
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -85,7 +86,7 @@ def _record(step_id: int, station_id: int) -> MeasurementRecord:
         step_id=step_id,
         action_id=step_id,
         station_id=station_id,
-        detector_pose_xyz=(0.5 + 0.1 * step_id, 0.5, 1.0),
+        detector_pose_xyz=(0.5 + 0.1 * station_id, 0.5, 1.0),
         detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
         fe_orientation_index=step_id % 4,
         pb_orientation_index=(step_id + 1) % 4,
@@ -191,7 +192,11 @@ class _RecordingEstimator:
 def _backend(recorder: _RecordingEstimator) -> SurfaceMLEBackend:
     """Return a spectral adapter using the deterministic recording estimator."""
     config = MLEConfig(mode="spectral", isotope_names=("Cs-137",))
-    return SurfaceMLEBackend(config, estimator_factory=lambda _config: recorder)
+    return SurfaceMLEBackend(
+        config,
+        estimator_factory=lambda _config: recorder,
+        run_root=Path.cwd(),
+    )
 
 
 def _initialize_with_test_kernel(
@@ -199,19 +204,39 @@ def _initialize_with_test_kernel(
     context: RunContext,
 ) -> None:
     """Initialize the adapter without constructing the production physics kernel."""
-    kernel = ContinuousKernel(use_gpu=False)
-    with (
-        patch(
-            "three_d_estimation.estimator_backend.build_runtime_observation_model",
-            return_value=object(),
-        ),
-        patch(
-            "three_d_estimation.estimator_backend."
-            "continuous_kernel_from_observation_model",
-            return_value=kernel,
-        ),
-    ):
+    kernel = ContinuousKernel(
+        use_gpu=bool(backend.config.use_gpu),
+        gpu_device=str(backend.config.gpu_device),
+        gpu_dtype=str(backend.config.gpu_dtype),
+    )
+    environment = EnvironmentConfig(
+        size_x=context.environment["size_x"],
+        size_y=context.environment["size_y"],
+        size_z=context.environment["size_z"],
+        detector_position=context.environment["detector_position"],
+    )
+    raw_grid = context.environment.get("obstacle_grid")
+    obstacle_grid = (
+        None
+        if raw_grid is None
+        else ObstacleGrid.from_dict(dict(raw_grid))
+    )
+    resolved = Mock()
+    resolved.environment = environment
+    resolved.obstacle_grid = obstacle_grid
+    resolved.build_continuous_kernel.return_value = kernel
+    with patch(
+        "three_d_estimation.estimator_backend."
+        "ResolvedForwardContext.from_run_context",
+        return_value=resolved,
+    ) as resolver:
         backend.initialize(context)
+    resolver.assert_called_once_with(context, run_root=backend._run_root)
+    resolved.build_continuous_kernel.assert_called_once_with(
+        use_gpu=bool(backend.config.use_gpu),
+        gpu_device=str(backend.config.gpu_device),
+        gpu_dtype=str(backend.config.gpu_dtype),
+    )
 
 
 class SurfaceMLEBackendTests(unittest.TestCase):
@@ -231,13 +256,13 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         self.assertEqual(empty.step_id, -1)
         self.assertEqual(empty.diagnostics["fit_kind"], "not_fitted")
 
-        first = _record(0, 7)
-        second = _record(1, 7)
+        first = _record(0, 0)
+        second = _record(1, 0)
         backend.update(first)
         self.assertEqual(recorder.measurement_counts, [])
         backend.update(second)
         self.assertEqual(recorder.measurement_counts, [])
-        backend.on_station_complete(7, (first, second))
+        backend.on_station_complete(0, (first, second))
 
         self.assertEqual(recorder.measurement_counts, [2])
         environment = recorder.environments[0]
@@ -253,7 +278,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         self.assertEqual(warm.diagnostics["fit_kind"], "station_warm")
         np.testing.assert_array_equal(warm.predicted_spectrum, [2.0, 3.0])
 
-        third = _record(2, 8)
+        third = _record(2, 1)
         backend.update(third)
         stale = backend.snapshot()
         self.assertEqual(stale.step_id, 1)
@@ -284,11 +309,12 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         backend = SurfaceMLEBackend(
             config,
             estimator_factory=lambda _config: recorder,
+            run_root=Path.cwd(),
         )
         _initialize_with_test_kernel(backend, _context())
-        record = _record(0, 4)
+        record = _record(0, 0)
         backend.update(record)
-        backend.on_station_complete(4, (record,))
+        backend.on_station_complete(0, (record,))
         station_estimate = backend.latest_estimate
 
         backend.finalize()
@@ -315,7 +341,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
         _initialize_with_test_kernel(backend, _context())
-        record = _record(0, 4)
+        record = _record(0, 0)
         backend.update(record)
         result = backend.finalize()
         snapshot = result.final_snapshot
@@ -340,9 +366,9 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
         _initialize_with_test_kernel(backend, _context())
-        record = _record(0, 4)
+        record = _record(0, 0)
         backend.update(record)
-        backend.on_station_complete(4, (record,))
+        backend.on_station_complete(0, (record,))
         action = MLEPlanningAction(
             candidate_index=0,
             detector_pose_xyz=(1.0, 1.0, 1.0),
@@ -383,34 +409,40 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
         _initialize_with_test_kernel(backend, _context())
-        record = _record(0, 9)
+        record = _record(0, 0)
         backend.update(record)
 
         with self.assertRaisesRegex(ValueError, "buffered history suffix"):
-            backend.on_station_complete(9, (replace(record),))
-        backend.on_station_complete(9, (record,))
+            backend.on_station_complete(0, (replace(record),))
+        backend.on_station_complete(0, (record,))
         with self.assertRaisesRegex(RuntimeError, "No new measurements"):
-            backend.on_station_complete(9, (record,))
+            backend.on_station_complete(0, (record,))
 
     def test_invalid_runtime_inputs_fail_before_any_fit(self) -> None:
         """The adapter should reject external paths, duplicates, and empty history."""
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
         with self.assertRaisesRegex(ValueError, "requires the shared runtime"):
-            _initialize_with_test_kernel(
-                backend,
-                _context(
-                    obstacle_layout_path="/tmp/external-obstacles.json",
-                    embedded_obstacle=False,
+            with patch(
+                "three_d_estimation.estimator_backend."
+                "ResolvedForwardContext.from_run_context",
+                side_effect=ValueError(
+                    "Forward context requires the shared runtime asset root."
                 ),
-            )
+            ):
+                backend.initialize(
+                    _context(
+                        obstacle_layout_path="/tmp/external-obstacles.json",
+                        embedded_obstacle=False,
+                    )
+                )
         self.assertEqual(recorder.measurement_counts, [])
 
         backend = _backend(recorder)
         _initialize_with_test_kernel(backend, _context())
         with self.assertRaisesRegex(RuntimeError, "no measurements"):
             backend.finalize()
-        record = _record(0, 1)
+        record = _record(0, 0)
         backend.update(record)
         with self.assertRaisesRegex(ValueError, "Duplicate finalized step_id"):
             backend.update(record)
@@ -418,6 +450,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         count_backend = SurfaceMLEBackend(
             MLEConfig(mode="count", isotope_names=("Cs-137",)),
             estimator_factory=lambda _config: recorder,
+            run_root=Path.cwd(),
         )
         with self.assertRaisesRegex(ValueError, "response_poisson"):
             _initialize_with_test_kernel(

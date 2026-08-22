@@ -8,7 +8,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
+from runtime import CUIScene
+from runtime.prefix import measurement_records_digest
 from runtime.records import MeasurementRecord, RunContext
+from three_d_estimation import online as online_module
 from three_d_estimation.backend_contracts import EstimatorResult, EstimatorSnapshot
 from three_d_estimation.cli import build_argument_parser
 from three_d_estimation.config import MLEConfig
@@ -16,6 +21,10 @@ from three_d_estimation.information_planner import (
     MLEPlanningAction,
     MLEPlanningConfig,
     MLEPlanningResult,
+)
+from three_d_estimation.lineage import (
+    covered_records_lineage,
+    validate_covered_records_lineage,
 )
 from three_d_estimation.online import (
     ONLINE_STATE_FILENAME,
@@ -43,6 +52,15 @@ def _context() -> RunContext:
         source_rate_semantics={},
         forward_model_manifest={},
         runtime_config_sha256="b" * 64,
+    )
+
+
+def _dashboard_scene() -> CUIScene:
+    """Return one explicit fake CUI scene without resolving runtime assets."""
+    return CUIScene(
+        bounds_min_xyz=np.zeros(3, dtype=np.float64),
+        bounds_max_xyz=np.asarray([2.0, 2.0, 1.5], dtype=np.float64),
+        obstacle_boxes_xyz=np.zeros((0, 6), dtype=np.float64),
     )
 
 
@@ -80,7 +98,7 @@ def _record(
 
 
 def test_dashboard_trajectory_preserves_runtime_route_and_station_visits() -> None:
-    """The MLE CUI must use runtime waypoints instead of obstacle-crossing chords."""
+    """Shared routes must retain waypoints and same-pose station identities."""
     segment = [
         [0.5, 0.5, 1.0],
         [0.5, 1.5, 0.25],
@@ -102,24 +120,66 @@ def test_dashboard_trajectory_preserves_runtime_route_and_station_visits() -> No
             station_complete=True,
             detector_pose_xyz=(1.5, 2.5, 1.0),
         ),
+        _record(
+            3,
+            2,
+            station_complete=True,
+            detector_pose_xyz=(1.5, 2.5, 1.0),
+        ),
     )
 
     payload = _dashboard_trajectory(records)
+    redraw_payload = _dashboard_trajectory(records)
 
     assert payload["travel_path_segments_xyz"] == [segment]
     assert payload["measurement_stations"] == [
         {
             "station_id": 0,
+            "step_id": 0,
             "position_xyz": [0.5, 0.5, 1.0],
             "visit_count": 1,
         },
         {
             "station_id": 1,
+            "step_id": 1,
             "position_xyz": [1.5, 2.5, 1.0],
             "visit_count": 2,
         },
+        {
+            "station_id": 2,
+            "step_id": 3,
+            "position_xyz": [1.5, 2.5, 1.0],
+            "visit_count": 1,
+        },
     ]
     assert payload["current_detector_position_xyz"] == [1.5, 2.5, 1.0]
+    assert payload["latest_spectrum_counts"] == [4, 2]
+    assert redraw_payload["measurement_stations"] == payload["measurement_stations"]
+
+
+@pytest.mark.parametrize("tampering", ["missing-primary", "algorithm", "alias"])
+def test_active_lineage_rejects_legacy_or_disagreeing_digest_fields(
+    tampering: str,
+) -> None:
+    """Active v2 lineage must never self-downgrade to an unbound SHA alias."""
+    records = (_record(0, 0, station_complete=True),)
+    payload = covered_records_lineage(records)
+    if tampering == "missing-primary":
+        payload.pop("covered_records_digest")
+    elif tampering == "algorithm":
+        payload["covered_records_digest"] = {
+            "algorithm": "legacy.measurement-records-v1+sha256",
+            "sha256": payload["covered_records_sha256"],
+        }
+    else:
+        payload["covered_records_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="covered_records"):
+        validate_covered_records_lineage(
+            payload,
+            records,
+            location="test lineage",
+        )
 
 
 def _patch() -> SurfacePatch:
@@ -249,16 +309,7 @@ def test_online_session_publishes_each_causal_station_and_final_report(
         output_dir=output_dir,
         backend=_FakeOnlineBackend(),
         measurement_log_sha256="d" * 64,
-        dashboard_cui_overlay={
-            "type": "cui_overlay",
-            "schema_version": 1,
-            "truth": {
-                "schema_version": 1,
-                "semantics": "evaluation_cui_overlay_only_not_estimator_input",
-                "true_sources": {"Cs-137": [[0.5, 0.5, 0.0]]},
-                "true_strengths": {"Cs-137": [1200.0]},
-            },
-        },
+        dashboard_scene=_dashboard_scene(),
     )
 
     assert session.receive_persisted(_record(0, 0, station_complete=False)) is None
@@ -279,7 +330,15 @@ def test_online_session_publishes_each_causal_station_and_final_report(
     ]
     first = load_mle_estimate(completed.station_reports[0].report_paths.output_dir)
     final = load_mle_estimate(completed.final_report_paths.output_dir)
+    assert first.diagnostics["online_lineage"]["schema_version"] == 2
     assert first.diagnostics["online_lineage"]["covered_step_ids"] == [0, 1]
+    first_digest = measurement_records_digest(session.records[:2])
+    assert first.diagnostics["online_lineage"]["covered_records_digest"] == (
+        first_digest.to_payload()
+    )
+    assert first.diagnostics["online_lineage"]["covered_records_sha256"] == (
+        first_digest.sha256
+    )
     assert first.diagnostics["provenance"]["measurement_log_sha256"] is None
     assert final.diagnostics["online_lineage"]["covered_step_ids"] == [0, 1, 2]
     assert final.diagnostics["provenance"]["measurement_log_sha256"] == "d" * 64
@@ -290,16 +349,36 @@ def test_online_session_publishes_each_causal_station_and_final_report(
     )
     assert state["status"] == "finalized"
     assert state["record_count"] == 3
+    final_digest = measurement_records_digest(session.records)
+    assert state["covered_records_digest"] == final_digest.to_payload()
+    assert state["covered_records_sha256"] == final_digest.sha256
+    assert state["station_reports"][0]["covered_records_digest"] == (
+        first_digest.to_payload()
+    )
+    assert state["station_reports"][0]["covered_records_sha256"] == (
+        first_digest.sha256
+    )
     assert state["final_report_dir"] == "final"
     assert (output_dir / "index.html").is_file()
     assert dashboard["status"] == "finalized"
     assert dashboard["record_count"] == 3
     assert dashboard["latest_observed_spectrum_counts"] == [3, 2]
     assert dashboard["energy_bin_edges_keV"] == [0.0, 400.0, 800.0]
+    assert [station["station_id"] for station in dashboard["measurement_stations"]] == [
+        0,
+        1,
+    ]
+    assert [
+        station["visit_count"] for station in dashboard["measurement_stations"]
+    ] == [2, 1]
+    assert (
+        dashboard["measurement_stations"][0]["position_xyz"]
+        == dashboard["measurement_stations"][1]["position_xyz"]
+    )
     assert dashboard["density_by_isotope"]["Cs-137"] == [3.0]
     assert dashboard["detector_positions_xyz"] == []
     assert dashboard["planning"]["selected_action"]["shield_pair_ids"] == [3]
-    assert dashboard["cui"]["truth"]["true_sources"]["Cs-137"] == [[0.5, 0.5, 0.0]]
+    assert "truth" not in json.dumps(dashboard, sort_keys=True).lower()
     assert "truth" not in state
     assert "cui" not in state
     planning_path = output_dir / "planning" / "after_step_00000002.json"
@@ -307,6 +386,10 @@ def test_online_session_publishes_each_causal_station_and_final_report(
     planning = json.loads(planning_path.read_text(encoding="utf-8"))
     assert planning["diagnostics"]["data_cutoff_step"] == 2
     assert planning["diagnostics"]["covered_step_ids"] == [0, 1, 2]
+    assert planning["diagnostics"]["covered_records_digest"] == (
+        final_digest.to_payload()
+    )
+    assert planning["diagnostics"]["covered_records_sha256"] == final_digest.sha256
     assert planning["selected_action"]["measurement_program"] == [
         {
             "fe_orientation_index": 0,
@@ -332,6 +415,7 @@ def test_online_session_rejects_station_marker_disagreement(
         config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
         output_dir=tmp_path / "online",
         backend=_FakeOnlineBackend(),
+        dashboard_scene=_dashboard_scene(),
     )
 
     with pytest.raises(ValueError, match="disagrees"):
@@ -339,6 +423,96 @@ def test_online_session_rejects_station_marker_disagreement(
             _record(0, 0, station_complete=True),
             station_complete=False,
         )
+
+
+def test_online_session_exposes_no_truth_overlay_channel(
+    tmp_path: Path,
+) -> None:
+    """Estimator-owned session and dashboard APIs must have no truth channel."""
+    output_dir = tmp_path / "online"
+    session = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=output_dir,
+        backend=_FakeOnlineBackend(),
+        measurement_log_sha256="d" * 64,
+        dashboard_scene=_dashboard_scene(),
+    )
+    assert not hasattr(session, "set_dashboard_cui_overlay")
+    assert session.dashboard is not None
+    assert not hasattr(session.dashboard, "set_cui_overlay")
+
+    session.receive_persisted(_record(0, 0, station_complete=True))
+    session.finalize()
+    final_dashboard = json.loads((output_dir / "dashboard_data.json").read_text())
+    state = json.loads((output_dir / ONLINE_STATE_FILENAME).read_text())
+
+    assert final_dashboard["status"] == "finalized"
+    assert "truth" not in json.dumps(final_dashboard, sort_keys=True).lower()
+    assert "truth" not in json.dumps(state, sort_keys=True).lower()
+
+
+def test_online_dashboard_uses_runtime_resolved_file_obstacle_scene(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Production scene construction must consume the resolved runtime obstacle."""
+    obstacle_path = tmp_path / "obstacles.json"
+    obstacle_path.write_text("{}\n", encoding="utf-8")
+    environment = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=3.0)
+    obstacle_grid = ObstacleGrid.from_dict(
+        {
+            "version": 1,
+            "cell_size": 0.5,
+            "origin": [0.25, 1.5],
+            "grid_shape": [10, 12],
+            "blocked_cells": [[6, 3]],
+            "blocked_fraction": 1.0 / 120.0,
+        }
+    )
+
+    class FakeResolvedForwardContext:
+        """Return the already loaded file-backed runtime scene inputs."""
+
+        @classmethod
+        def from_run_context(
+            cls,
+            context: RunContext,
+            *,
+            run_root: str | Path,
+        ) -> object:
+            """Verify the asset root and expose resolved geometry."""
+            del cls
+            assert context.run_id == "online-test"
+            assert Path(run_root) == tmp_path
+            return type(
+                "Resolved",
+                (),
+                {
+                    "environment": environment,
+                    "obstacle_grid": obstacle_grid,
+                    "resolved_obstacle_path": obstacle_path,
+                },
+            )()
+
+    monkeypatch.setattr(
+        online_module,
+        "ResolvedForwardContext",
+        FakeResolvedForwardContext,
+    )
+    session = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "online",
+        run_root=tmp_path,
+        backend=_FakeOnlineBackend(),
+    )
+
+    assert session.dashboard is not None
+    np.testing.assert_array_equal(
+        session.dashboard.scene.obstacle_boxes_xyz,
+        [[3.25, 3.0, 0.0, 3.75, 3.5, 2.0]],
+    )
 
 
 def test_online_cli_serves_dashboard_by_default() -> None:
@@ -350,5 +524,16 @@ def test_online_cli_serves_dashboard_by_default() -> None:
     assert args.no_dashboard is False
     assert args.no_serve is False
     assert args.dashboard_host == "0.0.0.0"
-    assert args.dashboard_port == 8878
+    assert args.dashboard_port == 8877
     assert args.dashboard_public_host is None
+
+    with pytest.raises(SystemExit):
+        build_argument_parser().parse_args(
+            [
+                "ral-full-simulation",
+                "--run-dir",
+                "/tmp/runtime-log",
+                "--cui-truth-display-mode",
+                "hidden",
+            ]
+        )

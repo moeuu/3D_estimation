@@ -14,13 +14,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from runtime.measurement_log import MeasurementLog
+from runtime.prefix import measurement_records_digest
 from runtime.records import (
     canonical_json_bytes,
     validate_truth_free_estimator_input,
 )
 
 from .config import MLEConfig
-from runtime.prefix import measurement_records_sha256
+from .lineage import validate_covered_records_lineage
 from .observation_batch import subset_observation_batch
 from .replay import ReplayContext, prepare_replay, validate_warm_start_artifact
 from .reporting import mle_report_sha256
@@ -40,6 +41,7 @@ _SNAPSHOT_FIELDS = {
     "covered_step_ids",
     "source_run_id",
     "prefix_measurement_log_sha256",
+    "covered_records_digest",
     "covered_records_sha256",
     "covered_station_boundaries_sha256",
     "mle_result_sha256",
@@ -468,9 +470,12 @@ def _validate_snapshot(
         raise ValueError("MLESnapshot cutoff is not station-complete.")
     if snapshot.get("source_run_id") != log.context.run_id:
         raise ValueError("MLESnapshot source_run_id is incompatible.")
-    records_digest = measurement_records_sha256(log.records[: len(covered_steps)])
-    if snapshot.get("covered_records_sha256") != records_digest:
-        raise ValueError("MLESnapshot covered-record lineage is incompatible.")
+    covered_records = log.records[: len(covered_steps)]
+    records_digest = validate_covered_records_lineage(
+        snapshot,
+        covered_records,
+        location="MLESnapshot",
+    )
     boundary_digest = covered_station_boundaries_sha256(log, cutoff_step=cutoff_step)
     if snapshot.get("covered_station_boundaries_sha256") != boundary_digest:
         raise ValueError("MLESnapshot station-boundary lineage is incompatible.")
@@ -511,12 +516,19 @@ def _validate_snapshot(
         raise ValueError("MLESnapshot prefix MeasurementLog binding is incompatible.")
     report_lineage = estimate.diagnostics.get("causal_lineage")
     if not isinstance(report_lineage, Mapping) or (
-        report_lineage.get("covered_step_ids") != list(covered_steps)
+        report_lineage.get("schema_version") != 2
+        or report_lineage.get("covered_step_ids") != list(covered_steps)
         or report_lineage.get("data_cutoff_step") != cutoff_step
         or report_lineage.get("data_cutoff_station") != cutoff_station
-        or report_lineage.get("covered_records_sha256") != records_digest
     ):
         raise ValueError("MLESnapshot cutoff differs from bound report lineage.")
+    report_records_digest = validate_covered_records_lineage(
+        report_lineage,
+        covered_records,
+        location="MLE report causal_lineage",
+    )
+    if report_records_digest != records_digest:
+        raise ValueError("MLESnapshot digest differs from bound report lineage.")
     _validate_snapshot_predictions(
         snapshot["predicted_observations"],
         estimate=estimate,
@@ -645,6 +657,7 @@ def score_future_count_candidates(
                 "cumulative_log_predictive_likelihood_ratio": float(np.sum(ratios)),
             }
         )
+    current_records_digest = measurement_records_digest(context.log.records)
     return {
         "schema_version": 1,
         "score_family": "frozen_count_snapshot_cluster_log_predictive_ratio",
@@ -666,9 +679,14 @@ def score_future_count_candidates(
                 "prefix_measurement_log_sha256"
             ],
             "current_measurement_log_sha256": context.log.content_sha256,
-            "current_covered_records_sha256": measurement_records_sha256(
-                context.log.records
-            ),
+            "snapshot_covered_records_digest": snapshot_payload[
+                "covered_records_digest"
+            ],
+            "snapshot_covered_records_sha256": snapshot_payload[
+                "covered_records_sha256"
+            ],
+            "current_covered_records_digest": current_records_digest.to_payload(),
+            "current_covered_records_sha256": current_records_digest.sha256,
             "snapshot_covered_station_boundaries_sha256": snapshot_payload[
                 "covered_station_boundaries_sha256"
             ],

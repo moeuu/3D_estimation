@@ -66,6 +66,34 @@ def _check_package_boundary() -> list[str]:
         or re.fullmatch(r"[0-9a-f]{40}", revision) is None
     ):
         return ["shared simulation runtime source must pin one Git commit"]
+    contract_dependencies = [
+        dependency
+        for dependency in dependencies
+        if dependency.startswith("radiation-estimator-service-contracts")
+    ]
+    if len(contract_dependencies) != 1 or "==" not in contract_dependencies[0]:
+        return ["estimator service contracts dependency must use an exact version"]
+    contract_source = (
+        payload.get("tool", {})
+        .get("uv", {})
+        .get("sources", {})
+        .get("radiation-estimator-service-contracts")
+    )
+    contract_revision = (
+        None if not isinstance(contract_source, dict) else contract_source.get("rev")
+    )
+    if (
+        not isinstance(contract_source, dict)
+        or not isinstance(contract_source.get("git"), str)
+        or not isinstance(contract_revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", contract_revision) is None
+    ):
+        return ["estimator service contracts source must pin one Git commit"]
+    service_script = payload.get("project", {}).get("scripts", {}).get(
+        "radiation-surface-mle-service"
+    )
+    if service_script != "three_d_estimation.service:main":
+        return ["dedicated surface-MLE service entry point is missing"]
     return []
 
 

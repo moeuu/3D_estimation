@@ -6,8 +6,12 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from runtime.measurement_log import MeasurementLog
-from runtime.records import MeasurementRecord
+from runtime.measurement_log import (
+    MeasurementLog,
+    MeasurementLogArrayView,
+    MeasurementLogView,
+)
+from runtime.records import MeasurementRecord, RunContext
 
 from .types import ObservationBatch
 
@@ -103,57 +107,69 @@ def _stack_isotope_covariances(
     return np.stack(matrices, axis=0)
 
 
+def _array_view_from_records(
+    records: tuple[MeasurementRecord, ...],
+    isotope_names: tuple[str, ...],
+    *,
+    context: RunContext,
+) -> MeasurementLogArrayView:
+    """Delegate canonical record packing to a shared pathless runtime view."""
+    if not isinstance(context, RunContext):
+        raise TypeError("context must be a RunContext.")
+    if tuple(context.isotopes) != isotope_names:
+        raise ValueError("RunContext isotopes must match isotope_names.")
+    return MeasurementLogView.from_records(context, records).array_view()
+
+
+def _observation_batch_from_array_view(
+    arrays: MeasurementLogArrayView,
+    records: tuple[MeasurementRecord, ...],
+    isotope_names: tuple[str, ...],
+) -> ObservationBatch:
+    """Attach MLE-derived fields to canonical shared-runtime record arrays."""
+    if arrays.record_count != len(records):
+        raise ValueError("MeasurementLog array rows must align with records.")
+    return ObservationBatch(
+        detector_positions_xyz=arrays.detector_pose_xyz,
+        detector_quaternions_wxyz=arrays.detector_quat_wxyz,
+        fe_indices=arrays.fe_orientation_index,
+        pb_indices=arrays.pb_orientation_index,
+        live_times_s=arrays.live_time_s,
+        spectrum_counts=arrays.spectrum_counts,
+        spectrum_variances=_stack_optional_spectrum_variances(records),
+        energy_bin_edges_keV=arrays.energy_bin_edges_keV,
+        isotope_counts=_stack_isotope_counts(records, isotope_names),
+        isotope_covariances=_stack_isotope_covariances(records, isotope_names),
+        station_ids=arrays.station_id,
+        isotope_names=isotope_names,
+        step_ids=arrays.step_id,
+        action_ids=arrays.action_id,
+        travel_times_s=arrays.travel_time_s,
+        shield_actuation_times_s=arrays.shield_actuation_time_s,
+        shield_program_block_ids=tuple(
+            _shield_program_block_id(record) for record in records
+        ),
+    )
+
+
 def observation_batch_from_records(
     records: Sequence[MeasurementRecord],
     isotope_names: Sequence[str],
+    *,
+    context: RunContext,
 ) -> ObservationBatch:
-    """Build one all-history batch from finalized estimator-independent records."""
+    """Build a batch through the shared runtime's canonical record array view."""
     rows = tuple(records)
     if not rows:
         raise ValueError("At least one MeasurementRecord is required.")
     if any(not isinstance(record, MeasurementRecord) for record in rows):
         raise TypeError("records must contain only MeasurementRecord objects.")
     names = tuple(str(value) for value in isotope_names)
-    first_edges = rows[0].energy_bin_edges_keV
-    if any(
-        not np.array_equal(record.energy_bin_edges_keV, first_edges)
-        for record in rows[1:]
-    ):
-        raise ValueError("All records must use identical energy-bin edges.")
-    return ObservationBatch(
-        detector_positions_xyz=np.asarray(
-            [record.detector_pose_xyz for record in rows], dtype=float
-        ),
-        detector_quaternions_wxyz=np.asarray(
-            [record.detector_quat_wxyz for record in rows], dtype=float
-        ),
-        fe_indices=np.asarray(
-            [record.fe_orientation_index for record in rows], dtype=np.int64
-        ),
-        pb_indices=np.asarray(
-            [record.pb_orientation_index for record in rows], dtype=np.int64
-        ),
-        live_times_s=np.asarray([record.live_time_s for record in rows], dtype=float),
-        spectrum_counts=np.vstack([record.spectrum_counts for record in rows]),
-        spectrum_variances=_stack_optional_spectrum_variances(rows),
-        energy_bin_edges_keV=np.asarray(first_edges, dtype=float),
-        isotope_counts=_stack_isotope_counts(rows, names),
-        isotope_covariances=_stack_isotope_covariances(rows, names),
-        station_ids=np.asarray([record.station_id for record in rows], dtype=np.int64),
-        isotope_names=names,
-        step_ids=np.asarray([record.step_id for record in rows], dtype=np.int64),
-        action_ids=np.asarray([record.action_id for record in rows], dtype=np.int64),
-        travel_times_s=np.asarray(
-            [record.travel_time_s for record in rows],
-            dtype=float,
-        ),
-        shield_actuation_times_s=np.asarray(
-            [record.shield_actuation_time_s for record in rows],
-            dtype=float,
-        ),
-        shield_program_block_ids=tuple(
-            _shield_program_block_id(record) for record in rows
-        ),
+    arrays = _array_view_from_records(rows, names, context=context)
+    return _observation_batch_from_array_view(
+        arrays,
+        rows,
+        names,
     )
 
 
@@ -161,7 +177,11 @@ def observation_batch_from_log(log: MeasurementLog) -> ObservationBatch:
     """Convert a loaded versioned measurement log into an MLE batch."""
     if not isinstance(log, MeasurementLog):
         raise TypeError("log must be a MeasurementLog.")
-    return observation_batch_from_records(log.records, log.context.isotopes)
+    rows = tuple(log.records)
+    if not rows:
+        raise ValueError("At least one MeasurementRecord is required.")
+    names = tuple(log.context.isotopes)
+    return _observation_batch_from_array_view(log.array_view(), rows, names)
 
 
 def subset_observation_batch(

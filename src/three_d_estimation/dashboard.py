@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
-import os
+from io import BytesIO
 from pathlib import Path
-import socket
-import subprocess
-import sys
 import threading
-import time
 from typing import Mapping
 
 import matplotlib
@@ -20,184 +14,74 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
+from runtime.artifacts import atomic_write_bytes
+from runtime.cui import (
+    CUIDashboardConfig,
+    CUIRoute,
+    CUIServerHandle,
+    cui_browser_url,
+    start_cui_server,
+)
+from runtime.cui_components import (
+    CUIScene,
+    pf_reference_panel_specs,
+    write_cui_index,
+)
+from runtime.defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_HOST,
+    DEFAULT_CUI_SPLIT_VIEW_PORT,
+)
 
 from .types import MLEEstimate
 
 
 DASHBOARD_DATA_FILENAME = "dashboard_data.json"
 DASHBOARD_INDEX_FILENAME = "index.html"
-DEFAULT_DASHBOARD_PORT = 8878
+DEFAULT_DASHBOARD_HOST = DEFAULT_CUI_SPLIT_VIEW_HOST
+DEFAULT_DASHBOARD_PORT = DEFAULT_CUI_SPLIT_VIEW_PORT
 OVERVIEW_IMAGE_FILENAME = "latest_experiment_overview.png"
 ROBOT_IMAGE_FILENAME = "latest_robot_2d.png"
 MLE_IMAGE_FILENAME = "latest_mle_3d.png"
+MLE_LABELED_IMAGE_FILENAME = "latest_mle_3d_labeled.png"
 SPECTRUM_IMAGE_FILENAME = "latest_spectrum.png"
 
-_HTTP_SERVERS: dict[tuple[str, int], ThreadingHTTPServer] = {}
-_HTTP_SERVER_ROOTS: dict[tuple[str, int], Path] = {}
-_HTTP_THREADS: list[threading.Thread] = []
-
-
-class _QuietHandler(SimpleHTTPRequestHandler):
-    """Serve static dashboard files without per-request terminal noise."""
-
-    def log_message(self, format: str, *args: object) -> None:
-        """Suppress the standard request log."""
-        del format, args
+_CUI_SERVER_HANDLES: dict[tuple[Path, str, int, str | None], CUIServerHandle] = {}
+_CUI_SERVER_LOCK = threading.Lock()
 
 
 def _write_bytes_atomic(path: Path, payload: bytes) -> None:
     """Durably replace one dashboard artifact."""
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        raise FileExistsError(f"Dashboard staging file exists: {temporary}")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def _tcp_port_is_open(host: str, port: int) -> bool:
-    """Return whether a local TCP endpoint is already accepting connections."""
-    connect_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
-    try:
-        with socket.create_connection((connect_host, port), timeout=0.2):
-            return True
-    except OSError:
-        return False
-
-
-def _default_public_host() -> str:
-    """Return a likely browser-reachable host for dashboard URLs."""
-    configured = os.environ.get(
-        "MLE_DASHBOARD_PUBLIC_HOST",
-        os.environ.get("CUI_SPLIT_VIEW_PUBLIC_HOST"),
-    )
-    if configured:
-        return configured
-    try:
-        output = subprocess.check_output(
-            ["hostname", "-I"],
-            text=True,
-            timeout=0.2,
-        )
-        candidates = [value for value in output.split() if value]
-        for candidate in candidates:
-            if candidate.startswith("100."):
-                return candidate
-        for candidate in candidates:
-            if not candidate.startswith(("127.", "172.")):
-                return candidate
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.settimeout(0.2)
-            probe.connect(("8.8.8.8", 80))
-            candidate = str(probe.getsockname()[0])
-            if candidate and not candidate.startswith("127."):
-                return candidate
-    except OSError:
-        pass
-    return "127.0.0.1"
-
-
-def _available_dashboard_port(host: str, requested_port: int) -> int:
-    """Return the first locally available dashboard port at or above a request."""
-    for candidate in range(int(requested_port), min(int(requested_port) + 100, 65536)):
-        if (host, candidate) not in _HTTP_SERVERS and not _tcp_port_is_open(
-            host, candidate
-        ):
-            return candidate
-    raise OSError(
-        f"No dashboard port is available in {requested_port}.."
-        f"{min(int(requested_port) + 99, 65535)}."
-    )
-
-
-def _dashboard_browser_url(public_host: str, port: int) -> str:
-    """Return one explicit browser URL, including IPv6 brackets and index path."""
-    display_host = str(public_host).strip()
-    if not display_host:
-        raise ValueError("Dashboard public host must be nonempty.")
-    if "://" in display_host or "/" in display_host:
-        raise ValueError("Dashboard public host must be a host name or IP address.")
-    if ":" in display_host and not display_host.startswith("["):
-        display_host = f"[{display_host}]"
-    return f"http://{display_host}:{int(port)}/index.html"
+    atomic_write_bytes(path, payload)
 
 
 def ensure_dashboard_server(
     output_dir: str | Path,
     *,
-    host: str = "0.0.0.0",
+    host: str = DEFAULT_DASHBOARD_HOST,
     port: int = DEFAULT_DASHBOARD_PORT,
     public_host: str | None = None,
 ) -> str:
-    """Start or reuse a persistent static server and return its browser URL."""
+    """Start or reuse the shared runtime CUI server and return its browser URL."""
     root = Path(output_dir).resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Dashboard output directory does not exist: {root}")
-    parsed_port = int(port)
-    if not 1 <= parsed_port <= 65535:
-        raise ValueError("Dashboard port must lie in 1..65535.")
-    display_host = (
-        _default_public_host()
-        if public_host is None and host in {"0.0.0.0", "::"}
-        else str(public_host or host)
+    config = CUIDashboardConfig(
+        host=host,
+        port=port,
+        public_host=public_host,
     )
-    requested_key = (host, parsed_port)
-    if requested_key in _HTTP_SERVERS and _HTTP_SERVER_ROOTS.get(requested_key) == root:
-        return _dashboard_browser_url(display_host, parsed_port)
-    selected_port = _available_dashboard_port(host, parsed_port)
-    url = _dashboard_browser_url(display_host, selected_port)
-    key = (host, selected_port)
-
-    log_path = root / f"dashboard_server_{selected_port}.log"
-    pid_path = root / f"dashboard_server_{selected_port}.pid"
-    try:
-        with log_path.open("ab") as log_handle:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "http.server",
-                    str(selected_port),
-                    "--bind",
-                    host,
-                    "--directory",
-                    root.as_posix(),
-                ],
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+    key = (root, config.host, config.port, config.public_host)
+    with _CUI_SERVER_LOCK:
+        handle = _CUI_SERVER_HANDLES.get(key)
+        if handle is None:
+            handle = start_cui_server(
+                root,
+                index_path=DASHBOARD_INDEX_FILENAME,
+                config=config,
             )
-        pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
-        for _ in range(20):
-            if _tcp_port_is_open(host, selected_port):
-                return url
-            if process.poll() is not None:
-                break
-            time.sleep(0.05)
-    except OSError:
-        pass
-
-    handler = partial(_QuietHandler, directory=root.as_posix())
-    server = ThreadingHTTPServer((host, selected_port), handler)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="online-mle-dashboard",
-        daemon=True,
-    )
-    thread.start()
-    _HTTP_SERVERS[key] = server
-    _HTTP_SERVER_ROOTS[key] = root
-    _HTTP_THREADS.append(thread)
-    return url
+            handle.persistent = True
+            _CUI_SERVER_HANDLES[key] = handle
+    if handle.url is None:
+        raise RuntimeError("Shared runtime did not start the MLE CUI server.")
+    return handle.url
 
 
 def _finite_float(value: object, *, fallback: float = 0.0) -> float:
@@ -248,13 +132,11 @@ _ISOTOPE_COLORS = {
 
 
 def _environment_bounds(
-    environment: Mapping[str, object],
+    scene: CUIScene,
     estimate: MLEEstimate | None,
 ) -> tuple[float, float, float]:
-    """Return positive xyz plotting bounds from runtime-owned scene metadata."""
-    x_max = _finite_float(environment.get("size_x"), fallback=0.0)
-    y_max = _finite_float(environment.get("size_y"), fallback=0.0)
-    z_max = _finite_float(environment.get("size_z"), fallback=0.0)
+    """Return positive xyz plotting bounds from the canonical runtime scene."""
+    x_max, y_max, z_max = map(float, scene.bounds_max_xyz)
     if estimate is not None:
         points = np.asarray(
             [patch.centroid_xyz for patch in estimate.patches],
@@ -268,30 +150,16 @@ def _environment_bounds(
 
 def _draw_obstacles(
     axis: object,
-    environment: Mapping[str, object],
+    scene: CUIScene,
 ) -> None:
-    """Draw the runtime-owned obstacle grid on one top-down Matplotlib axis."""
-    from matplotlib.patches import Rectangle
+    """Draw canonical runtime obstacle footprints on a top-down axis."""
+    from matplotlib.patches import Polygon
 
-    raw_grid = environment.get("obstacle_grid", {})
-    grid = raw_grid if isinstance(raw_grid, Mapping) else {}
-    cell_size = max(_finite_float(grid.get("cell_size"), fallback=1.0), 1.0e-9)
-    raw_origin = grid.get("origin", (0.0, 0.0))
-    origin = np.asarray(raw_origin, dtype=np.float64).reshape(-1)
-    if origin.size < 2:
-        origin = np.zeros(2, dtype=np.float64)
-    for raw_cell in grid.get("blocked_cells", []):
-        cell = np.asarray(raw_cell, dtype=np.float64).reshape(-1)
-        if cell.size < 2 or np.any(~np.isfinite(cell[:2])):
-            continue
+    for footprint in scene.obstacle_footprints_xy:
         axis.add_patch(
-            Rectangle(
-                (
-                    float(origin[0] + cell[0] * cell_size),
-                    float(origin[1] + cell[1] * cell_size),
-                ),
-                cell_size,
-                cell_size,
+            Polygon(
+                footprint,
+                closed=True,
                 facecolor="black",
                 edgecolor="none",
                 alpha=0.75,
@@ -302,32 +170,14 @@ def _draw_obstacles(
 
 def _draw_obstacles_3d(
     axis: object,
-    environment: Mapping[str, object],
+    scene: CUIScene,
 ) -> None:
-    """Draw runtime obstacle cells as flat floor patches on a 3-D axis."""
+    """Draw canonical runtime obstacles as flat floor patches on a 3-D axis."""
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    raw_grid = environment.get("obstacle_grid", {})
-    grid = raw_grid if isinstance(raw_grid, Mapping) else {}
-    cell_size = max(_finite_float(grid.get("cell_size"), fallback=1.0), 1.0e-9)
-    origin = np.asarray(grid.get("origin", (0.0, 0.0)), dtype=np.float64).reshape(-1)
-    if origin.size < 2:
-        origin = np.zeros(2, dtype=np.float64)
     patches: list[list[tuple[float, float, float]]] = []
-    for raw_cell in grid.get("blocked_cells", []):
-        cell = np.asarray(raw_cell, dtype=np.float64).reshape(-1)
-        if cell.size < 2 or np.any(~np.isfinite(cell[:2])):
-            continue
-        x0 = float(origin[0] + cell[0] * cell_size)
-        y0 = float(origin[1] + cell[1] * cell_size)
-        patches.append(
-            [
-                (x0, y0, 0.0),
-                (x0 + cell_size, y0, 0.0),
-                (x0 + cell_size, y0 + cell_size, 0.0),
-                (x0, y0 + cell_size, 0.0),
-            ]
-        )
+    for footprint in scene.obstacle_footprints_xy:
+        patches.append([(float(x), float(y), 0.0) for x, y in footprint])
     if patches:
         axis.add_collection3d(
             Poly3DCollection(
@@ -337,29 +187,6 @@ def _draw_obstacles_3d(
                 alpha=0.25,
             )
         )
-
-
-def _truth_arrays(
-    cui_overlay: Mapping[str, object] | None,
-    isotope: str,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return evaluation-only truth positions and strengths for one isotope."""
-    truth = None if cui_overlay is None else cui_overlay.get("truth")
-    if not isinstance(truth, Mapping):
-        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
-    sources = truth.get("true_sources", {})
-    strengths = truth.get("true_strengths", {})
-    raw_positions = sources.get(isotope, []) if isinstance(sources, Mapping) else []
-    raw_strengths = strengths.get(isotope, []) if isinstance(strengths, Mapping) else []
-    positions = np.asarray(raw_positions, dtype=np.float64)
-    if positions.size == 0:
-        positions = np.zeros((0, 3), dtype=np.float64)
-    elif positions.ndim != 2 or positions.shape[1] != 3:
-        positions = np.zeros((0, 3), dtype=np.float64)
-    values = np.asarray(raw_strengths, dtype=np.float64).reshape(-1)
-    if values.size != positions.shape[0]:
-        values = np.zeros(positions.shape[0], dtype=np.float64)
-    return positions, values
 
 
 def _hotspot_arrays(
@@ -383,66 +210,19 @@ def _hotspot_arrays(
     )
 
 
-def _xyz_rows(value: object) -> NDArray[np.float64]:
-    """Return finite xyz rows or an empty array for malformed display input."""
-    rows = np.asarray(value, dtype=np.float64)
-    if rows.size == 0:
-        return np.zeros((0, 3), dtype=np.float64)
-    if rows.ndim != 2 or rows.shape[1] != 3 or np.any(~np.isfinite(rows)):
-        return np.zeros((0, 3), dtype=np.float64)
-    return rows
-
-
-def _path_segments(payload: Mapping[str, object]) -> list[NDArray[np.float64]]:
-    """Return validated obstacle-aware runtime path segments."""
-    segments: list[NDArray[np.float64]] = []
-    raw_segments = payload.get("travel_path_segments_xyz", [])
-    if not isinstance(raw_segments, list):
-        return segments
-    for raw_segment in raw_segments:
-        segment = _xyz_rows(raw_segment)
-        if segment.shape[0] >= 2:
-            segments.append(segment)
-    return segments
-
-
 def _measurement_stations(
-    payload: Mapping[str, object],
+    route: CUIRoute,
 ) -> tuple[NDArray[np.float64], list[str]]:
-    """Return measurement positions and PF-style station visit labels."""
-    points: list[NDArray[np.float64]] = []
-    labels: list[str] = []
-    raw_stations = payload.get("measurement_stations", [])
-    if isinstance(raw_stations, list):
-        for index, raw_station in enumerate(raw_stations):
-            if not isinstance(raw_station, Mapping):
-                continue
-            point = np.asarray(raw_station.get("position_xyz", ()), dtype=np.float64)
-            if point.shape != (3,) or np.any(~np.isfinite(point)):
-                continue
-            visits = max(int(raw_station.get("visit_count", 1)), 1)
-            station_id = int(raw_station.get("station_id", index))
-            labels.append(str(station_id) if visits <= 1 else f"{station_id}({visits})")
-            points.append(point)
-    if points:
-        return np.vstack(points), labels
-
-    positions = _xyz_rows(payload.get("detector_positions_xyz", []))
-    if not positions.size:
-        return positions, []
-    unique_points: list[NDArray[np.float64]] = []
-    counts: list[int] = []
-    for point in positions:
-        if unique_points and float(np.linalg.norm(point - unique_points[-1])) <= 1.0e-6:
-            counts[-1] += 1
-        else:
-            unique_points.append(point.copy())
-            counts.append(1)
+    """Return canonical runtime station positions and PF-style visit labels."""
     labels = [
-        str(index) if count <= 1 else f"{index}({count})"
-        for index, count in enumerate(counts)
+        str(station_id) if visits <= 1 else f"{station_id}({visits})"
+        for station_id, visits in zip(
+            route.measurement_station_ids,
+            route.measurement_visit_counts,
+            strict=True,
+        )
     ]
-    return np.vstack(unique_points), labels
+    return route.measurement_stations_xyz, labels
 
 
 def _unique_path_waypoints(
@@ -468,7 +248,7 @@ def _unique_path_waypoints(
 
 def _draw_path(
     axis: object,
-    payload: Mapping[str, object],
+    route: CUIRoute,
     *,
     three_d: bool,
     show_station_labels: bool = False,
@@ -477,8 +257,8 @@ def _draw_path(
     """Draw the runtime route using the same visual contract as the PF CUI."""
     from matplotlib import patheffects
 
-    segments = _path_segments(payload)
-    stations, station_labels = _measurement_stations(payload)
+    segments = list(route.travel_path_segments_xyz)
+    stations, station_labels = _measurement_stations(route)
     for index, segment in enumerate(segments):
         coordinates = (
             (segment[:, 0], segment[:, 1], segment[:, 2])
@@ -542,10 +322,8 @@ def _draw_path(
                 text.set_path_effects(
                     [patheffects.withStroke(linewidth=1.8, foreground="white")]
                 )
-    current = np.asarray(
-        payload.get("current_detector_position_xyz", ()), dtype=np.float64
-    )
-    if current.shape != (3,) or np.any(~np.isfinite(current)):
+    current = route.current_detector_position_xyz
+    if current is None:
         current = stations[-1] if stations.size else np.zeros(0, dtype=np.float64)
     if current.size:
         coordinates = (
@@ -597,28 +375,129 @@ def _format_3d_axis(
 
 def _save_figure_atomic(figure: object, path: Path) -> None:
     """Atomically publish one Matplotlib PNG without partial browser reads."""
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    if temporary.exists():
-        raise FileExistsError(f"Dashboard image staging file exists: {temporary}")
     try:
-        figure.savefig(temporary, format="png", dpi=150, bbox_inches="tight")
-        os.replace(temporary, path)
+        buffer = BytesIO()
+        figure.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+        atomic_write_bytes(path, buffer.getvalue())
     finally:
         plt.close(figure)
-        if temporary.exists():
-            temporary.unlink()
+
+
+def _annotate_3d_sources(
+    axis: object,
+    positions: NDArray[np.float64],
+    labels: list[str],
+    *,
+    color: str,
+) -> None:
+    """Draw compact source identifiers beside 3-D points."""
+    for point, label in zip(positions, labels, strict=True):
+        axis.text(
+            float(point[0]),
+            float(point[1]),
+            float(point[2]),
+            label,
+            color=color,
+            fontsize=8,
+            fontweight="bold",
+        )
+
+
+def _build_mle_3d_figure(
+    estimate: MLEEstimate | None,
+    *,
+    isotopes: tuple[str, ...],
+    route: CUIRoute,
+    scene: CUIScene,
+    bounds: tuple[float, float, float],
+    progress: str,
+    labeled: bool,
+) -> object:
+    """Build one PF-aligned Surface MLE 3-D figure."""
+    figure = plt.figure(figsize=(14.2, 6.6))
+    density_axis = figure.add_subplot(1, 2, 1, projection="3d")
+    hotspot_axis = figure.add_subplot(1, 2, 2, projection="3d")
+    _draw_obstacles_3d(density_axis, scene)
+    _draw_obstacles_3d(hotspot_axis, scene)
+    _draw_path(density_axis, route, three_d=True)
+    _draw_path(
+        hotspot_axis,
+        route,
+        three_d=True,
+        show_legend_context=False,
+    )
+    if estimate is not None:
+        patch_points = np.asarray(
+            [patch.centroid_xyz for patch in estimate.patches], dtype=np.float64
+        )
+        for isotope_index, isotope in enumerate(isotopes):
+            if isotope_index >= estimate.density_by_isotope.shape[0]:
+                continue
+            color = _ISOTOPE_COLORS.get(isotope, "#9467bd")
+            density = np.asarray(
+                estimate.density_by_isotope[isotope_index], dtype=float
+            )
+            peak = max(float(np.max(density, initial=0.0)), 1.0e-12)
+            active = density > peak * 1.0e-4
+            if np.any(active):
+                density_axis.scatter(
+                    patch_points[active, 0],
+                    patch_points[active, 1],
+                    patch_points[active, 2],
+                    s=4.0 + 34.0 * np.sqrt(density[active] / peak),
+                    alpha=0.38,
+                    color=color,
+                    label=isotope,
+                )
+            hotspots, strengths = _hotspot_arrays(estimate, isotope)
+            if hotspots.size:
+                sizes = 90.0 + 120.0 * strengths / max(
+                    float(np.max(strengths)), 1.0e-12
+                )
+                hotspot_axis.scatter(
+                    hotspots[:, 0],
+                    hotspots[:, 1],
+                    hotspots[:, 2],
+                    marker="x",
+                    s=sizes,
+                    linewidths=2.5,
+                    color=color,
+                    label=f"MLE {isotope}",
+                )
+                if labeled:
+                    _annotate_3d_sources(
+                        hotspot_axis,
+                        hotspots,
+                        [
+                            f"{isotope} E{index + 1}"
+                            for index in range(hotspots.shape[0])
+                        ],
+                        color=color,
+                    )
+    for axis, title in (
+        (density_axis, "Surface-patch intensity"),
+        (hotspot_axis, "MLE hotspot centroids"),
+    ):
+        _format_3d_axis(axis, bounds=bounds, title=title)
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            axis.legend(handles, labels, fontsize=8)
+    label_suffix = " with source labels" if labeled else ""
+    figure.suptitle(f"Surface MLE 3D{label_suffix} - {progress}")
+    figure.tight_layout()
+    return figure
 
 
 def _render_dashboard_images(
     estimate: MLEEstimate | None,
     payload: Mapping[str, object],
-    environment: Mapping[str, object],
-    cui_overlay: Mapping[str, object] | None,
+    route: CUIRoute,
+    scene: CUIScene,
     output_dir: Path,
 ) -> None:
     """Render the PF-style scientific PNG set for the browser CUI."""
     isotopes = tuple(str(value) for value in payload.get("isotopes", []))
-    x_max, y_max, z_max = _environment_bounds(environment, estimate)
+    x_max, y_max, z_max = _environment_bounds(scene, estimate)
     progress = (
         f"records={int(payload.get('record_count', 0))} "
         f"station={payload.get('latest_station_id', '—')} "
@@ -631,31 +510,11 @@ def _render_dashboard_images(
     elevation_axis = overview.add_subplot(overview_grid[0, 1])
     info_axis = overview.add_subplot(overview_grid[1, 1])
     info_axis.axis("off")
-    _draw_obstacles(top_axis, environment)
-    _draw_path(top_axis, payload, three_d=False)
+    _draw_obstacles(top_axis, scene)
+    _draw_path(top_axis, route, three_d=False)
     for isotope in isotopes:
         color = _ISOTOPE_COLORS.get(isotope, "#9467bd")
-        truth_positions, _ = _truth_arrays(cui_overlay, isotope)
         hotspots, _ = _hotspot_arrays(estimate, isotope)
-        if truth_positions.size:
-            top_axis.scatter(
-                truth_positions[:, 0],
-                truth_positions[:, 1],
-                marker="*",
-                s=85,
-                color=color,
-                label=f"true {isotope}",
-                zorder=7,
-            )
-            elevation_axis.scatter(
-                truth_positions[:, 0],
-                truth_positions[:, 2],
-                marker="*",
-                s=85,
-                color=color,
-                label=f"true {isotope}",
-                zorder=7,
-            )
         if hotspots.size:
             top_axis.scatter(
                 hotspots[:, 0],
@@ -681,7 +540,7 @@ def _render_dashboard_images(
     elevation_axis.set(
         xlim=(0.0, x_max), ylim=(0.0, z_max), xlabel="x [m]", ylabel="z [m]"
     )
-    stations, _ = _measurement_stations(payload)
+    stations, _ = _measurement_stations(route)
     if stations.size:
         elevation_axis.scatter(
             stations[:, 0],
@@ -696,7 +555,7 @@ def _render_dashboard_images(
         )
     elevation_axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.45)
     elevation_axis.axhline(z_max, color="black", linewidth=0.8, alpha=0.25)
-    top_axis.set_title("Top-down map: obstacles, path, truth, and MLE")
+    top_axis.set_title("Top-down map: obstacles, path, and MLE")
     elevation_axis.set_title("Elevation projection: height ambiguity")
     for axis, x_limits, y_limits in (
         (top_axis, (0.0, x_max), (0.0, y_max)),
@@ -718,20 +577,18 @@ def _render_dashboard_images(
         )
     summary = payload.get("summary")
     summary_mapping = summary if isinstance(summary, Mapping) else {}
+    summary_lines = [
+        progress,
+        f"status: {payload.get('status', 'starting')}",
+        f"converged: {summary_mapping.get('converged', '—')}",
+        f"iterations: {summary_mapping.get('iterations', '—')}",
+        f"Poisson deviance: {summary_mapping.get('poisson_deviance', '—')}",
+        f"surface patches: {summary_mapping.get('patch_count', '—')}",
+    ]
     info_axis.text(
         0.0,
         0.02,
-        "\n".join(
-            (
-                progress,
-                f"status: {payload.get('status', 'starting')}",
-                f"converged: {summary_mapping.get('converged', '—')}",
-                f"iterations: {summary_mapping.get('iterations', '—')}",
-                f"Poisson deviance: {summary_mapping.get('poisson_deviance', '—')}",
-                f"surface patches: {summary_mapping.get('patch_count', '—')}",
-                "truth markers are evaluation overlay only",
-            )
-        ),
+        "\n".join(summary_lines),
         ha="left",
         va="bottom",
         fontsize=8,
@@ -748,28 +605,17 @@ def _render_dashboard_images(
     )
     _save_figure_atomic(overview, output_dir / OVERVIEW_IMAGE_FILENAME)
 
-    robot, robot_axis = plt.subplots(figsize=(8.4, 7.2))
-    _draw_obstacles(robot_axis, environment)
+    robot, robot_axis = plt.subplots(figsize=(7.0, 6.0))
+    _draw_obstacles(robot_axis, scene)
     _draw_path(
         robot_axis,
-        payload,
+        route,
         three_d=False,
         show_station_labels=True,
     )
     for isotope in isotopes:
         color = _ISOTOPE_COLORS.get(isotope, "#9467bd")
-        truth_positions, _ = _truth_arrays(cui_overlay, isotope)
         hotspots, _ = _hotspot_arrays(estimate, isotope)
-        if truth_positions.size:
-            robot_axis.scatter(
-                truth_positions[:, 0],
-                truth_positions[:, 1],
-                marker="*",
-                s=95,
-                color=color,
-                label=f"true {isotope}",
-                zorder=7,
-            )
         if hotspots.size:
             robot_axis.scatter(
                 hotspots[:, 0],
@@ -789,100 +635,48 @@ def _render_dashboard_images(
     )
     robot_axis.set_aspect("equal", adjustable="box")
     robot_axis.grid(alpha=0.25)
-    robot_axis.set_title(f"Robot 2D position — {progress}")
+    robot_axis.set_title(f"Robot 2D position - {progress}")
     handles, labels = robot_axis.get_legend_handles_labels()
     if handles:
         robot_axis.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.01, 1.0))
     robot.tight_layout()
     _save_figure_atomic(robot, output_dir / ROBOT_IMAGE_FILENAME)
 
-    mle_figure = plt.figure(figsize=(14.0, 6.2))
-    density_axis = mle_figure.add_subplot(1, 2, 1, projection="3d")
-    hotspot_axis = mle_figure.add_subplot(1, 2, 2, projection="3d")
-    _draw_obstacles_3d(density_axis, environment)
-    _draw_obstacles_3d(hotspot_axis, environment)
-    _draw_path(density_axis, payload, three_d=True)
-    _draw_path(
-        hotspot_axis,
-        payload,
-        three_d=True,
-        show_legend_context=False,
+    mle_figure = _build_mle_3d_figure(
+        estimate,
+        isotopes=isotopes,
+        route=route,
+        scene=scene,
+        bounds=(x_max, y_max, z_max),
+        progress=progress,
+        labeled=False,
     )
-    if estimate is not None:
-        patch_points = np.asarray(
-            [patch.centroid_xyz for patch in estimate.patches], dtype=np.float64
-        )
-        for isotope_index, isotope in enumerate(isotopes):
-            if isotope_index >= estimate.density_by_isotope.shape[0]:
-                continue
-            density = np.asarray(
-                estimate.density_by_isotope[isotope_index], dtype=float
-            )
-            peak = max(float(np.max(density, initial=0.0)), 1.0e-12)
-            active = density > peak * 1.0e-4
-            if np.any(active):
-                density_axis.scatter(
-                    patch_points[active, 0],
-                    patch_points[active, 1],
-                    patch_points[active, 2],
-                    s=4.0 + 34.0 * np.sqrt(density[active] / peak),
-                    alpha=0.38,
-                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
-                    label=isotope,
-                )
-            hotspots, strengths = _hotspot_arrays(estimate, isotope)
-            if hotspots.size:
-                sizes = 90.0 + 120.0 * strengths / max(
-                    float(np.max(strengths)), 1.0e-12
-                )
-                hotspot_axis.scatter(
-                    hotspots[:, 0],
-                    hotspots[:, 1],
-                    hotspots[:, 2],
-                    marker="x",
-                    s=sizes,
-                    linewidths=2.5,
-                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
-                    label=f"MLE {isotope}",
-                )
-    for isotope in isotopes:
-        truth_positions, _ = _truth_arrays(cui_overlay, isotope)
-        if truth_positions.size:
-            for axis in (density_axis, hotspot_axis):
-                axis.scatter(
-                    truth_positions[:, 0],
-                    truth_positions[:, 1],
-                    truth_positions[:, 2],
-                    marker="*",
-                    s=100,
-                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
-                    label=f"true {isotope}",
-                )
-    for axis, title in (
-        (density_axis, "Surface-patch intensity"),
-        (hotspot_axis, "MLE hotspot centroids"),
-    ):
-        _format_3d_axis(
-            axis,
-            bounds=(x_max, y_max, z_max),
-            title=title,
-        )
-        handles, labels = axis.get_legend_handles_labels()
-        if handles:
-            axis.legend(handles, labels, fontsize=8)
-    mle_figure.suptitle(f"Surface MLE 3D — {progress}")
-    mle_figure.tight_layout()
     _save_figure_atomic(mle_figure, output_dir / MLE_IMAGE_FILENAME)
+    mle_labeled_figure = _build_mle_3d_figure(
+        estimate,
+        isotopes=isotopes,
+        route=route,
+        scene=scene,
+        bounds=(x_max, y_max, z_max),
+        progress=progress,
+        labeled=True,
+    )
+    _save_figure_atomic(
+        mle_labeled_figure,
+        output_dir / MLE_LABELED_IMAGE_FILENAME,
+    )
 
-    spectrum, spectrum_axis = plt.subplots(figsize=(11.0, 4.8))
-    observed = np.asarray(
-        payload.get("latest_observed_spectrum_counts", []),
-        dtype=np.float64,
-    ).reshape(-1)
-    energy_edges = np.asarray(
-        payload.get("energy_bin_edges_keV", []),
-        dtype=np.float64,
-    ).reshape(-1)
+    spectrum, spectrum_axis = plt.subplots(figsize=(10.0, 4.8))
+    observed = (
+        np.zeros(0, dtype=np.float64)
+        if route.latest_spectrum_counts is None
+        else route.latest_spectrum_counts.astype(np.float64)
+    )
+    energy_edges = (
+        np.zeros(0, dtype=np.float64)
+        if route.energy_bin_edges_keV is None
+        else route.energy_bin_edges_keV
+    )
     energy_axis = (
         0.5 * (energy_edges[:-1] + energy_edges[1:])
         if energy_edges.size == observed.size + 1
@@ -933,7 +727,7 @@ def _render_dashboard_images(
             transform=spectrum_axis.transAxes,
         )
     spectrum_axis.grid(alpha=0.25)
-    spectrum_axis.set_title(f"Latest observed and predicted spectrum — {progress}")
+    spectrum_axis.set_title(f"Full spectrum - {progress}")
     spectrum.tight_layout()
     _save_figure_atomic(spectrum, output_dir / SPECTRUM_IMAGE_FILENAME)
 
@@ -942,13 +736,16 @@ def _dashboard_payload(
     estimate: MLEEstimate | None,
     state: Mapping[str, object],
     *,
+    route: CUIRoute | None = None,
     environment: Mapping[str, object] | None = None,
-    cui_overlay: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build the browser data contract with a display-only CUI overlay."""
-    truth = None if cui_overlay is None else cui_overlay.get("truth")
+    """Build the truth-free browser data contract."""
+    resolved_route = CUIRoute() if route is None else route
+    if not isinstance(resolved_route, CUIRoute):
+        raise TypeError("route must be a runtime CUIRoute.")
+    route_payload = resolved_route.to_payload()
     payload: dict[str, object] = {
-        "schema_version": 1,
+        **route_payload,
         "status": str(state.get("status", "starting")),
         "run_id": state.get("run_id"),
         "mode": state.get("mode"),
@@ -962,17 +759,14 @@ def _dashboard_payload(
         "patches": [],
         "density_by_isotope": {},
         "detector_positions_xyz": [],
-        "travel_path_segments_xyz": list(state.get("travel_path_segments_xyz", [])),
-        "measurement_stations": list(state.get("measurement_stations", [])),
-        "current_detector_position_xyz": state.get("current_detector_position_xyz"),
         "hotspots": [],
-        "latest_observed_spectrum_counts": list(
-            state.get("latest_observed_spectrum_counts", [])
+        "latest_observed_spectrum_counts": (
+            []
+            if resolved_route.latest_spectrum_counts is None
+            else resolved_route.latest_spectrum_counts.tolist()
         ),
-        "energy_bin_edges_keV": list(state.get("energy_bin_edges_keV", [])),
         "cui": {
             "environment": dict(environment or {}),
-            "truth": truth,
         },
     }
     if estimate is None:
@@ -1013,41 +807,60 @@ def _dashboard_payload(
 
 
 class OnlineMLEDashboard:
-    """Publish a self-refreshing estimator and private-CUI browser workspace."""
+    """Publish a self-refreshing truth-free estimator browser workspace."""
 
     def __init__(
         self,
         output_dir: str | Path,
         *,
+        scene: CUIScene,
         environment: Mapping[str, object] | None = None,
-        cui_overlay: Mapping[str, object] | None = None,
     ) -> None:
         """Create static dashboard assets in an online result directory."""
+        if not isinstance(scene, CUIScene):
+            raise TypeError("scene must be a runtime CUIScene.")
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.output_dir / DASHBOARD_INDEX_FILENAME
         self.data_path = self.output_dir / DASHBOARD_DATA_FILENAME
         self.environment = dict(environment or {})
-        self.cui_overlay = None if cui_overlay is None else dict(cui_overlay)
-        _write_bytes_atomic(self.index_path, _DASHBOARD_HTML.encode("utf-8"))
+        self.scene = scene
+        self._write_index()
+
+    def _write_index(self) -> None:
+        """Publish the shared PF-reference shell with MLE panel substitutions."""
+        self.index_path = write_cui_index(
+            self.output_dir,
+            pf_reference_panel_specs(
+                estimator_title="Surface MLE 3D",
+                estimator_filename=MLE_IMAGE_FILENAME,
+                labeled_estimator_title=("Surface MLE 3D with source labels"),
+                labeled_estimator_filename=MLE_LABELED_IMAGE_FILENAME,
+            ),
+            title="Rotating Shield MLE CUI View",
+            refresh_interval_ms=2000,
+            index_filename=DASHBOARD_INDEX_FILENAME,
+        )
 
     def publish(
         self,
         estimate: MLEEstimate | None,
         state: Mapping[str, object],
+        *,
+        route: CUIRoute | None = None,
     ) -> None:
         """Atomically publish the latest browser data snapshot."""
         payload = _dashboard_payload(
             estimate,
             state,
+            route=route,
             environment=self.environment,
-            cui_overlay=self.cui_overlay,
         )
         _render_dashboard_images(
             estimate,
             payload,
-            self.environment,
-            self.cui_overlay,
+            CUIRoute() if route is None else route,
+            self.scene,
             self.output_dir,
         )
         encoded = (
@@ -1063,61 +876,13 @@ class OnlineMLEDashboard:
         _write_bytes_atomic(self.data_path, encoded)
 
 
-_DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" href="data:,">
-  <title>Rotating Shield MLE CUI View</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
-    header { padding: 10px 16px; background: #1d1d1d; border-bottom: 1px solid #333; display: flex; justify-content: space-between; gap: 16px; }
-    header span:last-child { color: #aaa; }
-    main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px; }
-    section { background: #181818; border: 1px solid #333; padding: 8px; }
-    h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
-    img { width: 100%; height: calc(50vh - 70px); object-fit: contain; background: #fff; }
-    .wide { grid-column: 1 / span 2; }
-    .overview img { height: min(78vh, 980px); }
-    @media (max-width: 860px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } img, .overview img { height: auto; } }
-  </style>
-</head>
-<body>
-  <header><span>Rotating Shield MLE CUI View — auto refresh every 2 s — truth: evaluation overlay only</span><span id="status">loading</span></header>
-  <main>
-    <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png" alt="MLE experiment overview"></section>
-    <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png" alt="Robot path and MLE estimates"></section>
-    <section><h2>Surface MLE 3D</h2><img id="mle" src="latest_mle_3d.png" alt="Three-dimensional MLE surface estimate"></section>
-    <section class="wide"><h2>Latest observed and predicted full spectrum</h2><img id="spectrum" src="latest_spectrum.png" alt="Latest observed and predicted spectrum"></section>
-  </main>
-  <script>
-    async function refresh() {
-      const t = Date.now();
-      document.getElementById("overview").src = "latest_experiment_overview.png?t=" + t;
-      document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
-      document.getElementById("mle").src = "latest_mle_3d.png?t=" + t;
-      document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;
-      try {
-        const response = await fetch("dashboard_data.json?t=" + t, {cache: "no-store"});
-        const data = await response.json();
-        document.getElementById("status").textContent = `${String(data.status || "starting").toUpperCase()} · records ${data.record_count ?? 0} · station ${data.latest_station_id ?? "—"}`;
-      } catch (_) {
-        document.getElementById("status").textContent = "RECONNECTING";
-      }
-    }
-    refresh(); setInterval(refresh, 2000);
-  </script>
-</body>
-</html>
-"""
-
-
 __all__ = [
     "DASHBOARD_DATA_FILENAME",
     "DASHBOARD_INDEX_FILENAME",
+    "DEFAULT_DASHBOARD_HOST",
     "DEFAULT_DASHBOARD_PORT",
+    "MLE_LABELED_IMAGE_FILENAME",
     "OnlineMLEDashboard",
+    "cui_browser_url",
     "ensure_dashboard_server",
 ]

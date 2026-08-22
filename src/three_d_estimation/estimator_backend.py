@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
 from dataclasses import asdict, is_dataclass, replace
 import inspect
 import json
@@ -13,10 +12,6 @@ import numpy as np
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
-from measurement.observation_model import (
-    build_runtime_observation_model,
-    continuous_kernel_from_observation_model,
-)
 from measurement.obstacles import ObstacleGrid
 from three_d_estimation.backend_contracts import (
     EstimatorResult,
@@ -24,8 +19,8 @@ from three_d_estimation.backend_contracts import (
     SourceMode,
     SurfaceMapSnapshot,
 )
+from runtime import ResolvedForwardContext
 from runtime.records import MeasurementRecord, RunContext
-from runtime.forward_model_manifest import resolve_file_backed_model_asset
 
 from .config import MLEConfig
 from .estimator import SurfaceMLEEstimator
@@ -77,136 +72,6 @@ def _strict_json_dict(value: Mapping[str, object]) -> dict[str, object]:
         raise TypeError("Diagnostics must normalize to a JSON object.")
     json.dumps(safe, allow_nan=False, sort_keys=True)
     return safe
-
-
-def _positive_dimensions(
-    payload: Mapping[str, object],
-) -> tuple[float, float, float] | None:
-    """Extract finite positive room dimensions from one mapping."""
-    values: object | None = None
-    if all(key in payload for key in ("size_x", "size_y", "size_z")):
-        values = [payload["size_x"], payload["size_y"], payload["size_z"]]
-    else:
-        for key in ("room_size_xyz", "size_xyz"):
-            if key in payload:
-                values = payload[key]
-                break
-    if values is None:
-        return None
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise ValueError("Room dimensions must be a sequence of three numbers.")
-    parsed = tuple(float(value) for value in values)
-    if len(parsed) != 3 or any(
-        not math.isfinite(value) or value <= 0.0 for value in parsed
-    ):
-        raise ValueError("Room dimensions must contain three finite positive values.")
-    return parsed
-
-
-def _environment_from_context(context: RunContext) -> EnvironmentConfig:
-    """Construct the local measurement environment from embedded context data."""
-    candidates: list[Mapping[str, object]] = [context.environment]
-    nested = context.environment.get("environment")
-    if isinstance(nested, Mapping):
-        candidates.append(nested)
-    runtime_environment = context.runtime_config.get("environment")
-    if isinstance(runtime_environment, Mapping):
-        candidates.append(runtime_environment)
-    candidates.append(context.runtime_config)
-
-    dimensions = None
-    for candidate in candidates:
-        dimensions = _positive_dimensions(candidate)
-        if dimensions is not None:
-            break
-    if dimensions is None:
-        raise ValueError("RunContext must embed room dimensions for live MLE fitting.")
-
-    detector_position = None
-    for candidate in candidates:
-        raw_position = candidate.get(
-            "detector_position",
-            candidate.get("detector_position_xyz"),
-        )
-        if raw_position is None:
-            continue
-        if isinstance(raw_position, (str, bytes)) or not isinstance(
-            raw_position,
-            Sequence,
-        ):
-            raise ValueError("detector_position must contain three numbers.")
-        parsed = tuple(float(value) for value in raw_position)
-        if len(parsed) != 3 or any(not math.isfinite(value) for value in parsed):
-            raise ValueError("detector_position must contain three finite numbers.")
-        detector_position = parsed
-        break
-    return EnvironmentConfig(
-        size_x=dimensions[0],
-        size_y=dimensions[1],
-        size_z=dimensions[2],
-        detector_position=detector_position,
-    )
-
-
-def _embedded_obstacle(context: RunContext) -> ObstacleGrid | None:
-    """Return one obstacle grid embedded in the RunContext environment payload."""
-    candidates: list[object] = []
-    for key in ("obstacle_grid", "obstacle_layout", "obstacles"):
-        value = context.environment.get(key)
-        if value is not None:
-            candidates.append(value)
-    if "grid_shape" in context.environment and "blocked_cells" in context.environment:
-        candidates.append(context.environment)
-    if not candidates:
-        return None
-    if len(candidates) != 1 or not isinstance(candidates[0], Mapping):
-        raise ValueError(
-            "RunContext must contain at most one embedded obstacle-grid object."
-        )
-    return ObstacleGrid.from_dict(dict(candidates[0]))
-
-
-def _obstacle_from_context(
-    context: RunContext,
-    *,
-    run_root: Path | None,
-) -> ObstacleGrid | None:
-    """Resolve shared-runtime embedded or file-backed obstacle geometry."""
-    embedded = _embedded_obstacle(context)
-    if embedded is not None:
-        return embedded
-    path_value = context.obstacle_layout_path
-    if path_value is None or not str(path_value).strip():
-        return None
-    if run_root is None:
-        raise ValueError(
-            "File-backed live obstacle geometry requires the shared runtime "
-            "MeasurementLog run root."
-        )
-    resolved = resolve_file_backed_model_asset(
-        path_value,
-        field_name="obstacle_layout_path",
-        run_root=run_root,
-    )
-    return ObstacleGrid.load(resolved)
-
-
-def _runtime_config_from_context(context: RunContext) -> dict[str, object]:
-    """Return an observation-model config with no external file dependency."""
-    payload = deepcopy(dict(context.runtime_config))
-    configured_rate = payload.get("source_rate_model")
-    if (
-        configured_rate is not None
-        and str(configured_rate).strip().lower() != _SOURCE_RATE_MODEL
-    ):
-        raise ValueError("Runtime config source_rate_model must be 'detector_cps_1m'.")
-    payload["source_rate_model"] = _SOURCE_RATE_MODEL
-
-    if any(str(key).startswith("pf_") for key in payload):
-        raise ValueError("RunContext contains estimator-owned PF settings.")
-    if "full_spectrum_generative_model" not in payload:
-        raise ValueError("RunContext must embed full_spectrum_generative_model.")
-    return payload
 
 
 def _cluster_source_modes(
@@ -363,6 +228,7 @@ class SurfaceMLEBackend:
         self._run_root = None if run_root is None else Path(run_root).resolve()
         self._progress_hook = progress_hook
         self._context: RunContext | None = None
+        self._forward_context: ResolvedForwardContext | None = None
         self._environment: EnvironmentConfig | None = None
         self._obstacle_grid: ObstacleGrid | None = None
         self._kernel: object | None = None
@@ -389,6 +255,11 @@ class SurfaceMLEBackend:
         """Return the latest station or final all-history MLE estimate."""
         return self._latest_estimate
 
+    @property
+    def forward_context(self) -> ResolvedForwardContext | None:
+        """Return the shared runtime context resolved during initialization."""
+        return self._forward_context
+
     def initialize(self, context: RunContext) -> None:
         """Build all local physical objects for one independent run."""
         if self._context is not None:
@@ -408,30 +279,27 @@ class SurfaceMLEBackend:
                 "Count SurfaceMLEBackend requires response_poisson counts."
             )
 
-        environment = _environment_from_context(context)
-        obstacle_grid = _obstacle_from_context(
+        if self._run_root is None:
+            raise ValueError(
+                "SurfaceMLEBackend requires an explicit shared runtime asset root."
+            )
+        forward_context = ResolvedForwardContext.from_run_context(
             context,
             run_root=self._run_root,
         )
-        runtime_config = _runtime_config_from_context(context)
-        observation_model = build_runtime_observation_model(
-            runtime_config,
-            isotopes=context.isotopes,
-        )
-        kernel = continuous_kernel_from_observation_model(
-            observation_model,
-            obstacle_grid=obstacle_grid,
+        kernel = forward_context.build_continuous_kernel(
             use_gpu=bool(self.config.use_gpu),
+            gpu_device=str(self.config.gpu_device),
+            gpu_dtype=str(self.config.gpu_dtype),
         )
-        kernel.gpu_device = str(self.config.gpu_device)
-        kernel.gpu_dtype = str(self.config.gpu_dtype)
         estimator = self._new_estimator(self.config)
         if not callable(getattr(estimator, "fit", None)):
             raise TypeError("estimator_factory must return an object with fit().")
 
         self._context = context
-        self._environment = environment
-        self._obstacle_grid = obstacle_grid
+        self._forward_context = forward_context
+        self._environment = forward_context.environment
+        self._obstacle_grid = forward_context.obstacle_grid
         self._kernel = kernel
         self._estimator = estimator
 
@@ -470,6 +338,7 @@ class SurfaceMLEBackend:
         batch = observation_batch_from_records(
             self._records,
             self._context.isotopes,
+            context=self._context,
         )
         fit_kwargs: dict[str, object] = {"obstacle_grid": self._obstacle_grid}
         fit_signature = inspect.signature(self._estimator.fit)
@@ -601,6 +470,7 @@ class SurfaceMLEBackend:
         batch = observation_batch_from_records(
             self._records,
             self._context.isotopes,
+            context=self._context,
         )
         resolved_current_pair = current_pair_id
         if resolved_current_pair is None:

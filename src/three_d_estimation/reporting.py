@@ -16,13 +16,12 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-import shutil
-import tempfile
 from typing import Any
 import zipfile
 
 import numpy as np
 from numpy.typing import NDArray
+from runtime import AtomicBundlePublisher
 
 from .config import MLEConfig
 from .types import MLEEstimate, SurfacePatch
@@ -311,65 +310,34 @@ def _deterministic_npz_bytes(arrays: Mapping[str, NDArray[Any]]) -> bytes:
     return buffer.getvalue()
 
 
-def _write_bytes_fsync(path: Path, payload: bytes) -> None:
-    """Write one staged file completely before it can be renamed."""
-    with path.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _fsync_directory(path: Path) -> None:
-    """Best-effort fsync of directory entries on POSIX filesystems."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:  # pragma: no cover - platform/filesystem dependent
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:  # pragma: no cover - platform/filesystem dependent
-        pass
-    finally:
-        os.close(descriptor)
-
-
 def _commit_report(
     output_dir: Path,
     payloads: Mapping[str, bytes],
     *,
     overwrite: bool,
 ) -> None:
-    """Stage complete files then atomically replace individual report members."""
-    if output_dir.exists() and not output_dir.is_dir():
+    """Publish one complete report generation through shared runtime mechanics."""
+    target_exists = output_dir.exists() or output_dir.is_symlink()
+    if target_exists and not output_dir.is_dir():
         raise NotADirectoryError(f"Report output path is not a directory: {output_dir}")
-    existing = [
-        output_dir / name
-        for name in _KNOWN_REPORT_FILENAMES
-        if (output_dir / name).exists()
-    ]
-    if existing and not overwrite:
-        joined = ", ".join(str(path) for path in existing)
+    if target_exists and not overwrite:
         raise FileExistsError(
-            f"MLE report output already exists; pass overwrite=True: {joined}"
+            f"MLE report output already exists; pass overwrite=True: {output_dir}"
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".mle-report-", dir=output_dir))
-    try:
+    policy = "replace_known" if target_exists else "create"
+    with AtomicBundlePublisher(
+        output_dir,
+        policy=policy,
+        known_members=_KNOWN_REPORT_FILENAMES,
+    ) as publisher:
         for name in sorted(payloads):
-            _write_bytes_fsync(staging / name, payloads[name])
-        _fsync_directory(staging)
-        for name in sorted(payloads):
-            os.replace(staging / name, output_dir / name)
-        stale_hotspots = output_dir / HOTSPOT_CLUSTERS_FILENAME
+            publisher.write_bytes(name, payloads[name])
         if (
-            overwrite
+            policy == "replace_known"
             and HOTSPOT_CLUSTERS_FILENAME not in payloads
-            and stale_hotspots.exists()
         ):
-            stale_hotspots.unlink()
-        _fsync_directory(output_dir)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+            publisher.remove(HOTSPOT_CLUSTERS_FILENAME)
+        publisher.publish()
 
 
 def save_mle_estimate(
@@ -381,8 +349,9 @@ def save_mle_estimate(
 ) -> MLEReportPaths:
     """Save a complete estimate report and return its paths.
 
-    Existing report members are never replaced unless ``overwrite=True``.
-    Unrelated files already present in ``output_dir`` are left untouched.
+    A new report is published as one complete directory generation. With
+    ``overwrite=True``, known report members are atomically replaced while
+    unrelated files already present in ``output_dir`` remain unchanged.
 
     The canonical call is ``save_mle_estimate(estimate, output_dir)``.  The
     reversed ``(output_dir, estimate)`` order is also accepted for CLI and

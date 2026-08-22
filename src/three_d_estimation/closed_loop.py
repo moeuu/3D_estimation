@@ -7,18 +7,20 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from runtime.adaptive_client import (
+    AdaptiveCandidateSnapshot,
+    AdaptiveRefineRequest,
     AdaptiveRuntimeClient,
-    adaptive_step_request,
+    AdaptiveStepRequest,
     candidate_index_for_pose,
-    parse_adaptive_record,
-    parse_adaptive_resume_prefix,
-    parse_candidate_snapshot,
-    parse_run_context,
 )
+from runtime.defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_HOST,
+    DEFAULT_CUI_SPLIT_VIEW_PORT,
+)
+from runtime.measurement_log import MeasurementLogRecord
 
 from .config import MLEConfig
 from .information_planner import MLEPlanningConfig, MLEPlanningResult
@@ -362,21 +364,6 @@ def evaluate_mle_stop(
     return MLEStopDecision(all(gates.values()), gates, details)
 
 
-def _strict_fields(
-    payload: Mapping[str, Any],
-    expected: set[str],
-    *,
-    name: str,
-) -> None:
-    """Reject missing and unknown wire fields."""
-    if set(payload) != expected:
-        raise ValueError(
-            f"{name} fields disagree with the protocol; "
-            f"missing={sorted(expected - set(payload))}, "
-            f"unknown={sorted(set(payload) - expected)}."
-        )
-
-
 def run_ral_closed_loop(
     scenario_path: str | Path,
     *,
@@ -394,8 +381,8 @@ def run_ral_closed_loop(
     overwrite: bool = False,
     enable_dashboard: bool = True,
     serve_dashboard: bool = True,
-    dashboard_host: str = "0.0.0.0",
-    dashboard_port: int = 8878,
+    dashboard_host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
+    dashboard_port: int = DEFAULT_CUI_SPLIT_VIEW_PORT,
     dashboard_public_host: str | None = None,
     dashboard_url_hook: Callable[[str], None] | None = None,
     output_hook: Callable[[str], None] = print,
@@ -421,15 +408,6 @@ def run_ral_closed_loop(
         maximum_expected_information_gain_nats=threshold,
         low_information_patience=int(low_information_patience),
     )
-    client = AdaptiveRuntimeClient(
-        scenario_path,
-        runtime_root=runtime_root,
-        private_scene_profile=private_scene_profile,
-        resume_stage_path=resume_stage_path,
-        resume_compatibility_path=resume_compatibility_path,
-        output_hook=output_hook,
-    )
-    online: OnlineMLESession | None = None
     progress_last_elapsed: dict[str, float] = {}
 
     def relay_progress(progress: Mapping[str, object]) -> None:
@@ -455,47 +433,17 @@ def run_ral_closed_loop(
             f"elapsed={elapsed:.1f}s eta={eta}"
         )
 
-    try:
-        ready = client.read_event()
-        ready_schema = ready.get("schema_version")
-        if ready.get("type") != "ready" or ready_schema not in {1, 2}:
-            raise ValueError(
-                "Shared runtime returned an incompatible adaptive handshake."
-            )
-        if ready_schema == 1:
-            _strict_fields(
-                ready,
-                {"type", "schema_version", "context", "candidates", "bootstrap"},
-                name="adaptive ready event",
-            )
-            resume_prefix = None
-        else:
-            _strict_fields(
-                ready,
-                {"type", "schema_version", "context", "candidates", "resume"},
-                name="adaptive resume ready event",
-            )
-            resume_prefix = parse_adaptive_resume_prefix(ready["resume"])
-        context = parse_run_context(ready["context"])
-        candidates = parse_candidate_snapshot(ready["candidates"])
-        bootstrap = ready.get("bootstrap")
-        if resume_prefix is None:
-            if not isinstance(bootstrap, dict):
-                raise TypeError("Runtime bootstrap selection must be an object.")
-            _strict_fields(
-                bootstrap,
-                {"candidate_index", "fe_orientation_index", "pb_orientation_index"},
-                name="adaptive bootstrap",
-            )
+    def run_session(client: AdaptiveRuntimeClient) -> RALClosedLoopResult:
+        """Drive one context-owned adaptive session to publication."""
+        ready = client.handshake()
+        context = ready.context
+        candidates = ready.candidates
+        bootstrap = ready.bootstrap
+        resume_prefix = ready.resume
         if tuple(mle_config.isotope_names) != tuple(context.isotopes):
             raise ValueError(
                 "RAL MLE isotopes must match the adaptive runtime scenario."
             )
-        dashboard_cui_overlay = (
-            client.request_cui_overlay(include_truth=True)
-            if enable_dashboard
-            else None
-        )
         online = OnlineMLESession(
             context=context,
             config=mle_config,
@@ -509,7 +457,6 @@ def run_ral_closed_loop(
             dashboard_host=dashboard_host,
             dashboard_port=dashboard_port,
             dashboard_public_host=dashboard_public_host,
-            dashboard_cui_overlay=dashboard_cui_overlay,
             progress_hook=relay_progress,
         )
         if online.dashboard_url is not None and dashboard_url_hook is not None:
@@ -521,9 +468,9 @@ def run_ral_closed_loop(
         stop_reason = "maximum_measurement_safety_bound"
 
         def plan_next_station(
-            record: Any,
-            snapshot: dict[str, object],
-        ) -> dict[str, object] | None:
+            record: MeasurementLogRecord,
+            snapshot: AdaptiveCandidateSnapshot,
+        ) -> AdaptiveStepRequest | None:
             """Plan one station after a durable boundary and return its first view."""
             nonlocal candidates
             nonlocal pending_pose
@@ -531,16 +478,15 @@ def run_ral_closed_loop(
             nonlocal pending_station_id
             nonlocal stop_reason
             plan = online.plan_next_action(
-                snapshot["candidate_poses_xyz"],
+                snapshot.candidate_poses_xyz,
                 planning_config=planning_config,
-                allowed_pair_ids=snapshot["allowed_pair_ids"],
-                travel_costs=snapshot["travel_costs"],
-                current_pair_id=snapshot["current_pair_id"],
+                allowed_pair_ids=snapshot.allowed_pair_ids,
+                travel_costs=snapshot.travel_costs,
+                current_pair_id=snapshot.current_pair_id,
                 progress_hook=relay_progress,
                 screening_only=(
                     bool(getattr(planning_config, "two_stage_screening", False))
-                    and int(getattr(planning_config, "local_refinement_top_k", 0))
-                    > 0
+                    and int(getattr(planning_config, "local_refinement_top_k", 0)) > 0
                 ),
             )
             refinement_count = int(
@@ -553,26 +499,17 @@ def run_ral_closed_loop(
                         seed_indices.append(ranked_action.candidate_index)
                     if len(seed_indices) >= refinement_count:
                         break
-                refined_event = client.request(
-                    {"type": "refine", "candidate_indices": seed_indices}
+                refined_event = client.refine_candidates(
+                    AdaptiveRefineRequest.from_indices(seed_indices)
                 )
-                _strict_fields(
-                    refined_event,
-                    {"type", "candidates"},
-                    name="refined candidate event",
-                )
-                if refined_event.get("type") != "candidates":
-                    raise ValueError(
-                        "Shared runtime did not return refined candidates."
-                    )
-                candidates = parse_candidate_snapshot(refined_event["candidates"])
+                candidates = refined_event.candidates
                 snapshot = candidates
                 plan = online.plan_next_action(
-                    snapshot["candidate_poses_xyz"],
+                    snapshot.candidate_poses_xyz,
                     planning_config=planning_config,
-                    allowed_pair_ids=snapshot["allowed_pair_ids"],
-                    travel_costs=snapshot["travel_costs"],
-                    current_pair_id=snapshot["current_pair_id"],
+                    allowed_pair_ids=snapshot.allowed_pair_ids,
+                    travel_costs=snapshot.travel_costs,
+                    current_pair_id=snapshot.current_pair_id,
                     overwrite=True,
                     progress_hook=relay_progress,
                 )
@@ -603,7 +540,7 @@ def run_ral_closed_loop(
             pending_pose = selected.detector_pose_xyz
             pending_station_id = int(record.station_id) + 1
             fe_index, pb_index, dwell_time = pending_program.pop(0)
-            return adaptive_step_request(
+            return AdaptiveStepRequest(
                 candidate_index=selected.candidate_index,
                 fe_orientation_index=fe_index,
                 pb_orientation_index=pb_index,
@@ -613,11 +550,12 @@ def run_ral_closed_loop(
             )
 
         if resume_prefix is None:
-            assert isinstance(bootstrap, dict)
-            request: dict[str, object] | None = adaptive_step_request(
-                candidate_index=bootstrap["candidate_index"],
-                fe_orientation_index=bootstrap["fe_orientation_index"],
-                pb_orientation_index=bootstrap["pb_orientation_index"],
+            if bootstrap is None:
+                raise RuntimeError("Fresh adaptive handshake has no bootstrap.")
+            request: AdaptiveStepRequest | None = AdaptiveStepRequest(
+                candidate_index=bootstrap.candidate_index,
+                fe_orientation_index=bootstrap.fe_orientation_index,
+                pb_orientation_index=bootstrap.pb_orientation_index,
                 dwell_time_s=planning_config.live_time_s,
                 station_id=0,
                 station_complete=True,
@@ -638,12 +576,9 @@ def run_ral_closed_loop(
             )
 
         while request is not None:
-            event = client.request(request)
-            _strict_fields(event, {"type", "record", "candidates"}, name="record event")
-            if event.get("type") != "record":
-                raise ValueError("Shared runtime did not return a record event.")
-            record = parse_adaptive_record(event["record"])
-            candidates = parse_candidate_snapshot(event["candidates"])
+            event = client.acquire(request)
+            record = event.record
+            candidates = event.candidates
             station_complete = record.metadata.get("station_complete") is True
             online.receive_persisted(record, station_complete=station_complete)
             if len(online.records) >= int(max_measurements):
@@ -654,7 +589,7 @@ def run_ral_closed_loop(
                         "Pending station program lost its pose metadata."
                     )
                 fe_index, pb_index, dwell_time = pending_program.pop(0)
-                request = adaptive_step_request(
+                request = AdaptiveStepRequest(
                     candidate_index=candidate_index_for_pose(candidates, pending_pose),
                     fe_orientation_index=fe_index,
                     pb_orientation_index=pb_index,
@@ -666,14 +601,9 @@ def run_ral_closed_loop(
             if not station_complete:
                 raise RuntimeError("A runtime station ended without its final marker.")
             request = plan_next_station(record, candidates)
-        published = client.finalize()
-        _strict_fields(
-            published, {"type", "path", "record_count"}, name="published event"
-        )
-        if published.get("type") != "published":
-            raise ValueError("Shared runtime did not publish a final MeasurementLog.")
-        log = validate_ral_measurement_log(published["path"])
-        if int(published["record_count"]) != len(log.records):
+        published = client.finalize_log()
+        log = validate_ral_measurement_log(published.path)
+        if published.record_count != len(log.records):
             raise RuntimeError("Published runtime record count is inconsistent.")
         online.bind_finalized_measurement_log(log.path)
         completed = online.finalize()
@@ -688,9 +618,16 @@ def run_ral_closed_loop(
             dashboard_url=completed.dashboard_url,
             private_scene_profile=private_scene_profile,
         )
-    except BaseException:
-        client.abort()
-        raise
+
+    with AdaptiveRuntimeClient(
+        scenario_path,
+        runtime_root=runtime_root,
+        private_scene_profile=private_scene_profile,
+        resume_stage_path=resume_stage_path,
+        resume_compatibility_path=resume_compatibility_path,
+        output_hook=output_hook,
+    ) as client:
+        return run_session(client)
 
 
 __all__ = [

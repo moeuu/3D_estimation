@@ -11,6 +11,11 @@ from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
+from runtime.cui import CUI_URL_MESSAGE_PREFIX
+from runtime.defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_HOST,
+    DEFAULT_CUI_SPLIT_VIEW_PORT,
+)
 from runtime.measurement_log import load_measurement_log
 
 from .closed_loop import (
@@ -48,7 +53,7 @@ RAL_STOP_CONFIG = ROOT / "configs" / "mle" / "ral_full_stop.json"
 def _print_cui_dashboard_url(url: str, *, json_output: bool) -> None:
     """Print one immediately flushable CUI URL without corrupting JSON stdout."""
     stream = sys.stderr if json_output else sys.stdout
-    print(f"CUI dashboard URL: {url}", file=stream, flush=True)
+    print(f"{CUI_URL_MESSAGE_PREFIX} {url}", file=stream, flush=True)
 
 
 def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
@@ -175,14 +180,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     online_parser.add_argument(
         "--dashboard-host",
-        default="0.0.0.0",
-        help="Dashboard server bind host (default: 0.0.0.0).",
+        default=DEFAULT_CUI_SPLIT_VIEW_HOST,
+        help=f"Dashboard server bind host (default: {DEFAULT_CUI_SPLIT_VIEW_HOST}).",
     )
     online_parser.add_argument(
         "--dashboard-port",
         type=int,
-        default=8878,
-        help="Dashboard server TCP port (default: 8878).",
+        default=DEFAULT_CUI_SPLIT_VIEW_PORT,
+        help=f"Dashboard server TCP port (default: {DEFAULT_CUI_SPLIT_VIEW_PORT}).",
     )
     online_parser.add_argument(
         "--dashboard-public-host",
@@ -315,14 +320,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     ral_parser.add_argument(
         "--dashboard-host",
-        default="0.0.0.0",
-        help="Dashboard bind host (default: 0.0.0.0).",
+        default=DEFAULT_CUI_SPLIT_VIEW_HOST,
+        help=f"Dashboard bind host (default: {DEFAULT_CUI_SPLIT_VIEW_HOST}).",
     )
     ral_parser.add_argument(
         "--dashboard-port",
         type=int,
-        default=8878,
-        help="Dashboard TCP port (default: 8878).",
+        default=DEFAULT_CUI_SPLIT_VIEW_PORT,
+        help=f"Dashboard TCP port (default: {DEFAULT_CUI_SPLIT_VIEW_PORT}).",
     )
     ral_parser.add_argument(
         "--dashboard-public-host",
@@ -729,8 +734,6 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
         print(f"mle_output: {result.mle_output_dir}")
         if hasattr(result, "stop_reason"):
             print(f"stop_reason: {result.stop_reason}")
-        if result.dashboard_url is not None:
-            _print_cui_dashboard_url(result.dashboard_url, json_output=False)
     return 0
 
 

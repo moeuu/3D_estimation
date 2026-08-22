@@ -11,9 +11,11 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+from runtime import CUIScene, DigestIdentity, ResolvedForwardContext
+from runtime.cui import CUIRoute, cui_route_from_records
+from runtime.defaults import DEFAULT_CUI_SPLIT_VIEW_HOST
 from runtime.measurement_log import MeasurementLog, load_measurement_log
-from runtime.prefix import measurement_records_sha256
+from runtime.prefix import measurement_records_digest
 from runtime.records import MeasurementRecord, RunContext, canonical_json_sha256
 
 from .backend_contracts import EstimatorResult, EstimatorSnapshot
@@ -29,6 +31,7 @@ from .information_planner import (
     MLEPlanningResult,
     save_mle_planning_result,
 )
+from .lineage import covered_records_lineage
 from .provenance import estimator_provenance
 from .reporting import (
     MLEReportPaths,
@@ -81,9 +84,19 @@ class OnlineStationReport:
     station_id: int
     data_cutoff_step: int
     record_count: int
+    covered_records_digest: DigestIdentity
     covered_records_sha256: str
     report_paths: MLEReportPaths
     report_sha256: str
+
+    def __post_init__(self) -> None:
+        """Require the transitional SHA alias to match the primary digest."""
+        if not isinstance(self.covered_records_digest, DigestIdentity):
+            raise TypeError("covered_records_digest must be a DigestIdentity.")
+        if self.covered_records_sha256 != self.covered_records_digest.sha256:
+            raise ValueError(
+                "covered_records_sha256 must equal covered_records_digest.sha256."
+            )
 
     def to_dict(self, *, relative_to: Path) -> dict[str, object]:
         """Return deterministic state-manifest data for this report."""
@@ -91,6 +104,7 @@ class OnlineStationReport:
             "station_id": int(self.station_id),
             "data_cutoff_step": int(self.data_cutoff_step),
             "record_count": int(self.record_count),
+            "covered_records_digest": self.covered_records_digest.to_payload(),
             "covered_records_sha256": self.covered_records_sha256,
             "report_dir": self.report_paths.output_dir.relative_to(
                 relative_to
@@ -213,44 +227,32 @@ def _station_boundary(
 def _dashboard_trajectory(
     records: Sequence[MeasurementRecord],
 ) -> dict[str, object]:
-    """Return PF-compatible route and station history from runtime records."""
-    path_segments: list[list[list[float]]] = []
-    measurement_stations: list[dict[str, object]] = []
-    for record in records:
-        raw_waypoints = record.metadata.get("travel_waypoints_xyz")
-        if raw_waypoints is not None:
-            waypoints = np.asarray(raw_waypoints, dtype=np.float64)
-            if (
-                waypoints.ndim == 2
-                and waypoints.shape[1] == 3
-                and waypoints.shape[0] >= 2
-                and np.all(np.isfinite(waypoints))
-            ):
-                segment = waypoints.tolist()
-                if not path_segments or segment != path_segments[-1]:
-                    path_segments.append(segment)
+    """Return the shared runtime route payload for compatibility callers."""
+    return cui_route_from_records(records).to_payload()
 
-        point = np.asarray(record.detector_pose_xyz, dtype=np.float64).reshape(3)
-        if measurement_stations:
-            latest = measurement_stations[-1]
-            latest_point = np.asarray(latest["position_xyz"], dtype=np.float64)
-            if float(np.linalg.norm(point - latest_point)) <= 1.0e-6:
-                latest["visit_count"] = int(latest["visit_count"]) + 1
-                continue
-        measurement_stations.append(
-            {
-                "station_id": int(record.station_id),
-                "position_xyz": point.tolist(),
-                "visit_count": 1,
-            }
+
+def _resolved_dashboard_scene(
+    context: RunContext,
+    *,
+    run_root: Path | None,
+    forward_context: ResolvedForwardContext | None = None,
+) -> CUIScene:
+    """Resolve one authenticated runtime scene, including file-backed obstacles."""
+    resolved = forward_context
+    if resolved is None:
+        if run_root is None:
+            raise ValueError(
+                "Dashboard scene resolution requires an explicit runtime asset root."
+            )
+        resolved = ResolvedForwardContext.from_run_context(
+            context,
+            run_root=run_root,
         )
-    return {
-        "travel_path_segments_xyz": path_segments,
-        "measurement_stations": measurement_stations,
-        "current_detector_position_xyz": (
-            None if not records else list(map(float, records[-1].detector_pose_xyz))
-        ),
-    }
+    return CUIScene.from_environment(
+        resolved.environment,
+        resolved.obstacle_grid,
+        obstacle_height_m=min(2.0, resolved.environment.size_z),
+    )
 
 
 class OnlineMLESession:
@@ -274,10 +276,10 @@ class OnlineMLESession:
         overwrite: bool = False,
         enable_dashboard: bool = True,
         serve_dashboard: bool = False,
-        dashboard_host: str = "0.0.0.0",
+        dashboard_host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
         dashboard_port: int = DEFAULT_DASHBOARD_PORT,
         dashboard_public_host: str | None = None,
-        dashboard_cui_overlay: Mapping[str, object] | None = None,
+        dashboard_scene: CUIScene | None = None,
         progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         """Initialize one station-causal session and its output directory."""
@@ -291,6 +293,8 @@ class OnlineMLESession:
             )
         if not callable(save_report_hook):
             raise TypeError("save_report_hook must be callable.")
+        if dashboard_scene is not None and not isinstance(dashboard_scene, CUIScene):
+            raise TypeError("dashboard_scene must be a runtime CUIScene or None.")
 
         target = Path(output_dir).resolve()
         if target.exists():
@@ -337,11 +341,30 @@ class OnlineMLESession:
         self._latest_published_estimate: MLEEstimate | None = None
         self._latest_planning_state: dict[str, object] | None = None
         self._planning_paths: list[Path] = []
+        resolved_dashboard_scene = dashboard_scene
+        if enable_dashboard and resolved_dashboard_scene is None:
+            backend_forward_context = getattr(
+                active_backend,
+                "forward_context",
+                None,
+            )
+            if backend_forward_context is not None and not isinstance(
+                backend_forward_context,
+                ResolvedForwardContext,
+            ):
+                raise TypeError(
+                    "backend.forward_context must be a ResolvedForwardContext or None."
+                )
+            resolved_dashboard_scene = _resolved_dashboard_scene(
+                context,
+                run_root=resolved_run_root,
+                forward_context=backend_forward_context,
+            )
         self.dashboard = (
             OnlineMLEDashboard(
                 self.output_dir,
+                scene=resolved_dashboard_scene,
                 environment=context.environment,
-                cui_overlay=dashboard_cui_overlay,
             )
             if enable_dashboard
             else None
@@ -397,15 +420,16 @@ class OnlineMLESession:
         records = self.records
         if not records:
             raise RuntimeError("Online lineage requires at least one record.")
+        records_lineage = covered_records_lineage(records)
         lineage = {
-            "schema_version": 1,
+            "schema_version": 2,
             "fit_kind": fit_kind,
             "update_policy": "station_complete_all_history",
             "covered_step_ids": [record.step_id for record in records],
             "data_cutoff_step": records[-1].step_id,
             "data_cutoff_station": records[-1].station_id,
             "record_count": len(records),
-            "covered_records_sha256": measurement_records_sha256(records),
+            **records_lineage,
         }
         provenance = estimator_provenance(
             variant=self.config.mode,
@@ -446,6 +470,10 @@ class OnlineMLESession:
     ) -> dict[str, object]:
         """Build the current durable online state manifest."""
         records = self.records
+        records_lineage = covered_records_lineage(records) if records else {
+            "covered_records_digest": None,
+            "covered_records_sha256": None,
+        }
         return {
             "schema_version": 1,
             "status": status,
@@ -461,6 +489,7 @@ class OnlineMLESession:
             "resolved_estimator_config_sha256": (self.resolved_estimator_config_sha256),
             "measurement_log_sha256": self.measurement_log_sha256,
             "record_count": len(records),
+            **records_lineage,
             "latest_step_id": None if not records else records[-1].step_id,
             "latest_station_id": None if not records else records[-1].station_id,
             "station_reports": [
@@ -489,19 +518,12 @@ class OnlineMLESession:
             payload,
         )
         if self.dashboard is not None:
-            dashboard_payload = dict(payload)
             records = self.records
-            dashboard_payload.update(_dashboard_trajectory(records))
-            if records:
-                dashboard_payload["latest_observed_spectrum_counts"] = records[
-                    -1
-                ].spectrum_counts.tolist()
-                dashboard_payload["energy_bin_edges_keV"] = records[
-                    -1
-                ].energy_bin_edges_keV.tolist()
+            route: CUIRoute = cui_route_from_records(records)
             self.dashboard.publish(
                 self._latest_published_estimate,
-                dashboard_payload,
+                payload,
+                route=route,
             )
 
     def receive_persisted(
@@ -559,12 +581,14 @@ class OnlineMLESession:
                 self.config,
             )
             records = self.records
+            records_digest = measurement_records_digest(records)
             self._station_reports.append(
                 OnlineStationReport(
                     station_id=measurement.station_id,
                     data_cutoff_step=measurement.step_id,
                     record_count=len(records),
-                    covered_records_sha256=measurement_records_sha256(records),
+                    covered_records_digest=records_digest,
+                    covered_records_sha256=records_digest.sha256,
                     report_paths=report_paths,
                     report_sha256=mle_report_sha256(report_paths.output_dir),
                 )
@@ -659,8 +683,8 @@ class OnlineMLESession:
         if log.context.runtime_config_sha256 != self.context.runtime_config_sha256:
             raise ValueError("Finalized MeasurementLog runtime context changed.")
         if len(log.records) != len(self.records) or (
-            measurement_records_sha256(log.records)
-            != measurement_records_sha256(self.records)
+            measurement_records_digest(log.records)
+            != measurement_records_digest(self.records)
         ):
             raise ValueError(
                 "Finalized MeasurementLog differs from the persisted live history."
@@ -702,6 +726,7 @@ class OnlineMLESession:
         if not isinstance(planned, MLEPlanningResult):
             raise TypeError("Online backend planning must return MLEPlanningResult.")
         latest = self.records[-1]
+        records_lineage = covered_records_lineage(self.records)
         annotated = MLEPlanningResult(
             selected_action=planned.selected_action,
             ranked_actions=planned.ranked_actions,
@@ -712,7 +737,7 @@ class OnlineMLESession:
                 "data_cutoff_station": int(latest.station_id),
                 "record_count": len(self.records),
                 "covered_step_ids": [int(record.step_id) for record in self.records],
-                "covered_records_sha256": measurement_records_sha256(self.records),
+                **records_lineage,
                 "resolved_estimator_config_sha256": (
                     self.resolved_estimator_config_sha256
                 ),
@@ -741,7 +766,7 @@ def run_online_replay(
     overwrite: bool = False,
     enable_dashboard: bool = True,
     serve_dashboard: bool = False,
-    dashboard_host: str = "0.0.0.0",
+    dashboard_host: str = DEFAULT_CUI_SPLIT_VIEW_HOST,
     dashboard_port: int = DEFAULT_DASHBOARD_PORT,
     dashboard_public_host: str | None = None,
     dashboard_url_hook: Callable[[str], None] | None = None,

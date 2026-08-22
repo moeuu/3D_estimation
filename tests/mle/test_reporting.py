@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from measurement.model import EnvironmentConfig
+from runtime import AtomicBundlePublisher
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.reporting import (
     DIAGNOSTICS_FILENAME,
@@ -202,6 +203,8 @@ def test_existing_report_requires_explicit_overwrite_and_removes_stale_clusters(
     original = _estimate()
     paths = save_mle_estimate(original, output, _config())
     original_npz = paths.estimate_npz.read_bytes()
+    unrelated = output / "operator-notes.txt"
+    unrelated.write_bytes(b"retain this file exactly\n")
 
     with pytest.raises(FileExistsError, match="overwrite=True"):
         save_mle_estimate(original, output, _config())
@@ -221,7 +224,70 @@ def test_existing_report_requires_explicit_overwrite_and_removes_stale_clusters(
     )
     assert replacement_paths.hotspot_clusters_json is None
     assert not (output / HOTSPOT_CLUSTERS_FILENAME).exists()
+    assert unrelated.read_bytes() == b"retain this file exactly\n"
     _assert_estimates_equal(replacement, load_mle_estimate(output))
+
+
+def test_new_report_refuses_an_existing_unrelated_directory(tmp_path: Path) -> None:
+    """Create publication must never merge into a pre-existing directory."""
+    output = tmp_path / "report"
+    output.mkdir()
+    unrelated = output / "operator-notes.txt"
+    unrelated.write_bytes(b"do not replace\n")
+
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        save_mle_estimate(_estimate(), output, _config())
+
+    assert unrelated.read_bytes() == b"do not replace\n"
+    assert not (output / ESTIMATE_FILENAME).exists()
+
+
+def test_failed_overwrite_preserves_the_complete_previous_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staging failure must leave every published report member unchanged."""
+    output = tmp_path / "report"
+    paths = save_mle_estimate(_estimate(), output, _config())
+    original = {
+        path.name: path.read_bytes()
+        for path in (
+            paths.estimate_npz,
+            paths.diagnostics_json,
+            paths.hotspot_clusters_json,
+        )
+        if path is not None
+    }
+    write_bytes = AtomicBundlePublisher.write_bytes
+    calls = 0
+
+    def fail_second_write(
+        publisher: AtomicBundlePublisher,
+        relative_path: str | Path,
+        payload: bytes,
+    ) -> Path:
+        """Fail after one private member write but before generation publication."""
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected report staging failure")
+        return write_bytes(publisher, relative_path, payload)
+
+    monkeypatch.setattr(AtomicBundlePublisher, "write_bytes", fail_second_write)
+
+    with pytest.raises(RuntimeError, match="injected report staging failure"):
+        save_mle_estimate(
+            replace(_estimate(), diagnostics={"mode": "count"}),
+            output,
+            {"mode": "count"},
+            overwrite=True,
+        )
+
+    assert {
+        name: (output / name).read_bytes()
+        for name in original
+    } == original
+    assert not tuple(tmp_path.glob(".report.bundle-*"))
 
 
 def test_optional_predictions_and_hotspot_file_presence_round_trip(tmp_path: Path) -> None:

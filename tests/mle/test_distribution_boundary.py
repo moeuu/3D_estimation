@@ -38,6 +38,23 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
     assert "==" in runtime_dependency
     assert set(runtime_source) == {"git", "rev"}
     assert len(runtime_source["rev"]) == 40
+    contract_dependency = next(
+        dependency
+        for dependency in runtime_dependencies
+        if dependency.startswith("radiation-estimator-service-contracts")
+    )
+    contract_source = configuration["tool"]["uv"]["sources"][
+        "radiation-estimator-service-contracts"
+    ]
+    assert contract_dependency == "radiation-estimator-service-contracts==0.1.0"
+    assert set(contract_source) == {"git", "rev"}
+    assert contract_source["git"] == (
+        "https://github.com/moeuu/radiation-estimator-service-contracts.git"
+    )
+    assert len(contract_source["rev"]) == 40
+    assert project["scripts"]["radiation-surface-mle-service"] == (
+        "three_d_estimation.service:main"
+    )
 
 
 def test_package_discovery_contains_only_mle_code() -> None:
