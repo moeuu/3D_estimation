@@ -23,6 +23,7 @@ FORBIDDEN_PATHS = (
     "src/sim",
     "src/spectrum",
     "src/realtime_demo.py",
+    "src/three_d_estimation/service.py",
 )
 
 
@@ -66,34 +67,25 @@ def _check_package_boundary() -> list[str]:
         or re.fullmatch(r"[0-9a-f]{40}", revision) is None
     ):
         return ["shared simulation runtime source must pin one Git commit"]
-    contract_dependencies = [
+    research_dependencies = [
         dependency
         for dependency in dependencies
-        if dependency.startswith("radiation-estimator-service-contracts")
+        if dependency.startswith(("radiation-", "rotating-shield-"))
     ]
-    if len(contract_dependencies) != 1 or "==" not in contract_dependencies[0]:
-        return ["estimator service contracts dependency must use an exact version"]
-    contract_source = (
-        payload.get("tool", {})
-        .get("uv", {})
-        .get("sources", {})
-        .get("radiation-estimator-service-contracts")
-    )
-    contract_revision = (
-        None if not isinstance(contract_source, dict) else contract_source.get("rev")
-    )
-    if (
-        not isinstance(contract_source, dict)
-        or not isinstance(contract_source.get("git"), str)
-        or not isinstance(contract_revision, str)
-        or re.fullmatch(r"[0-9a-f]{40}", contract_revision) is None
+    if research_dependencies != runtime_dependencies:
+        return ["shared runtime must be the only research-package dependency"]
+    sources = payload.get("tool", {}).get("uv", {}).get("sources", {})
+    if set(sources) != {"rotating-shield-simulation-runtime"}:
+        return ["shared runtime must be the only pinned research source"]
+    scripts = payload.get("project", {}).get("scripts", {})
+    if any(
+        "service" in name.lower() or ".service:" in target
+        for name, target in scripts.items()
     ):
-        return ["estimator service contracts source must pin one Git commit"]
-    service_script = payload.get("project", {}).get("scripts", {}).get(
-        "radiation-surface-mle-service"
-    )
-    if service_script != "three_d_estimation.service:main":
-        return ["dedicated surface-MLE service entry point is missing"]
+        return ["out-of-process estimator service entry points must be absent"]
+    extras = payload.get("project", {}).get("optional-dependencies", {})
+    if any("service" in name.lower() for name in extras):
+        return ["out-of-process estimator service extras must be absent"]
     return []
 
 

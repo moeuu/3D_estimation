@@ -38,23 +38,24 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
     assert "==" in runtime_dependency
     assert set(runtime_source) == {"git", "rev"}
     assert len(runtime_source["rev"]) == 40
-    contract_dependency = next(
+    research_dependencies = tuple(
         dependency
         for dependency in runtime_dependencies
-        if dependency.startswith("radiation-estimator-service-contracts")
+        if dependency.startswith(("radiation-", "rotating-shield-"))
     )
-    contract_source = configuration["tool"]["uv"]["sources"][
-        "radiation-estimator-service-contracts"
-    ]
-    assert contract_dependency == "radiation-estimator-service-contracts==0.1.0"
-    assert set(contract_source) == {"git", "rev"}
-    assert contract_source["git"] == (
-        "https://github.com/moeuu/radiation-estimator-service-contracts.git"
+    assert research_dependencies == (runtime_dependency,)
+    assert set(configuration["tool"]["uv"].get("sources", {})) == {
+        "rotating-shield-simulation-runtime"
+    }
+    assert not any(
+        "service" in name.lower() or ".service:" in target
+        for name, target in project.get("scripts", {}).items()
     )
-    assert len(contract_source["rev"]) == 40
-    assert project["scripts"]["radiation-surface-mle-service"] == (
-        "three_d_estimation.service:main"
+    assert not any(
+        "service" in name.lower()
+        for name in project.get("optional-dependencies", {})
     )
+    assert not (ROOT / "src" / "three_d_estimation" / "service.py").exists()
 
 
 def test_package_discovery_contains_only_mle_code() -> None:

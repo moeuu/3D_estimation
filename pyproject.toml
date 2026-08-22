@@ -13,7 +13,6 @@ requires-python = ">=3.12"
 dependencies = [
   "matplotlib>=3.10.7",
   "numpy>=2.3.5",
-  "radiation-estimator-service-contracts==0.1.0",
   "rotating-shield-simulation-runtime==0.1.0",
   "scipy>=1.16.3",
   "threadpoolctl>=3.6.0",
@@ -29,7 +28,6 @@ dev = [
 [project.scripts]
 estimate-radiation-mle = "three_d_estimation.cli:main"
 estimate-radiation = "three_d_estimation.cli:main"
-radiation-surface-mle-service = "three_d_estimation.service:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -52,5 +50,4 @@ target-version = "py312"
 select = ["E4", "E7", "E9", "F"]
 
 [tool.uv.sources]
-radiation-estimator-service-contracts = { git = "https://github.com/moeuu/radiation-estimator-service-contracts.git", rev = "e7184a117d5018ddef015182f357eb638b6fa377" }
 rotating-shield-simulation-runtime = { git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git", rev = "dc853ad8d600451efad56d88038ef8f98a7a486b" }

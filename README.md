@@ -189,23 +189,6 @@ uv run estimate-radiation-mle fit-spectrum \
 The `replay` command is retained only for an explicitly derived count observation
 contract. It does not derive isotope counts from raw MeasurementLog spectra.
 
-The independent estimator service has exactly two process verbs:
-
-```bash
-radiation-surface-mle-service capabilities --response /path/to/capabilities.json
-radiation-surface-mle-service execute \
-  --request /path/to/request.json \
-  --response /path/to/response.json
-```
-
-`capabilities` advertises the single versioned surface-MLE estimate operation,
-MeasurementLog schema 2, and the accepted MLE config/result contracts. `execute`
-accepts authenticated file references and publishes an authenticated result
-directory. The shared package defines only this wire and artifact contract: the MLE
-solver, regularization, warm starts, and report construction remain in this
-repository. The service advertises `accepts_truth=false` and rejects truth-bearing
-requests; truth-free MeasurementLog records are its only observation input.
-
 For a final unseen-environment evaluation after regularization and calibration have
 been frozen:
 
