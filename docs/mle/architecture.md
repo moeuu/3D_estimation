@@ -10,16 +10,15 @@ MeasurementLog schema-2 records. This estimator imports that package's public re
 observation-model, continuous-kernel, asset-resolution, and log-reader APIs. It does
 not copy or synchronize runtime source.
 
-There are two estimator execution paths:
-
-1. `OnlineMLESession` accepts each already-persisted runtime record. Production RA-L
-   mode buffers all shield views at one point and performs one coarse all-history
-   warm fit only when the durable station marker closes that measurement point.
-   Finalization rebuilds the configured full-resolution grid and uncertainty result.
-2. `OnlineMLESession.plan_next_action` and the `plan-next` CLI rank truth-free
-   runtime candidate poses and Fe/Pb programs from a station-complete spectral MLE.
-   They use local Fisher `D_s`-optimal design, explicit vertical/support ambiguity
-   criteria, and the shared physical kernel.
+Production has one live estimator path. `OnlineMLESession` accepts each
+already-persisted runtime record. Production RA-L mode buffers all shield views at
+one point and performs one coarse all-history warm fit only when the durable station
+marker closes that measurement point. Finalization rebuilds the configured
+full-resolution grid and uncertainty result. After each completed station,
+`OnlineMLESession.plan_next_action` ranks the current truth-free runtime candidate
+poses and Fe/Pb programs using local Fisher `D_s`-optimal design, explicit
+vertical/support ambiguity criteria, and the shared physical kernel. No command
+reloads a saved log and estimate to plan another action.
 
 No path reads PF state or PF candidates. Runtime candidate generation, route and
 traversability planning, acquisition execution, simulation, and MeasurementLog
@@ -53,8 +52,8 @@ The notation used below is:
 | `E` | physical shared-edge graph edges |
 | `N` | fitted nuisance coefficients |
 
-The online backend and neutral prefix-scoring context convert runtime records into
-one validated `ObservationBatch`:
+The online backend and the runtime-context validator convert runtime records into one
+validated `ObservationBatch`:
 
 | Field | Shape | Meaning |
 | --- | --- | --- |
@@ -118,7 +117,7 @@ Patches have stable IDs, optional parent IDs, and refinement levels. Solver adja
 
 ## Shared physical kernel
 
-The online backend and neutral prefix-scoring/planning context call the shared runtime's
+The online backend and runtime-context validator call the shared runtime's
 `RuntimeObservationModel` and `ContinuousKernel`. Their response includes
 detector/source geometry, finite detector and aperture settings, selected Fe/Pb shield
 geometry and attenuation, obstacle path attenuation, optional buildup, and calibrated

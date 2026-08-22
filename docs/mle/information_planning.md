@@ -31,7 +31,7 @@ head/mast/base collision checks and separately calculated motion, settling, and
 shield-actuation costs. The MLE may return high-scoring candidate indices in a
 generic refinement request. The runtime—not this package—generates and
 collision-checks the local 3-D neighbors, after which the MLE reranks the refined
-set. PF, MLE, and future estimators therefore share one physical workspace.
+set. PF and MLE therefore share one physical workspace.
 
 ## Two-stage candidate search
 
@@ -167,29 +167,15 @@ positive precision floor, and nuisance Schur complement make it safer than simpl
 ranking expected counts, but the result still depends on the current MLE and response
 calibration.
 
-## Runtime candidate JSON
+## Live runtime candidate contract
 
-The standalone CLI accepts this strict shell:
-
-```json
-{
-  "candidate_poses_xyz": [[0.5, 0.5, 1.0], [1.5, 0.5, 1.0]],
-  "travel_costs": [0.0, 1.25],
-  "allowed_pair_ids": [0, 1, 8, 9],
-  "current_pair_id": 0
-}
-```
-
-Only `candidate_poses_xyz` is required. If `current_pair_id` is omitted, the last
-causal measurement supplies it. The planner never accepts source truth, PF
-particles, or PF candidates.
-
-`plan-next` verifies that the saved MLE belongs to the runtime run and resolved MLE
-configuration when those identities are present. Its covered step IDs must be an
-exact prefix of the available log, and only that prefix contributes Fisher
-information. Online planning is stricter still: it is available only when the
-latest durable record closes a station and the latest fit covers all received
-records.
+The controller passes `candidate_poses_xyz`, optional `travel_costs`, optional
+`allowed_pair_ids`, and the current shield pair directly to
+`OnlineMLESession.plan_next_action`. If `current_pair_id` is omitted, the last causal
+measurement supplies it. Planning is available only when the latest durable record
+closes a station and the latest fit covers all received records. The planner never
+accepts source truth, PF particles, or PF candidates, and there is no standalone
+command that plans from a reloaded log and saved estimate.
 
 Configuration defaults are in
 [`configs/mle/default_planning.json`](../../configs/mle/default_planning.json).

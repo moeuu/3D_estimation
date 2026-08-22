@@ -1,4 +1,4 @@
-"""Validated runtime context for MLE prefix planning and scoring."""
+"""Validated runtime context for MLE configuration and lineage checks."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from .types import MLEEstimate, ObservationBatch
 
 @dataclass(frozen=True, slots=True)
 class EstimatorContext:
-    """Hold validated objects needed to score one current measurement prefix."""
+    """Hold validated runtime objects for estimator configuration checks."""
 
     measurement_log_path: Path
     log: MeasurementLog
@@ -93,7 +93,7 @@ def prepare_estimator_context(
     config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
     config_source_sha256: str | None = None,
 ) -> EstimatorContext:
-    """Resolve runtime physics and MLE identities for one measurement prefix."""
+    """Resolve runtime physics and MLE identities for one measurement log."""
     resolved_log_path = Path(measurement_log_path).resolve()
     log = load_measurement_log(resolved_log_path)
     batch = observation_batch_from_log(log)

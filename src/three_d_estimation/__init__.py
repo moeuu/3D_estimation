@@ -17,11 +17,6 @@ from .estimator_context import (
     prepare_estimator_context,
     validate_warm_start_artifact,
 )
-from .future_scoring import (
-    covered_station_boundaries_sha256,
-    save_future_candidate_scores,
-    score_future_count_candidates,
-)
 from .information_planner import (
     PLANNING_METHOD,
     MLEPlanningAction,
@@ -112,7 +107,6 @@ __all__ = [
     "build_spectral_response",
     "build_surface_patches",
     "compute_forward_conformance",
-    "covered_station_boundaries_sha256",
     "ensure_dashboard_server",
     "evaluate_surface_map_objective",
     "fit_surface_map_poisson",
@@ -128,10 +122,8 @@ __all__ = [
     "refine_surface_patches",
     "run_ral_closed_loop",
     "save_forward_conformance",
-    "save_future_candidate_scores",
     "save_mle_estimate",
     "save_mle_planning_result",
-    "score_future_count_candidates",
     "select_fisher_action",
     "validate_ral_measurement_log",
     "validate_warm_start_artifact",

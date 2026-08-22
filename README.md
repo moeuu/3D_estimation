@@ -98,22 +98,9 @@ selected action includes detector xyz plus an ordered
 `measurement_program` with Fe/Pb indices, dwell times, and the final
 `station_complete` flag.
 
-The same operation is available for a saved station report:
-
-```bash
-uv run estimate-radiation-mle plan-next \
-  --run-dir /path/to/measurement-log \
-  --estimate /path/to/mle-online/stations/station_000003_step_00000015 \
-  --mle-config configs/mle/default_spectral.json \
-  --planning-config configs/mle/default_planning.json \
-  --candidates /path/from/runtime/candidates.json \
-  --output /path/to/next-mle-action.json \
-  --cpu --json
-```
-
 The online dashboard served at its existing URL shows the latest recommendation and
 marks its detector position. See [MLE information planning](docs/mle/information_planning.md)
-for the criterion, candidate JSON contract, and limitations.
+for the criterion, live candidate contract, and limitations.
 
 ## RA-L full simulation
 

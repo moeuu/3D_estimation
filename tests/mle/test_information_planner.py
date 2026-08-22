@@ -11,7 +11,6 @@ import pytest
 from measurement.continuous_kernels import ContinuousKernel
 
 import three_d_estimation.information_planner as information_planner
-from three_d_estimation.cli import _estimate_history_indices, build_argument_parser
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.information_planner import (
     PLANNING_METHOD,
@@ -2094,46 +2093,6 @@ def test_external_motion_cost_can_change_the_selected_pose() -> None:
     )
 
     assert selected.candidate_index == 0
-
-
-def test_plan_next_cli_requires_runtime_candidates_and_output() -> None:
-    """CLI should expose a separate runtime-candidate planning operation."""
-    args = build_argument_parser().parse_args(
-        [
-            "plan-next",
-            "--run-dir",
-            "/tmp/runtime-log",
-            "--estimate",
-            "/tmp/mle-report",
-            "--mle-config",
-            "/tmp/mle.json",
-            "--candidates",
-            "/tmp/candidates.json",
-            "--output",
-            "/tmp/action.json",
-        ]
-    )
-
-    assert args.command == "plan-next"
-    assert args.cpu is False
-    assert args.gpu is False
-    assert args.planning_config is None
-
-
-def test_planning_history_must_be_an_exact_causal_prefix() -> None:
-    """An old station estimate cannot inspect later MeasurementLog records."""
-
-    class _Estimate:
-        """Expose only diagnostics required by the CLI lineage check."""
-
-        diagnostics = {"online_lineage": {"covered_step_ids": [0, 1]}}
-
-    indices = _estimate_history_indices(_Estimate(), np.asarray([0, 1, 2]))
-    np.testing.assert_array_equal(indices, [0, 1])
-
-    _Estimate.diagnostics = {"online_lineage": {"covered_step_ids": [0, 2]}}
-    with pytest.raises(ValueError, match="exact causal prefix"):
-        _estimate_history_indices(_Estimate(), np.asarray([0, 1, 2]))
 
 
 def test_floor_ceiling_competition_rewards_height_discrimination() -> None:

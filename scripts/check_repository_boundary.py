@@ -24,6 +24,7 @@ FORBIDDEN_PATHS = (
     "src/spectrum",
     "src/realtime_demo.py",
     "src/three_d_estimation/holdout.py",
+    "src/three_d_estimation/future_scoring.py",
     "src/three_d_estimation/replay.py",
     "src/three_d_estimation/service.py",
     "scripts/run_mle_replay.py",

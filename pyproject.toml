@@ -50,4 +50,4 @@ target-version = "py312"
 select = ["E4", "E7", "E9", "F"]
 
 [tool.uv.sources]
-rotating-shield-simulation-runtime = { git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git", rev = "dc853ad8d600451efad56d88038ef8f98a7a486b" }
+rotating-shield-simulation-runtime = { git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git", rev = "12b1ee25e63ffd7c75b170fd36ab240bf2e819fe" }

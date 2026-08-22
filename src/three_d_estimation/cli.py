@@ -9,7 +9,6 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
-import numpy as np
 from runtime.cui import CUI_URL_MESSAGE_PREFIX
 from runtime.defaults import (
     DEFAULT_CUI_SPLIT_VIEW_HOST,
@@ -21,19 +20,7 @@ from .closed_loop import (
     RAL_PRIVATE_SCENE_PROFILES,
     run_ral_closed_loop,
 )
-from .config import MLEConfig
 from .conformance import compute_forward_conformance, save_forward_conformance
-from .estimator_context import prepare_estimator_context
-from .future_scoring import (
-    save_future_candidate_scores,
-    score_future_count_candidates,
-)
-from .information_planner import (
-    MLEPlanningConfig,
-    plan_next_measurement,
-    save_mle_planning_result,
-)
-from .observation_batch import subset_observation_batch
 from .ral import preflight_ral_full_simulation
 from .reporting import load_mle_estimate
 
@@ -189,70 +176,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print preflight or completed pipeline data as JSON.",
     )
-    planning_parser = subparsers.add_parser(
-        "plan-next",
-        help=(
-            "Select a runtime-supplied detector pose and Fe/Pb program by "
-            "MLE Fisher information."
-        ),
-    )
-    planning_parser.add_argument(
-        "--run-dir",
-        type=Path,
-        required=True,
-        help="Shared-runtime MeasurementLog containing the estimate history.",
-    )
-    planning_parser.add_argument(
-        "--estimate",
-        type=Path,
-        required=True,
-        help="Station-complete or final MLE report directory.",
-    )
-    planning_parser.add_argument(
-        "--mle-config",
-        type=Path,
-        required=True,
-        help="Exact spectral MLE configuration used for the estimate.",
-    )
-    planning_parser.add_argument(
-        "--candidates",
-        type=Path,
-        required=True,
-        help="Truth-free runtime candidate-pose JSON.",
-    )
-    planning_parser.add_argument(
-        "--planning-config",
-        type=Path,
-        default=None,
-        help="Optional MLE Fisher-planning JSON configuration.",
-    )
-    planning_parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Destination next-action JSON artifact.",
-    )
-    planning_device = planning_parser.add_mutually_exclusive_group()
-    planning_device.add_argument(
-        "--gpu",
-        action="store_true",
-        help="Use the shared runtime CUDA kernel when available.",
-    )
-    planning_device.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force CPU response construction.",
-    )
-    planning_parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace an existing next-action JSON artifact.",
-    )
-    planning_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print the complete planning result as JSON.",
-    )
     report_parser = subparsers.add_parser(
         "report",
         help="Read a saved MLE estimate and print its summary.",
@@ -284,48 +207,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace an existing conformance NPZ.",
-    )
-    score_parser = subparsers.add_parser(
-        "score-future",
-        help="Score frozen count-MLE candidates on post-cutoff observations only.",
-    )
-    score_parser.add_argument(
-        "--run-dir",
-        type=Path,
-        required=True,
-        help="Current station-complete MeasurementLog prefix.",
-    )
-    score_parser.add_argument(
-        "--mle-config",
-        type=Path,
-        required=True,
-        help="Exact count-MLE JSON configuration used by the snapshot report.",
-    )
-    score_parser.add_argument(
-        "--snapshot-estimate",
-        type=Path,
-        required=True,
-        help="Earlier count-MLE report directory or mle_estimate.npz.",
-    )
-    score_parser.add_argument(
-        "--snapshot",
-        type=Path,
-        required=True,
-        help="Earlier MLESnapshot v2 JSON artifact.",
-    )
-    score_parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Destination future-only score JSON.",
-    )
-    score_parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Replace an existing score JSON artifact.",
-    )
-    score_parser.add_argument(
-        "--json", action="store_true", help="Print the complete score as JSON."
     )
     return parser
 
@@ -458,135 +339,6 @@ def _run_ral_live_acquisition(args: argparse.Namespace) -> int:
     return 0
 
 
-def _candidate_payload(path: Path) -> dict[str, object]:
-    """Load and validate the runtime-owned truth-free candidate JSON shell."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError("Candidate-pose JSON root must be an object.")
-    allowed = {
-        "candidate_poses_xyz",
-        "travel_costs",
-        "allowed_pair_ids",
-        "current_pair_id",
-    }
-    unknown = sorted(set(payload) - allowed)
-    if unknown:
-        raise ValueError(f"Candidate-pose JSON has unknown fields: {unknown}")
-    if "candidate_poses_xyz" not in payload:
-        raise ValueError("Candidate-pose JSON requires candidate_poses_xyz.")
-    return payload
-
-
-def _estimate_history_indices(
-    estimate: object,
-    available_step_ids: object,
-) -> np.ndarray:
-    """Resolve and verify the exact causal history covered by an MLE report."""
-    diagnostics = dict(estimate.diagnostics)
-    lineage = diagnostics.get("online_lineage")
-    raw_steps = (
-        lineage.get("covered_step_ids")
-        if isinstance(lineage, dict)
-        else diagnostics.get("observation_step_ids")
-    )
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raise ValueError("MLE report must declare its covered observation step IDs.")
-    steps = np.asarray(raw_steps)
-    if not np.issubdtype(steps.dtype, np.integer) or np.issubdtype(
-        steps.dtype,
-        np.bool_,
-    ):
-        raise ValueError("MLE report covered step IDs must be integers.")
-    available = np.asarray(available_step_ids, dtype=np.int64)
-    expected = available[: steps.size]
-    if expected.shape != steps.shape or not np.array_equal(
-        expected,
-        steps.astype(np.int64),
-    ):
-        raise ValueError(
-            "MLE report history must be an exact causal prefix of the runtime log."
-        )
-    return np.arange(steps.size, dtype=np.int64)
-
-
-def _run_plan_next(args: argparse.Namespace) -> int:
-    """Run MLE-local Fisher planning over runtime-supplied candidate poses."""
-    mle_config = MLEConfig.load(args.mle_config)
-    mle_config = replace(mle_config, mode="spectral")
-    if args.gpu:
-        mle_config = replace(mle_config, use_gpu=True)
-    elif args.cpu:
-        mle_config = replace(mle_config, use_gpu=False)
-    context = prepare_estimator_context(args.run_dir, config=mle_config)
-    estimate = load_mle_estimate(args.estimate)
-    provenance = estimate.diagnostics.get("provenance", {})
-    if isinstance(provenance, dict):
-        estimate_run_id = provenance.get("measurement_run_id")
-        if estimate_run_id is not None and estimate_run_id != context.log.run_id:
-            raise ValueError("MLE estimate belongs to a different runtime run_id.")
-        estimate_config_digest = provenance.get("resolved_estimator_config_sha256")
-        if estimate_config_digest is not None and (
-            estimate_config_digest != context.resolved_estimator_config_sha256
-        ):
-            raise ValueError(
-                "MLE estimate was fitted with a different resolved MLE configuration."
-            )
-    indices = _estimate_history_indices(estimate, context.batch.step_ids)
-    history = subset_observation_batch(context.batch, indices)
-    candidates = _candidate_payload(args.candidates)
-    planning_config = (
-        MLEPlanningConfig()
-        if args.planning_config is None
-        else MLEPlanningConfig.load(args.planning_config)
-    )
-    current_pair = candidates.get("current_pair_id")
-    if current_pair is None:
-        orientation_count = len(context.kernel.orientations)
-        current_pair = int(history.fe_indices[-1]) * orientation_count + int(
-            history.pb_indices[-1]
-        )
-    result = plan_next_measurement(
-        estimate,
-        history,
-        context.kernel,
-        mle_config,
-        candidates["candidate_poses_xyz"],
-        planning_config=planning_config,
-        allowed_pair_ids=candidates.get("allowed_pair_ids"),
-        travel_costs=candidates.get("travel_costs"),
-        current_pair_id=current_pair,
-    )
-    result = replace(
-        result,
-        diagnostics={
-            **result.diagnostics,
-            "measurement_run_id": context.log.run_id,
-            "data_cutoff_step": int(history.step_ids[-1]),
-            "covered_step_ids": history.step_ids.astype(int).tolist(),
-            "resolved_estimator_config_sha256": (
-                context.resolved_estimator_config_sha256
-            ),
-        },
-    )
-    output = save_mle_planning_result(
-        result,
-        args.output,
-        overwrite=bool(args.overwrite),
-    )
-    payload = result.to_dict()
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        action = result.selected_action
-        print(f"candidate_index: {action.candidate_index}")
-        print(f"detector_pose_xyz: {list(action.detector_pose_xyz)}")
-        print(f"shield_pair_ids: {list(action.shield_pair_ids)}")
-        print(f"information_gain_nats: {action.information_gain_nats:.8g}")
-        print(f"score: {action.score:.8g}")
-        print(f"output: {output}")
-    return 0
-
-
 def _run_forward_conformance(args: argparse.Namespace) -> int:
     """Generate all canonical local forward responses and report their count."""
     result = compute_forward_conformance(args.axes)
@@ -600,43 +352,16 @@ def _run_forward_conformance(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_score_future(args: argparse.Namespace) -> int:
-    """Run frozen future-only candidate verification and save its artifact."""
-    payload = score_future_count_candidates(
-        args.run_dir,
-        config=args.mle_config,
-        snapshot_estimate=args.snapshot_estimate,
-        snapshot=args.snapshot,
-    )
-    output = save_future_candidate_scores(
-        args.output,
-        payload,
-        overwrite=bool(args.overwrite),
-    )
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print(f"snapshot_id: {payload['snapshot_id']}")
-        print(f"future_steps: {len(payload['future_step_ids'])}")
-        print(f"candidates: {len(payload['candidates'])}")
-        print(f"output: {output}")
-    return 0
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments and execute the requested standalone operation."""
     parser = build_argument_parser()
     args = parser.parse_args(None if argv is None else list(argv))
     if args.command == "ral-full-simulation":
         return _run_ral_live_acquisition(args)
-    if args.command == "plan-next":
-        return _run_plan_next(args)
     if args.command == "report":
         return _run_report(args)
     if args.command == "forward-conformance":
         return _run_forward_conformance(args)
-    if args.command == "score-future":
-        return _run_score_future(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

@@ -91,7 +91,7 @@ semantics. The current native contract includes:
 - line-resolved isotope energies, weights, and Fe/Pb attenuation; and
 - obstacle path and live-time response semantics.
 
-The online backend and neutral prefix-scoring/planning context reconstruct
+The online backend and runtime-context validator reconstruct
 `RuntimeObservationModel` and `ContinuousKernel` from this validated runtime context.
 They do not maintain a second copy of detector, shield, obstacle, or spectrum physics.
 

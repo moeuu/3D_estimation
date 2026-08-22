@@ -57,6 +57,7 @@ def test_build_metadata_separates_runtime_and_development_tools() -> None:
     )
     assert not (ROOT / "src" / "three_d_estimation" / "service.py").exists()
     assert not (ROOT / "src" / "three_d_estimation" / "holdout.py").exists()
+    assert not (ROOT / "src" / "three_d_estimation" / "future_scoring.py").exists()
     assert not (ROOT / "src" / "three_d_estimation" / "replay.py").exists()
     assert not (ROOT / "scripts" / "run_mle_replay.py").exists()
 
@@ -69,7 +70,14 @@ def test_completed_log_estimator_api_is_absent() -> None:
 
     assert importlib.util.find_spec("three_d_estimation.replay") is None
     assert importlib.util.find_spec("three_d_estimation.holdout") is None
+    assert importlib.util.find_spec("three_d_estimation.future_scoring") is None
     for name in ("ReplayContext", "ReplayResult", "prepare_replay", "run_replay"):
+        assert not hasattr(three_d_estimation, name)
+    for name in (
+        "covered_station_boundaries_sha256",
+        "save_future_candidate_scores",
+        "score_future_count_candidates",
+    ):
         assert not hasattr(three_d_estimation, name)
     assert not hasattr(online, "run_online_replay")
     assert not hasattr(ral, "RALFullSimulationResult")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -517,9 +518,39 @@ def test_online_dashboard_uses_runtime_resolved_file_obstacle_scene(
 
 @pytest.mark.parametrize(
     "command",
-    ("replay", "fit-spectrum", "online-replay", "online", "ral-holdout"),
+    (
+        "replay",
+        "fit-spectrum",
+        "online-replay",
+        "online",
+        "ral-holdout",
+        "plan-next",
+        "score-future",
+    ),
 )
-def test_finalized_log_fit_commands_are_not_cli_surfaces(command: str) -> None:
-    """Offline full-log fitting commands must not return to the public CLI."""
-    with pytest.raises(SystemExit):
+def test_offline_commands_are_not_cli_surfaces(
+    command: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Offline fitting, planning, and scoring commands must remain absent."""
+    with pytest.raises(SystemExit) as exc_info:
         build_argument_parser().parse_args([command])
+    assert exc_info.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_cli_exposes_only_live_and_read_only_commands() -> None:
+    """The installed CLI must keep one live launcher and read-only utilities."""
+    parser = build_argument_parser()
+    subparser_actions = [
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+
+    assert len(subparser_actions) == 1
+    assert set(subparser_actions[0].choices) == {
+        "ral-full-simulation",
+        "report",
+        "forward-conformance",
+    }
