@@ -79,6 +79,7 @@ def test_runtime_candidate_snapshot_is_shape_and_cost_checked() -> None:
         "travel_costs": [0.0, 1.0],
         "allowed_pair_ids": list(range(64)),
         "current_pair_id": 7,
+        "shield_angular_speed_rad_s": 0.5,
     }
 
     parsed = parse_candidate_snapshot(payload)
