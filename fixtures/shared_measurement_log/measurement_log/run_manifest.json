@@ -1,11 +1,11 @@
 {
   "artifact_hashes": {
     "environment.json": "523a7f7fd52accf6ce3921738ddb92e06a196691e1cb4e507cd2a8abfbc23a3f",
-    "forward_model_manifest.json": "379ba6a9153663534ffd5003b5f44befcbff15b6c49c22b8e82087d851a76756",
-    "observation_metadata.jsonl": "9d37ce9ce6d67c0f2d8a492e72ec15e03b32a2bada980fef2fe8928a27f84e0a",
+    "forward_model_manifest.json": "c83de9bb7b98c2d0893b66abd20aa3b322e99f754a5ca49c0d91e7b13c6c80af",
+    "observation_metadata.jsonl": "1d22972441fd471032806d9e6ec8d0198b529b4f92ccd9e5d2e9c2560d096920",
     "observations.npz": "f8d7594a3b716838f602a0e12f35c4484369e097e8fd1764bffe4d7067965a58",
     "repository_commit.txt": "5a84b79716842f146f7533d890cc7308cad7b21abdc29c1852c6b3bb8ad66672",
-    "runtime_config.resolved.json": "98191b403d6f94f38c0fdc8d6d198953ab434cc9c0568b5e740decdb07621d3f"
+    "runtime_config.resolved.json": "2ba77cd9e18a075174ce202b462040f2f2ef1f424cd4a50afe975040b0c81f4c"
   },
   "bin_width_keV": 2.0,
   "energy_bin_count": 851,
@@ -24,8 +24,8 @@
     "size_y": 2.0,
     "size_z": 1.5
   },
-  "forward_model_manifest_sha256": "379ba6a9153663534ffd5003b5f44befcbff15b6c49c22b8e82087d851a76756",
-  "full_spectrum_contract_hash_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
+  "forward_model_manifest_sha256": "c83de9bb7b98c2d0893b66abd20aa3b322e99f754a5ca49c0d91e7b13c6c80af",
+  "full_spectrum_contract_hash_sha256": "93fbef221a90af9b8248294416bcd539b8262c2f814c34244d999666251f5b7a",
   "full_spectrum_contract_schema_version": 3,
   "index_conventions": {
     "action_id": "zero_based_unique_measurement_action",
@@ -58,7 +58,7 @@
     },
     "spectrum": {
       "id": "test-full-spectrum.v2",
-      "sha256": "f146605bdae89ad9e689e7a12ae5e148f819780fbff0fe1044354c58b46926da"
+      "sha256": "202d64bd04194fcc7316384ebffdb3335f1225730808430eb3ed5cb569abf792"
     },
     "transport": {
       "id": "test-transport.v2",
@@ -69,7 +69,7 @@
   "obstacle_layout_path": null,
   "record_count": 12,
   "repository_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "resolved_config_sha256": "98191b403d6f94f38c0fdc8d6d198953ab434cc9c0568b5e740decdb07621d3f",
+  "resolved_config_sha256": "2ba77cd9e18a075174ce202b462040f2f2ef1f424cd4a50afe975040b0c81f4c",
   "run_id": "pure-pf-schema-v2-local-fixture",
   "schema_version": 2,
   "sim_backend": "analytic_test_fixture",

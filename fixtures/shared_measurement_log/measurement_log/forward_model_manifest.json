@@ -81,7 +81,7 @@
     },
     "spectrum": {
       "id": "test-full-spectrum.v2",
-      "sha256": "f146605bdae89ad9e689e7a12ae5e148f819780fbff0fe1044354c58b46926da"
+      "sha256": "202d64bd04194fcc7316384ebffdb3335f1225730808430eb3ed5cb569abf792"
     },
     "transport": {
       "id": "test-transport.v2",
@@ -91,7 +91,7 @@
   "obstacle_material_contract_id": "known_composite_materials_xcom_v1",
   "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
   "repository_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "resolved_config_sha256": "98191b403d6f94f38c0fdc8d6d198953ab434cc9c0568b5e740decdb07621d3f",
+  "resolved_config_sha256": "2ba77cd9e18a075174ce202b462040f2f2ef1f424cd4a50afe975040b0c81f4c",
   "response_semantics": {
     "detector_geometry": "model_identifier_bound",
     "distance_attenuation": "inverse_square_with_modelled_near_field",

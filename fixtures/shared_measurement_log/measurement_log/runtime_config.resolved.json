@@ -14,7 +14,7 @@
   "energy_bin_count": 851,
   "energy_max_keV": 1700.0,
   "energy_min_keV": 0.0,
-  "full_spectrum_contract_hash_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
+  "full_spectrum_contract_hash_sha256": "93fbef221a90af9b8248294416bcd539b8262c2f814c34244d999666251f5b7a",
   "full_spectrum_generative_model": {
     "acceptance_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650",
     "additive_noncollided_transport_response": {
@@ -311,7 +311,7 @@
     "background_rate_cps": 5.0,
     "background_semantics": "independent_pre_dead_time_pulse_rate_added_once",
     "bin_width_keV": 2.0,
-    "contract_hash_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
+    "contract_hash_sha256": "93fbef221a90af9b8248294416bcd539b8262c2f814c34244d999666251f5b7a",
     "dead_time_application_count": 1,
     "dead_time_model": "nonparalyzable_event_time_renewal_total",
     "dead_time_tau_s": 5.813e-09,
@@ -684,7 +684,7 @@
     "validation": {
       "additive_scatter_contract_sha256": "c09d50f84dbdd97bb93ef78ea7e4a5077c107366d41484ff50e90b581c921cf4",
       "all_passed": true,
-      "approved_model_contract_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
+      "approved_model_contract_sha256": "93fbef221a90af9b8248294416bcd539b8262c2f814c34244d999666251f5b7a",
       "artifact_sha256_by_scene": {
         "2026072701": "3f671714b50c9155b973270f2449f4d12292b27bac5ca298374cd697423e0c34",
         "2026072702": "a144379fd3df7017e91e7f0816476be8d6e4983b8234b262e467e281f7af0bb0",
@@ -1240,7 +1240,7 @@
       ],
       "validation_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650"
     },
-    "validation_manifest_sha256": "c0956be9e28770dd20622cb50c78fdb1eba91bb8e6af9d96613b224c82c88ffc"
+    "validation_manifest_sha256": "189a006595f23b59ca42eb1dcb9bd25b6130559fa271a9e92aa8a9b53813d675"
   },
   "line_resolved_shield_attenuation": true,
   "obstacle_attenuation_enabled": true,
