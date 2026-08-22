@@ -20,6 +20,7 @@ from .information_planner import (
     save_mle_planning_result,
     select_fisher_action,
 )
+from .live_snapshot import MLELiveSurfaceSnapshot
 from .observation_batch import (
     observation_batch_from_records,
 )
@@ -73,6 +74,7 @@ __all__ = [
     "ForwardConformanceResult",
     "MLEConfig",
     "MLEEstimate",
+    "MLELiveSurfaceSnapshot",
     "MLEPlanningAction",
     "MLEPlanningConfig",
     "MLEPlanningResult",

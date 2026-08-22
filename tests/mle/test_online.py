@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +16,7 @@ from measurement.obstacles import ObstacleGrid
 from runtime import CUIScene
 from runtime.prefix import measurement_records_digest
 from runtime.records import MeasurementRecord, RunContext
-from three_d_estimation import online as online_module
+from three_d_estimation import MLELiveSurfaceSnapshot, online as online_module
 from three_d_estimation.backend_contracts import EstimatorResult, EstimatorSnapshot
 from three_d_estimation.cli import build_argument_parser
 from three_d_estimation.config import MLEConfig
@@ -222,7 +223,20 @@ def _estimate(record_count: int) -> MLEEstimate:
         poisson_deviance=0.5,
         iterations=2,
         converged=True,
-        diagnostics={"hotspot_clusters": []},
+        diagnostics={
+            "hotspot_clusters": [
+                {
+                    "isotope": "Cs-137",
+                    "cluster_id": np.int64(4),
+                    "patch_ids": [0],
+                    "centroid_xyz": [0.5, 0.5, 0.0],
+                    "integrated_strength_cps_1m": 3.0,
+                    "peak_density_cps_1m_m2": np.float64(3.0),
+                    "surface_kinds": ["floor"],
+                    "centroid_covariance_xyz_m2": np.eye(3).tolist(),
+                }
+            ]
+        },
     )
 
 
@@ -528,6 +542,178 @@ def test_online_session_enforces_three_phase_finalization_order(
         session.receive_persisted(_record(1, 1, station_complete=True))
     with pytest.raises(RuntimeError, match="already complete"):
         session.plan_next_action(np.asarray([[1.0, 0.5, 1.0]]))
+
+
+def test_live_surface_snapshot_copies_immutable_mle_grid_and_lineage(
+    tmp_path: Path,
+) -> None:
+    """The live API must expose an immutable MLE grid, never PF-shaped state."""
+    backend = _FakeOnlineBackend()
+    session = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "online",
+        backend=backend,
+        enable_dashboard=False,
+    )
+    session.receive_persisted(_record(0, 0, station_complete=True))
+
+    snapshot = session.live_surface_snapshot()
+
+    assert backend.finalize_calls == 0
+    assert isinstance(snapshot, MLELiveSurfaceSnapshot)
+    assert snapshot.measurement_run_id == "online-test"
+    assert snapshot.record_count == 1
+    assert snapshot.data_cutoff_step == 0
+    assert snapshot.data_cutoff_station == 0
+    assert snapshot.covered_records_digest == measurement_records_digest(
+        session.records
+    )
+    assert snapshot.covered_records_sha256 == snapshot.covered_records_digest.sha256
+    assert snapshot.representation == "mle_surface_density_grid"
+    assert snapshot.density_unit == "detector_cps_1m_per_m2"
+    assert snapshot.isotope_names == ("Cs-137",)
+    assert snapshot.patch_ids == (0,)
+    assert snapshot.patch_surface_kinds == ("floor",)
+    assert snapshot.patch_object_ids == ("room:floor",)
+    np.testing.assert_array_equal(snapshot.patch_centroids_xyz, [[0.5, 0.5, 0.0]])
+    np.testing.assert_array_equal(snapshot.density_by_isotope, [[3.0]])
+    np.testing.assert_array_equal(snapshot.latest_predicted_spectrum, [1.0, 2.0])
+    assert snapshot.hotspot_clusters[0]["patch_ids"] == (0,)
+    assert snapshot.hotspot_clusters[0]["centroid_covariance_xyz_m2"] == (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    assert not hasattr(snapshot, "particles")
+    assert not hasattr(snapshot, "particle_weights")
+    assert not np.shares_memory(
+        snapshot.density_by_isotope,
+        backend.latest_estimate.density_by_isotope,
+    )
+    assert not np.shares_memory(
+        snapshot.latest_predicted_spectrum,
+        backend.latest_estimate.predicted_spectra,
+    )
+
+    with pytest.raises(ValueError, match="read-only"):
+        snapshot.density_by_isotope[0, 0] = 9.0
+    with pytest.raises(ValueError, match="read-only"):
+        snapshot.patch_centroids_xyz[0, 0] = 9.0
+    with pytest.raises(TypeError):
+        snapshot.hotspot_clusters[0]["isotope"] = "Co-60"
+    with pytest.raises(FrozenInstanceError):
+        setattr(snapshot, "record_count", 2)
+
+
+def test_live_surface_snapshot_remains_available_across_finalization_phases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Completion, binding, and publication must retain the same live grid API."""
+    backend = _FakeOnlineBackend()
+    session = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "online",
+        backend=backend,
+        enable_dashboard=False,
+    )
+    with pytest.raises(RuntimeError, match="completed station fit"):
+        session.live_surface_snapshot()
+    session.receive_persisted(_record(0, 0, station_complete=False))
+    with pytest.raises(RuntimeError, match="completed station fit"):
+        session.live_surface_snapshot()
+    session.receive_persisted(_record(1, 0, station_complete=True))
+    station_snapshot = session.live_surface_snapshot()
+    session.complete_live_state()
+    complete_snapshot = session.live_surface_snapshot()
+    assert backend.finalize_calls == 1
+
+    run_dir = (tmp_path / "measurement-log").resolve()
+    fake_log = SimpleNamespace(
+        path=run_dir,
+        run_id=session.context.run_id,
+        context=session.context,
+        records=session.records,
+        content_sha256="d" * 64,
+    )
+    monkeypatch.setattr(online_module, "load_measurement_log", lambda path: fake_log)
+    session.bind_finalized_measurement_log(run_dir)
+
+    def reject_completed_log_read(path: Path) -> object:
+        """Fail if snapshot construction reopens the completed log."""
+        del path
+        raise AssertionError("live_surface_snapshot must not read the completed log")
+
+    monkeypatch.setattr(
+        online_module,
+        "load_measurement_log",
+        reject_completed_log_read,
+    )
+    bound_snapshot = session.live_surface_snapshot()
+    session.publish_bound_result()
+    published_snapshot = session.live_surface_snapshot()
+
+    assert station_snapshot.covered_records_digest == (
+        complete_snapshot.covered_records_digest
+    )
+    assert bound_snapshot.covered_records_digest == (
+        published_snapshot.covered_records_digest
+    )
+    assert backend.finalize_calls == 1
+
+
+def test_live_surface_snapshot_rejects_failed_state_and_stale_prediction(
+    tmp_path: Path,
+) -> None:
+    """Failed sessions are unreadable and stale predictions are not exposed."""
+
+    class StalePredictionBackend(_FakeOnlineBackend):
+        """Publish a valid surface estimate with no current prediction row."""
+
+        def on_station_complete(
+            self,
+            station_id: int,
+            measurements: tuple[MeasurementRecord, ...],
+        ) -> None:
+            """Fit density while leaving prediction rows behind live history."""
+            del station_id, measurements
+            self.latest_estimate = _estimate(0)
+
+    stale = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "stale",
+        backend=StalePredictionBackend(),
+        enable_dashboard=False,
+    )
+    stale.receive_persisted(_record(0, 0, station_complete=True))
+    assert stale.live_surface_snapshot().latest_predicted_spectrum is None
+
+    class FailingBackend(_FakeOnlineBackend):
+        """Raise during a station fit to place the online session in failure."""
+
+        def on_station_complete(
+            self,
+            station_id: int,
+            measurements: tuple[MeasurementRecord, ...],
+        ) -> None:
+            """Inject a scientific station-fit failure."""
+            del station_id, measurements
+            raise RuntimeError("injected station fit failure")
+
+    failed = OnlineMLESession(
+        context=_context(),
+        config=MLEConfig(mode="spectral", isotope_names=("Cs-137",)),
+        output_dir=tmp_path / "failed",
+        backend=FailingBackend(),
+        enable_dashboard=False,
+    )
+    with pytest.raises(RuntimeError, match="injected station fit failure"):
+        failed.receive_persisted(_record(0, 0, station_complete=True))
+    with pytest.raises(RuntimeError, match="failed"):
+        failed.live_surface_snapshot()
 
 
 @pytest.mark.parametrize("tampering", ("context", "records"))

@@ -24,6 +24,15 @@ the configured full-resolution map while acquisition is still active;
 `publish_bound_result()` only adds provenance and writes the final artifacts. No
 scientific fit is allowed after runtime log publication, and `OnlineMLESession` has
 no ambiguous `finalize()` method.
+
+Controllers and CUI integrations can call `live_surface_snapshot()` at any completed
+station boundary, including after final binding and publication. It returns the MLE's
+own immutable `MLELiveSurfaceSnapshot`: an isotope-by-surface-patch density grid,
+patch geometry identifiers, hotspot diagnostics, causal record digest, and the latest
+prediction when it covers the entire received history. This contract deliberately
+contains no PF particles or particle weights and does not trigger a fit or reopen a
+completed MeasurementLog.
+
 The output is:
 
 ```text

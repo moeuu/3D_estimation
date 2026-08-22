@@ -31,6 +31,7 @@ from .information_planner import (
     save_mle_planning_result,
 )
 from .lineage import covered_records_lineage
+from .live_snapshot import MLELiveSurfaceSnapshot
 from .provenance import estimator_provenance
 from .reporting import (
     MLEReportPaths,
@@ -591,6 +592,38 @@ class OnlineMLESession:
             self._failed = True
             raise
 
+    def live_surface_snapshot(self) -> MLELiveSurfaceSnapshot:
+        """Copy the current station-complete MLE state for live rendering."""
+        self._ensure_healthy()
+        records = self.records
+        if not records or self._last_completed_record_count != len(records):
+            raise RuntimeError(
+                "MLE live surface snapshots require a completed station fit."
+            )
+        estimate = (
+            self._completed_state.final_estimate
+            if self._completed_state is not None
+            else self._latest_published_estimate
+        )
+        if not isinstance(estimate, MLEEstimate):
+            raise RuntimeError(
+                "MLE live surface snapshots require a current MLE estimate."
+            )
+        predicted = estimate.predicted_spectra
+        prediction_covers_history = (
+            predicted is not None and predicted.shape[0] == len(records)
+        )
+        latest = records[-1]
+        return MLELiveSurfaceSnapshot.from_estimate(
+            estimate,
+            measurement_run_id=self.context.run_id,
+            record_count=len(records),
+            data_cutoff_step=latest.step_id,
+            data_cutoff_station=latest.station_id,
+            covered_records_digest=measurement_records_digest(records),
+            include_latest_prediction=prediction_covers_history,
+        )
+
     process_persisted_measurement = receive_persisted
 
     def bind_finalized_measurement_log(
@@ -763,6 +796,7 @@ class OnlineMLESession:
 __all__ = [
     "CompletedOnlineMLEState",
     "ONLINE_STATE_FILENAME",
+    "MLELiveSurfaceSnapshot",
     "OnlineMLERunResult",
     "OnlineMLESession",
     "OnlineStationReport",
