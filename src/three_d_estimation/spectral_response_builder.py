@@ -21,6 +21,10 @@ from threadpoolctl import threadpool_limits
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
 from runtime.discrepancy_calibration import DiscrepancyCalibration
+from spectrum.additive_scatter import (
+    AdditiveNoncollidedTransportResponse,
+    PhysicsOnlyNoncollidedTransportResponse,
+)
 from spectrum.library import default_library
 from spectrum.response_matrix import (
     BACKSCATTER_FRACTION,
@@ -39,6 +43,15 @@ from .response_operator import (
 
 
 @dataclass(frozen=True, slots=True)
+class _SpectralProcessKernel:
+    """Store a pickle-safe recipe for one fresh runtime kernel."""
+
+    kernel_without_additive_response: ContinuousKernel
+    additive_response_kind: str | None
+    additive_response_payload: Mapping[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedSpectralIsotope:
     """Store one isotope's jointly evaluated transport lines and pulses."""
 
@@ -47,7 +60,7 @@ class _PreparedSpectralIsotope:
     line_start: int
     weights: NDArray[np.float64]
     positive_line_indices: NDArray[np.int64]
-    kernel: ContinuousKernel
+    kernel: ContinuousKernel | _SpectralProcessKernel
     pulses: NDArray[np.float64]
 
 
@@ -84,23 +97,90 @@ def _available_cpu_count() -> int:
 def _fresh_spectral_process_context(
     context: _SpectralProcessContext,
 ) -> _SpectralProcessContext:
-    """Clone physical kernels without serializing parent execution caches."""
-    cloned_kernels: dict[int, ContinuousKernel] = {}
+    """Return a spawn-safe context without parent caches or mapping proxies."""
+    cloned_kernels: dict[int, _SpectralProcessKernel] = {}
     prepared_isotopes: list[_PreparedSpectralIsotope] = []
     for prepared in context.prepared_isotopes:
+        if not isinstance(prepared.kernel, ContinuousKernel):
+            raise TypeError("Spectral process preparation requires runtime kernels.")
         identity = id(prepared.kernel)
         fresh_kernel = cloned_kernels.get(identity)
         if fresh_kernel is None:
-            fresh_kernel = replace(prepared.kernel)
+            response = prepared.kernel.additive_scatter_response
+            if response is None:
+                response_kind = None
+                response_payload = None
+            elif type(response) is AdditiveNoncollidedTransportResponse:
+                response_kind = "additive_noncollided"
+                response_payload = response.to_payload()
+            elif type(response) is PhysicsOnlyNoncollidedTransportResponse:
+                response_kind = "physics_only_noncollided"
+                response_payload = response.to_payload()
+            else:
+                raise TypeError("Unsupported additive scatter response type.")
+            fresh_kernel = _SpectralProcessKernel(
+                kernel_without_additive_response=replace(
+                    prepared.kernel,
+                    additive_scatter_response=None,
+                ),
+                additive_response_kind=response_kind,
+                additive_response_payload=response_payload,
+            )
             cloned_kernels[identity] = fresh_kernel
         prepared_isotopes.append(replace(prepared, kernel=fresh_kernel))
+    return replace(context, prepared_isotopes=tuple(prepared_isotopes))
+
+
+def _materialize_spectral_process_context(
+    context: _SpectralProcessContext,
+) -> _SpectralProcessContext:
+    """Rebuild authenticated runtime responses inside one spawned worker."""
+    restored_kernels: dict[int, ContinuousKernel] = {}
+    prepared_isotopes: list[_PreparedSpectralIsotope] = []
+    for prepared in context.prepared_isotopes:
+        recipe = prepared.kernel
+        if isinstance(recipe, ContinuousKernel):
+            restored_kernel = replace(recipe)
+        else:
+            identity = id(recipe)
+            restored_kernel = restored_kernels.get(identity)
+            if restored_kernel is None:
+                payload = recipe.additive_response_payload
+                if recipe.additive_response_kind is None:
+                    if payload is not None:
+                        raise ValueError(
+                            "Kernel response payload lacks a response kind."
+                        )
+                    response = None
+                elif recipe.additive_response_kind == "additive_noncollided":
+                    if payload is None:
+                        raise ValueError("Additive response payload is unavailable.")
+                    response = AdditiveNoncollidedTransportResponse.from_payload(
+                        payload
+                    )
+                elif recipe.additive_response_kind == "physics_only_noncollided":
+                    if payload is None:
+                        raise ValueError(
+                            "Physics-only response payload is unavailable."
+                        )
+                    response = PhysicsOnlyNoncollidedTransportResponse.from_payload(
+                        payload
+                    )
+                else:
+                    raise ValueError("Kernel response recipe kind is invalid.")
+                restored_kernel = replace(
+                    recipe.kernel_without_additive_response,
+                    additive_scatter_response=response,
+                )
+                restored_kernels[identity] = restored_kernel
+        prepared_isotopes.append(replace(prepared, kernel=restored_kernel))
     return replace(context, prepared_isotopes=tuple(prepared_isotopes))
 
 
 def _initialize_spectral_process(context: _SpectralProcessContext) -> None:
     """Initialize one CPU worker without nested Torch oversubscription."""
     global _SPECTRAL_PROCESS_CONTEXT, _SPECTRAL_THREADPOOL_LIMITER
-    _SPECTRAL_PROCESS_CONTEXT = context
+    _SPECTRAL_PROCESS_CONTEXT = _materialize_spectral_process_context(context)
     _SPECTRAL_THREADPOOL_LIMITER = threadpool_limits(limits=1)
     try:
         import torch
@@ -131,6 +211,8 @@ def _calculate_spectral_context_task(
         dtype=np.float64,
     )
     for prepared in context.prepared_isotopes:
+        if not isinstance(prepared.kernel, ContinuousKernel):
+            raise RuntimeError("Spectral response kernel was not initialized.")
         raw = _joint_line_kernel_values(
             prepared.kernel,
             prepared.isotope,
@@ -1056,7 +1138,7 @@ def _spectral_spatial_cache_key(
 ) -> str:
     """Return a stable physical-model and patch line-factor cache key."""
     digest = sha256()
-    digest.update(b"spectral-response-spatial-line-factor-v5\0")
+    digest.update(b"spectral-response-spatial-line-factor-v6\0")
     try:
         runtime_distribution = distribution("rotating-shield-simulation-runtime")
         runtime_identity = (
@@ -1074,7 +1156,12 @@ def _spectral_spatial_cache_key(
         if field.init and field.name != "gpu_device":
             _hash_canonical_value(digest, field.name)
             _hash_canonical_value(digest, getattr(kernel, field.name))
-    _hash_canonical_value(digest, dict(isotope_lines))
+    # Spatial-factor line columns follow the requested isotope order. Preserve
+    # that order in the namespace instead of canonicalizing it as a mapping.
+    ordered_isotope_lines = tuple(
+        (isotope, tuple(lines)) for isotope, lines in isotope_lines.items()
+    )
+    _hash_canonical_value(digest, ordered_isotope_lines)
     for array in (areas, quadrature_points, quadrature_weights):
         _hash_array(digest, array)
     return digest.hexdigest()

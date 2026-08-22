@@ -34,7 +34,7 @@ from .types import MLEEstimate, ObservationBatch, SurfacePatch
 from .uncertainty import _project_patch_strengths_to_base
 
 
-PLANNING_METHOD = "two_stage_grouped_likelihood_fisher_d_s_station_block_v4"
+PLANNING_METHOD = "two_stage_grouped_likelihood_fisher_d_s_station_block_v5"
 _BEAM_PRECISION_WORKSPACE_LIMIT_BYTES = 64 * 1024 * 1024
 
 
@@ -453,12 +453,94 @@ class _LineSpectralDesign:
 
 
 @dataclass(frozen=True, slots=True)
+class _SpectralHypothesisMoments:
+    """Store grouped source counts and complete observation variance."""
+
+    source_counts: NDArray[np.float64]
+    total_variance: NDArray[np.float64]
+
+
+@dataclass(frozen=True, slots=True)
+class _GroupedNB2LineDesign:
+    """Project grouped NB2 hypotheses without a dense fine-bin response."""
+
+    grouped_response: NDArray[np.float64]
+    grouped_background: NDArray[np.float64]
+    spatial_factors: NDArray[np.float64]
+    pulse_shapes: NDArray[np.float64]
+    line_isotope_indices: NDArray[np.int64]
+    live_times_s: NDArray[np.float64]
+    background_rate_by_bin: NDArray[np.float64]
+    overdispersion_alpha_by_bin: NDArray[np.float64]
+    fine_group_indices: NDArray[np.int64]
+    group_count: int
+    energy_chunk_size: int
+
+    def project_hypothesis(
+        self,
+        strengths: NDArray[np.float64],
+    ) -> _SpectralHypothesisMoments:
+        """Return exact grouped source counts and NB2 variance for one hypothesis."""
+        values = np.asarray(strengths, dtype=np.float64)
+        isotope_count = int(np.max(self.line_isotope_indices)) + 1
+        expected_shape = (self.spatial_factors.shape[1], isotope_count)
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"Grouped screening strengths must have shape {expected_shape}."
+            )
+        if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+            raise ValueError(
+                "Grouped screening strengths must be finite and non-negative."
+            )
+        amplitudes = np.einsum(
+            "mgl,gl->ml",
+            self.spatial_factors,
+            values[:, self.line_isotope_indices],
+            optimize=True,
+        )
+        measurement_count = int(self.spatial_factors.shape[0])
+        grouped_source = np.zeros(
+            (measurement_count, int(self.group_count)),
+            dtype=np.float64,
+        )
+        grouped_variance = np.zeros_like(grouped_source)
+        bin_count = int(self.pulse_shapes.shape[1])
+        for start in range(0, bin_count, int(self.energy_chunk_size)):
+            stop = min(start + int(self.energy_chunk_size), bin_count)
+            source_chunk = amplitudes @ self.pulse_shapes[:, start:stop]
+            common_chunk = (
+                self.live_times_s[:, None]
+                * self.background_rate_by_bin[None, start:stop]
+            )
+            mean_chunk = source_chunk + common_chunk
+            variance_chunk = mean_chunk + (
+                self.overdispersion_alpha_by_bin[None, start:stop] * mean_chunk**2
+            )
+            group_indices = self.fine_group_indices[start:stop]
+            grouped_source += _group_last_axis(
+                source_chunk,
+                group_indices,
+                int(self.group_count),
+            )
+            grouped_variance += _group_last_axis(
+                variance_chunk,
+                group_indices,
+                int(self.group_count),
+            )
+        return _SpectralHypothesisMoments(
+            source_counts=grouped_source,
+            total_variance=grouped_variance,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _ScreeningPatchView:
     """Expose compact representative points as unit-area pseudo patches."""
 
     quadrature_points_xyz: NDArray[np.float64]
     quadrature_weights: NDArray[np.float64]
     areas_m2: NDArray[np.float64]
+    strength_projection: NDArray[np.float64]
 
 
 def _validated_candidate_poses(
@@ -597,9 +679,17 @@ def _screening_pseudo_model(
         [patch.patch_id for patch in estimate.patches],
         dtype=np.int64,
     )
+    patch_areas = np.asarray(
+        [patch.area_m2 for patch in estimate.patches],
+        dtype=np.float64,
+    )
+    patch_index_by_id = {
+        int(patch_id): patch_index for patch_index, patch_id in enumerate(patch_ids)
+    }
     pseudo_points: list[NDArray[np.float64]] = []
     pseudo_strength_rows: list[NDArray[np.float64]] = []
     pseudo_basis_rows: list[NDArray[np.float64]] = []
+    pseudo_strength_projection: list[NDArray[np.float64]] = []
     point_limit = int(config.screening_points_per_mode)
     isotope_count = len(estimate.isotope_names)
     parameter_count = full_basis.shape[2]
@@ -608,7 +698,13 @@ def _screening_pseudo_model(
         if not coordinates.size:
             raise RuntimeError("Screening mode unexpectedly has no coordinates.")
         isotope_index = int(coordinates[0, 1])
-        indices = coordinates[:, 0].astype(np.int64)
+        mode_patch_ids = labels[parameter_index]["patch_ids"]
+        if not isinstance(mode_patch_ids, list):
+            raise RuntimeError("Screening mode patch IDs must be stored as a list.")
+        indices = np.asarray(
+            [patch_index_by_id[int(patch_id)] for patch_id in mode_patch_ids],
+            dtype=np.int64,
+        )
         weights = full_basis[indices, isotope_index, parameter_index]
         local_points = patch_points[indices]
         representative_count = min(point_limit, int(indices.size))
@@ -617,9 +713,12 @@ def _screening_pseudo_model(
         representatives = [first]
         minimum_distance = np.linalg.norm(local_points - local_points[first], axis=1)
         while len(representatives) < representative_count:
-            scores = minimum_distance * np.sqrt(np.maximum(weights, 0.0))
+            scores = minimum_distance.copy()
             scores[np.asarray(representatives, dtype=np.int64)] = -np.inf
-            next_index = int(np.argmax(scores))
+            next_candidates = np.flatnonzero(scores == float(np.max(scores)))
+            next_index = int(
+                next_candidates[np.argmin(patch_ids[indices[next_candidates]])]
+            )
             representatives.append(next_index)
             minimum_distance = np.minimum(
                 minimum_distance,
@@ -633,16 +732,21 @@ def _screening_pseudo_model(
             axis=2,
         )
         assignments = np.argmin(distances, axis=1)
+        for cluster_index, representative_index in enumerate(representatives):
+            assignments[representative_index] = cluster_index
         for cluster_index in range(representative_count):
             members = assignments == cluster_index
             if not np.any(members):
-                continue
+                raise RuntimeError("Screening representative cluster is empty.")
             cluster_weights = weights[members]
             weight_sum = float(np.sum(cluster_weights))
+            centroid_weights = (
+                cluster_weights if weight_sum > 0.0 else patch_areas[indices[members]]
+            )
             centroid = np.average(
                 local_points[members],
                 axis=0,
-                weights=cluster_weights,
+                weights=centroid_weights,
             )
             strength_row = np.zeros(isotope_count, dtype=np.float64)
             strength_row[isotope_index] = float(
@@ -653,14 +757,27 @@ def _screening_pseudo_model(
                 dtype=np.float64,
             )
             basis_row[isotope_index, parameter_index] = weight_sum
+            projection_row = np.zeros(
+                (len(estimate.patches), isotope_count),
+                dtype=np.float64,
+            )
+            projection_row[
+                indices[members],
+                isotope_index,
+            ] = 1.0
             pseudo_points.append(np.asarray(centroid, dtype=np.float64))
             pseudo_strength_rows.append(strength_row)
             pseudo_basis_rows.append(basis_row)
+            pseudo_strength_projection.append(projection_row)
     points = np.asarray(pseudo_points, dtype=np.float64)
     patch_view = _ScreeningPatchView(
         quadrature_points_xyz=points[:, None, :],
         quadrature_weights=np.ones((points.shape[0], 1), dtype=np.float64),
         areas_m2=np.ones(points.shape[0], dtype=np.float64),
+        strength_projection=np.asarray(
+            pseudo_strength_projection,
+            dtype=np.float64,
+        ),
     )
     pseudo_strengths = np.asarray(pseudo_strength_rows, dtype=np.float64)
     pseudo_basis = np.asarray(pseudo_basis_rows, dtype=np.float64)
@@ -955,7 +1072,11 @@ def _diverse_exact_candidate_indices(
     target = min(maximum, max(minimum, within_margin))
     pool = tuple(ranked[: min(len(ranked), max(4 * target, target))])
     selected: list[int] = []
-    forced = min(2, target, len(pool))
+    forced = min(
+        target,
+        len(pool),
+        max(minimum, int(np.ceil((1.0 - config.exact_diversity_weight) * target))),
+    )
     selected.extend(int(pool[index].candidate_index) for index in range(forced))
     coordinates = np.asarray(
         [poses[int(action.candidate_index)] for action in pool],
@@ -1359,14 +1480,9 @@ def _calibrated_screening_spectral_design(
     isotopes: Sequence[str],
     kernel: ContinuousKernel,
     mle_config: MLEConfig,
-    source_strengths: NDArray[np.float64],
     background_rate_by_bin: NDArray[np.float64],
     grouped_edges_keV: NDArray[np.float64],
-) -> tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-]:
+) -> _GroupedNB2LineDesign:
     """Build grouped response and exact grouped NB2 variance from line factors."""
     if mle_config.discrepancy_calibration_path is None:
         raise ValueError("Calibrated screening requires a calibration artifact.")
@@ -1425,35 +1541,35 @@ def _calibrated_screening_spectral_design(
             operator.spatial_factors[:, None, :, line_index]
             * grouped_pulses[line_index][None, :, None]
         )
-    strengths = np.asarray(source_strengths, dtype=np.float64)
-    if strengths.shape != (operator.patch_count, operator.isotope_count):
-        raise ValueError("Screening strengths do not match compact response axes.")
-    amplitudes = np.einsum(
-        "mgl,gl->ml",
-        operator.spatial_factors,
-        strengths[:, operator.line_isotope_indices],
-        optimize=True,
-    )
     background_rate = np.asarray(background_rate_by_bin, dtype=np.float64)
     if background_rate.shape != (operator.observation_shape[1],):
         raise ValueError("Fine screening background rate must match energy bins.")
-    background_by_bin = (
-        np.asarray(observations.live_times_s, dtype=np.float64)[:, None]
-        * background_rate[None, :]
+    live_times = np.asarray(observations.live_times_s, dtype=np.float64)
+    grouped_background = np.zeros(
+        (measurement_count, group_count),
+        dtype=np.float64,
     )
-    expected_by_bin = amplitudes @ operator.pulse_shapes + background_by_bin
-    grouped_variance = _grouped_overdispersed_variance(
-        expected_by_bin,
-        details.overdispersion_alpha_by_bin,
-        group_indices,
-        group_count,
+    energy_step = int(mle_config.response_energy_chunk_size)
+    for start in range(0, operator.observation_shape[1], energy_step):
+        stop = min(start + energy_step, operator.observation_shape[1])
+        grouped_background += _group_last_axis(
+            live_times[:, None] * background_rate[None, start:stop],
+            group_indices[start:stop],
+            group_count,
+        )
+    return _GroupedNB2LineDesign(
+        grouped_response=grouped_response,
+        grouped_background=grouped_background,
+        spatial_factors=operator.spatial_factors,
+        pulse_shapes=operator.pulse_shapes,
+        line_isotope_indices=operator.line_isotope_indices,
+        live_times_s=live_times,
+        background_rate_by_bin=background_rate,
+        overdispersion_alpha_by_bin=details.overdispersion_alpha_by_bin,
+        fine_group_indices=group_indices,
+        group_count=group_count,
+        energy_chunk_size=energy_step,
     )
-    grouped_background = _group_last_axis(
-        background_by_bin,
-        group_indices,
-        group_count,
-    )
-    return grouped_response, grouped_background, grouped_variance
 
 
 def _historical_spectral_design(
@@ -2238,8 +2354,12 @@ def _symmetric_spectral_separation(
     first: NDArray[np.float64],
     second: NDArray[np.float64],
     overdispersion_alpha_by_bin: NDArray[np.float64] | None = None,
+    common_counts: NDArray[np.float64] | None = None,
+    *,
+    first_variance: NDArray[np.float64] | None = None,
+    second_variance: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Return bounded count- and variance-aware spectral separation."""
+    """Return bounded separation using complete shared Poisson/NB2 means."""
     first_values = np.asarray(first, dtype=np.float64)
     second_values = np.asarray(second, dtype=np.float64)
     if first_values.shape != second_values.shape or first_values.ndim < 1:
@@ -2251,22 +2371,57 @@ def _symmetric_spectral_separation(
         or np.any(second_values < 0.0)
     ):
         raise ValueError("Spectral hypotheses must contain finite non-negative counts.")
-    alpha = (
-        np.zeros(first_values.shape[-1], dtype=np.float64)
-        if overdispersion_alpha_by_bin is None
-        else np.asarray(overdispersion_alpha_by_bin, dtype=np.float64)
-    )
-    if alpha.size == 0:
-        alpha = np.zeros(first_values.shape[-1], dtype=np.float64)
-    if (
-        alpha.shape != (first_values.shape[-1],)
-        or np.any(~np.isfinite(alpha))
-        or np.any(alpha < 0.0)
-    ):
-        raise ValueError("Spectral separation overdispersion must match bins.")
-    denominator = (
-        first_values + second_values + alpha * (first_values**2 + second_values**2)
-    )
+    if (first_variance is None) != (second_variance is None):
+        raise ValueError(
+            "Both spectral hypothesis variances must be supplied together."
+        )
+    if first_variance is not None and second_variance is not None:
+        first_variance_values = np.asarray(first_variance, dtype=np.float64)
+        second_variance_values = np.asarray(second_variance, dtype=np.float64)
+        if (
+            first_variance_values.shape != first_values.shape
+            or second_variance_values.shape != second_values.shape
+            or np.any(~np.isfinite(first_variance_values))
+            or np.any(first_variance_values < 0.0)
+            or np.any(~np.isfinite(second_variance_values))
+            or np.any(second_variance_values < 0.0)
+        ):
+            raise ValueError(
+                "Spectral hypothesis variances must match finite non-negative counts."
+            )
+        denominator = first_variance_values + second_variance_values
+    else:
+        alpha = (
+            np.zeros(first_values.shape[-1], dtype=np.float64)
+            if overdispersion_alpha_by_bin is None
+            else np.asarray(overdispersion_alpha_by_bin, dtype=np.float64)
+        )
+        if alpha.size == 0:
+            alpha = np.zeros(first_values.shape[-1], dtype=np.float64)
+        if (
+            alpha.shape not in {(first_values.shape[-1],), first_values.shape}
+            or np.any(~np.isfinite(alpha))
+            or np.any(alpha < 0.0)
+        ):
+            raise ValueError("Spectral separation overdispersion must match bins.")
+        common = (
+            np.zeros_like(first_values)
+            if common_counts is None
+            else np.asarray(common_counts, dtype=np.float64)
+        )
+        try:
+            common = np.broadcast_to(common, first_values.shape)
+        except ValueError as exc:
+            raise ValueError(
+                "Common spectral counts must broadcast to both hypotheses."
+            ) from exc
+        if np.any(~np.isfinite(common)):
+            raise ValueError("Common spectral counts must be finite.")
+        first_mean = np.maximum(first_values + common, 0.0)
+        second_mean = np.maximum(second_values + common, 0.0)
+        denominator = (
+            first_mean + second_mean + alpha * (first_mean**2 + second_mean**2)
+        )
     distance = 0.5 * np.sum(
         np.divide(
             (first_values - second_values) ** 2,
@@ -2279,60 +2434,126 @@ def _symmetric_spectral_separation(
     return -np.expm1(-np.maximum(distance, 0.0))
 
 
-def _ambiguity_metrics(
-    response: NDArray[np.float64] | _LineSpectralDesign,
-    information: NDArray[np.float64],
-    poses: NDArray[np.float64],
-    estimate: MLEEstimate,
-    historical: ObservationBatch,
+def _aligned_support_strengths(
+    base_strengths: NDArray[np.float64],
+    alternative_strengths: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Match isotope totals so only within-isotope support can differ."""
+    base = np.asarray(base_strengths, dtype=np.float64)
+    alternative = np.asarray(alternative_strengths, dtype=np.float64)
+    if base.shape != alternative.shape or base.ndim != 2:
+        raise ValueError("Support strength maps must have matching G x I shapes.")
+    if (
+        np.any(~np.isfinite(base))
+        or np.any(base < 0.0)
+        or np.any(~np.isfinite(alternative))
+        or np.any(alternative < 0.0)
+    ):
+        raise ValueError("Support strength maps must be finite and non-negative.")
+    aligned = base.copy()
+    base_totals = np.sum(base, axis=0)
+    alternative_totals = np.sum(alternative, axis=0)
+    shared = (base_totals > 0.0) & (alternative_totals > 0.0)
+    if np.any(shared):
+        aligned[:, shared] = (
+            alternative[:, shared]
+            * (base_totals[shared] / alternative_totals[shared])[None, :]
+        )
+    return aligned
+
+
+def _vertical_basis_scale(
+    patch_z: NDArray[np.float64],
     source_basis: NDArray[np.float64],
-    alternatives: Sequence[MLEEstimate],
+) -> NDArray[np.float64]:
+    """Return one centered vertical coordinate for each source basis mode."""
+    z_values = np.asarray(patch_z, dtype=np.float64)
+    basis = np.asarray(source_basis, dtype=np.float64)
+    if basis.ndim != 3 or z_values.shape != (basis.shape[0],):
+        raise ValueError("Patch heights and source basis must align.")
+    basis_mass = np.sum(np.abs(basis), axis=(0, 1))
+    basis_z = np.einsum(
+        "g,gik->k",
+        z_values,
+        np.abs(basis),
+        optimize=True,
+    ) / np.maximum(basis_mass, 1.0e-30)
+    z_span = max(float(np.ptp(z_values)), 1.0e-12)
+    return (basis_z - float(np.mean(basis_z))) / z_span
+
+
+def _response_ambiguity_metrics(
+    project: Callable[[NDArray[np.float64]], NDArray[np.float64]],
+    information: NDArray[np.float64],
+    floor_weights: NDArray[np.float64],
+    ceiling_weights: NDArray[np.float64],
+    base_strengths: NDArray[np.float64],
+    alternative_strengths: Sequence[NDArray[np.float64]],
+    z_scale: NDArray[np.float64],
+    overdispersion_alpha_by_bin: NDArray[np.float64],
+    common_counts: NDArray[np.float64] | None,
+    project_moments: (
+        Callable[[NDArray[np.float64]], _SpectralHypothesisMoments] | None
+    ) = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Return pose/pair metrics for vertical and support-hypothesis ambiguity."""
-    if isinstance(response, _LineSpectralDesign):
-        action_count, _bin_count = response.observation_shape
-        patch_count = response.patch_count
-        isotope_count = response.isotope_count
-        separation_alpha = response.overdispersion_alpha_by_bin
+    """Return response-dependent ambiguity metrics for one action batch."""
+    fisher = np.asarray(information, dtype=np.float64)
 
-        def project(weights: NDArray[np.float64]) -> NDArray[np.float64]:
-            """Project one source hypothesis through compact line factors."""
-            return _factorized_source_spectrum(response, weights)
+    def hypothesis_moments(
+        weights: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
+        """Project source counts and an optional exact grouped variance."""
+        if project_moments is None:
+            return np.asarray(project(weights), dtype=np.float64), None
+        moments = project_moments(weights)
+        if not isinstance(moments, _SpectralHypothesisMoments):
+            raise TypeError("Hypothesis moment projection returned an invalid value.")
+        return (
+            np.asarray(moments.source_counts, dtype=np.float64),
+            np.asarray(moments.total_variance, dtype=np.float64),
+        )
 
-    else:
-        action_count, _bin_count, patch_count, isotope_count = response.shape
-        separation_alpha = np.zeros(_bin_count, dtype=np.float64)
+    def separation(
+        first_spectrum: NDArray[np.float64],
+        second_spectrum: NDArray[np.float64],
+        first_variance: NDArray[np.float64] | None,
+        second_variance: NDArray[np.float64] | None,
+    ) -> NDArray[np.float64]:
+        """Return exact available separation for two projected hypotheses."""
+        if first_variance is not None and second_variance is not None:
+            return _symmetric_spectral_separation(
+                first_spectrum,
+                second_spectrum,
+                first_variance=first_variance,
+                second_variance=second_variance,
+            )
+        return _symmetric_spectral_separation(
+            first_spectrum,
+            second_spectrum,
+            overdispersion_alpha_by_bin,
+            common_counts,
+        )
 
-        def project(weights: NDArray[np.float64]) -> NDArray[np.float64]:
-            """Project one source hypothesis through a dense test response."""
-            return np.einsum("abgi,gi->ab", response, weights, optimize=True)
-
-    if patch_count != len(estimate.patches):
-        raise ValueError("Planner response and estimate patches do not align.")
-    floor = np.asarray(
-        [patch.surface_kind == "floor" for patch in estimate.patches],
-        dtype=bool,
-    )
-    ceiling = np.asarray(
-        [patch.surface_kind == "ceiling" for patch in estimate.patches],
-        dtype=bool,
-    )
-
-    def surface_spectrum(mask: NDArray[np.bool_]) -> NDArray[np.float64]:
-        """Return equal-total-strength spectra for one competing surface."""
-        weights = np.zeros((patch_count, isotope_count), dtype=np.float64)
-        if np.any(mask):
-            weights[mask] = 1.0 / (float(np.count_nonzero(mask)) * isotope_count)
-        return project(weights)
-
-    floor_spectrum = surface_spectrum(floor)
-    ceiling_spectrum = surface_spectrum(ceiling)
-    floor_ceiling = _symmetric_spectral_separation(
+    floor_spectrum, floor_variance = hypothesis_moments(floor_weights)
+    ceiling_spectrum, ceiling_variance = hypothesis_moments(ceiling_weights)
+    if (
+        fisher.ndim != 3
+        or floor_spectrum.shape != ceiling_spectrum.shape
+        or floor_spectrum.ndim != 2
+        or fisher.shape[0] != floor_spectrum.shape[0]
+    ):
+        raise ValueError("Ambiguity spectra and Fisher actions must align.")
+    floor_ceiling = separation(
         floor_spectrum,
         ceiling_spectrum,
-        separation_alpha,
+        floor_variance,
+        ceiling_variance,
     )
-    floor_centered = floor_spectrum - np.mean(floor_spectrum, axis=1, keepdims=True)
+    floor_centered = floor_spectrum - np.mean(
+        floor_spectrum,
+        axis=1,
+        keepdims=True,
+    )
     ceiling_centered = ceiling_spectrum - np.mean(
         ceiling_spectrum,
         axis=1,
@@ -2345,42 +2566,61 @@ def _ambiguity_metrics(
     correlation = np.divide(
         np.sum(floor_centered * ceiling_centered, axis=1),
         denominator,
-        out=np.ones(action_count, dtype=np.float64),
+        out=np.ones(floor_spectrum.shape[0], dtype=np.float64),
         where=denominator > 0.0,
     )
     correlation_reduction = 1.0 - np.clip(np.abs(correlation), 0.0, 1.0)
 
-    patch_z = np.asarray([patch.centroid_xyz[2] for patch in estimate.patches])
-    basis_mass = np.sum(np.abs(source_basis), axis=(0, 1))
-    basis_z = np.einsum(
-        "g,gik->k",
-        patch_z,
-        np.abs(source_basis),
-        optimize=True,
-    ) / np.maximum(basis_mass, 1.0e-30)
-    z_span = max(float(np.ptp(patch_z)), 1.0e-12)
-    z_scale = (basis_z - float(np.mean(basis_z))) / z_span
-    source_count = int(source_basis.shape[2])
-    nuisance_count = int(information.shape[1]) - source_count
+    vertical = np.asarray(z_scale, dtype=np.float64)
+    source_count = int(vertical.size)
+    nuisance_count = int(fisher.shape[1]) - source_count
+    if fisher.shape[1] != fisher.shape[2] or nuisance_count < 0:
+        raise ValueError("Ambiguity Fisher dimensions do not match source modes.")
     marginal_information = np.stack(
         tuple(
             _source_marginal_precision(action_information, nuisance_count)
-            for action_information in information
+            for action_information in fisher
         ),
         axis=0,
     )
     z_fisher = np.einsum(
         "k,akl,l->a",
-        z_scale,
+        vertical,
         marginal_information,
-        z_scale,
+        vertical,
         optimize=True,
     )
     z_fisher = np.log1p(np.maximum(z_fisher, 0.0))
 
-    support_separation = np.zeros(action_count, dtype=np.float64)
-    base_strength = np.asarray(estimate.patch_strength_by_isotope, dtype=float).T
-    base_prediction = project(base_strength)
+    base = np.asarray(base_strengths, dtype=np.float64)
+    base_prediction, base_variance = hypothesis_moments(base)
+    support_separation = np.zeros(floor_spectrum.shape[0], dtype=np.float64)
+    for alternative in alternative_strengths:
+        aligned = _aligned_support_strengths(base, alternative)
+        alternative_prediction, alternative_variance = hypothesis_moments(aligned)
+        support_separation = np.maximum(
+            support_separation,
+            separation(
+                base_prediction,
+                alternative_prediction,
+                base_variance,
+                alternative_variance,
+            ),
+        )
+    return {
+        "floor_ceiling": floor_ceiling,
+        "support": support_separation,
+        "z_fisher": z_fisher,
+        "correlation": correlation_reduction,
+    }
+
+
+def _project_alternative_strengths(
+    estimate: MLEEstimate,
+    alternatives: Sequence[MLEEstimate],
+) -> tuple[NDArray[np.float64], ...]:
+    """Project compatible alternative estimates onto the current patch grid."""
+    projected: list[NDArray[np.float64]] = []
     for alternative in alternatives:
         if tuple(alternative.isotope_names) != tuple(estimate.isotope_names):
             continue
@@ -2391,32 +2631,57 @@ def _ambiguity_metrics(
             )
         except ValueError:
             continue
-        alternative_strength = np.asarray(
+        strength = np.asarray(
             alternative.patch_strength_by_isotope,
             dtype=np.float64,
         ).T
-        prediction = project(projection @ alternative_strength)
-        support_separation = np.maximum(
-            support_separation,
-            _symmetric_spectral_separation(
-                base_prediction,
-                prediction,
-                separation_alpha,
-            ),
-        )
+        projected.append(projection @ strength)
+    return tuple(projected)
 
+
+def _geometry_normalization_scale(
+    candidate_context_xyz: NDArray[np.float64],
+    historical: ObservationBatch,
+) -> float:
+    """Return one fixed geometry scale for a complete candidate search."""
+    context = _validated_candidate_poses(candidate_context_xyz)
+    return max(
+        float(
+            np.linalg.norm(
+                np.ptp(
+                    np.vstack((context, historical.detector_positions_xyz)),
+                    axis=0,
+                )
+            )
+        ),
+        1.0e-12,
+    )
+
+
+def _geometric_ambiguity_metrics(
+    poses: NDArray[np.float64],
+    estimate: MLEEstimate,
+    historical: ObservationBatch,
+    geometry_scale: float,
+) -> dict[str, NDArray[np.float64]]:
+    """Return pose-only ambiguity metrics under one fixed search scale."""
+    candidate_poses = _validated_candidate_poses(poses)
+    scale = float(geometry_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("geometry_scale must be finite and positive.")
+    base_strength = np.asarray(estimate.patch_strength_by_isotope, dtype=float).T
     strengths = np.sum(base_strength, axis=1)
+    patch_points = np.vstack(
+        [np.asarray(patch.centroid_xyz, dtype=np.float64) for patch in estimate.patches]
+    )
     source_centroid = (
         np.average(
-            np.vstack([patch.centroid_xyz for patch in estimate.patches]),
+            patch_points,
             axis=0,
             weights=np.maximum(strengths, 0.0),
         )
         if np.any(strengths > 0.0)
-        else np.mean(
-            np.vstack([patch.centroid_xyz for patch in estimate.patches]),
-            axis=0,
-        )
+        else np.mean(patch_points, axis=0)
     )
 
     def elevation(candidate: NDArray[np.float64]) -> float:
@@ -2428,18 +2693,10 @@ def _ambiguity_metrics(
         [elevation(pose) for pose in historical.detector_positions_xyz],
         dtype=np.float64,
     )
-    pose_count = poses.shape[0]
+    pose_count = candidate_poses.shape[0]
     elevation_diversity = np.zeros(pose_count, dtype=np.float64)
     geometry_exploration = np.zeros(pose_count, dtype=np.float64)
-    scale = max(
-        float(
-            np.linalg.norm(
-                np.ptp(np.vstack((poses, historical.detector_positions_xyz)), axis=0)
-            )
-        ),
-        1.0e-12,
-    )
-    for pose_index, pose in enumerate(poses):
+    for pose_index, pose in enumerate(candidate_poses):
         angle = elevation(pose)
         elevation_diversity[pose_index] = min(
             1.0,
@@ -2457,9 +2714,6 @@ def _ambiguity_metrics(
             )
             / scale,
         )
-    patch_points = np.vstack(
-        [np.asarray(patch.centroid_xyz, dtype=np.float64) for patch in estimate.patches]
-    )
     patch_areas = np.asarray(
         [float(patch.area_m2) for patch in estimate.patches],
         dtype=np.float64,
@@ -2487,7 +2741,7 @@ def _ambiguity_metrics(
         1.0,
     )
     surface_coverage = np.zeros(pose_count, dtype=np.float64)
-    for pose_index, pose in enumerate(poses):
+    for pose_index, pose in enumerate(candidate_poses):
         candidate_distances = np.linalg.norm(patch_points - pose[None, :], axis=1)
         improvement = np.maximum(
             np.minimum(historical_distances, surface_scale)
@@ -2499,16 +2753,113 @@ def _ambiguity_metrics(
             float(np.sum(coverage_weights * improvement)) / surface_scale,
         )
     return {
-        "floor_ceiling": floor_ceiling,
-        "support": support_separation,
-        "z_fisher": z_fisher,
-        "correlation": correlation_reduction,
-        "elevation": np.repeat(elevation_diversity, action_count // pose_count),
-        "geometry": np.repeat(geometry_exploration, action_count // pose_count),
-        "surface_coverage": np.repeat(
-            surface_coverage,
-            action_count // pose_count,
+        "elevation": elevation_diversity,
+        "geometry": geometry_exploration,
+        "surface_coverage": surface_coverage,
+    }
+
+
+def _ambiguity_metrics(
+    response: NDArray[np.float64] | _LineSpectralDesign,
+    information: NDArray[np.float64],
+    poses: NDArray[np.float64],
+    estimate: MLEEstimate,
+    historical: ObservationBatch,
+    source_basis: NDArray[np.float64],
+    alternatives: Sequence[MLEEstimate],
+    *,
+    nuisance_coefficients: NDArray[np.float64] | None = None,
+    common_counts: NDArray[np.float64] | None = None,
+    geometry_scale: float | None = None,
+) -> dict[str, NDArray[np.float64]]:
+    """Return pose/pair metrics for vertical and support-hypothesis ambiguity."""
+    if isinstance(response, _LineSpectralDesign):
+        action_count, _bin_count = response.observation_shape
+        patch_count = response.patch_count
+        isotope_count = response.isotope_count
+        separation_alpha = response.overdispersion_alpha_by_bin
+        coefficients = (
+            np.zeros(len(response.nuisance_names), dtype=np.float64)
+            if nuisance_coefficients is None
+            else np.asarray(nuisance_coefficients, dtype=np.float64)
+        )
+        if coefficients.shape != (len(response.nuisance_names),):
+            raise ValueError("Ambiguity nuisance coefficients do not align.")
+        shared_counts = (
+            np.einsum(
+                "abn,n->ab",
+                response.nuisance_response,
+                coefficients,
+                optimize=True,
+            )
+            if common_counts is None
+            else np.asarray(common_counts, dtype=np.float64)
+        )
+
+        def project(weights: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Project one source hypothesis through compact line factors."""
+            return _factorized_source_spectrum(response, weights)
+
+    else:
+        action_count, _bin_count, patch_count, isotope_count = response.shape
+        separation_alpha = np.zeros(_bin_count, dtype=np.float64)
+        shared_counts = common_counts
+
+        def project(weights: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Project one source hypothesis through a dense test response."""
+            return np.einsum("abgi,gi->ab", response, weights, optimize=True)
+
+    if patch_count != len(estimate.patches):
+        raise ValueError("Planner response and estimate patches do not align.")
+    floor = np.asarray(
+        [patch.surface_kind == "floor" for patch in estimate.patches],
+        dtype=bool,
+    )
+    ceiling = np.asarray(
+        [patch.surface_kind == "ceiling" for patch in estimate.patches],
+        dtype=bool,
+    )
+
+    def surface_weights(mask: NDArray[np.bool_]) -> NDArray[np.float64]:
+        """Return equal-total-strength weights for one competing surface."""
+        weights = np.zeros((patch_count, isotope_count), dtype=np.float64)
+        if np.any(mask):
+            weights[mask] = 1.0 / (float(np.count_nonzero(mask)) * isotope_count)
+        return weights
+
+    patch_z = np.asarray([patch.centroid_xyz[2] for patch in estimate.patches])
+    base_strength = np.asarray(estimate.patch_strength_by_isotope, dtype=float).T
+    response_metrics = _response_ambiguity_metrics(
+        project,
+        information,
+        surface_weights(floor),
+        surface_weights(ceiling),
+        base_strength,
+        _project_alternative_strengths(estimate, alternatives),
+        _vertical_basis_scale(patch_z, source_basis),
+        separation_alpha,
+        shared_counts,
+    )
+    pose_count = poses.shape[0]
+    if action_count % pose_count:
+        raise ValueError("Ambiguity actions must contain equal pair counts per pose.")
+    geometric_metrics = _geometric_ambiguity_metrics(
+        poses,
+        estimate,
+        historical,
+        (
+            _geometry_normalization_scale(poses, historical)
+            if geometry_scale is None
+            else float(geometry_scale)
         ),
+    )
+    repeats = action_count // pose_count
+    return {
+        **response_metrics,
+        **{
+            name: np.repeat(values, repeats)
+            for name, values in geometric_metrics.items()
+        },
     }
 
 
@@ -3444,6 +3795,7 @@ def _screen_candidate_measurements(
     config: MLEPlanningConfig,
     historical_response_cache: dict[str, object] | None,
     progress_hook: Callable[[Mapping[str, object]], None] | None,
+    alternative_estimates: Sequence[MLEEstimate] = (),
 ) -> MLEPlanningResult:
     """Screen many poses with grouped spectra and a compact source basis."""
     started = perf_counter()
@@ -3461,6 +3813,80 @@ def _screen_candidate_measurements(
         historical_basis,
         basis_labels,
     ) = _screening_pseudo_model(estimate, config)
+    isotope_count = len(estimate.isotope_names)
+    full_surface_kinds = np.asarray(
+        [patch.surface_kind for patch in estimate.patches],
+        dtype=object,
+    )
+
+    def pseudo_surface_weights(kind: str) -> NDArray[np.float64]:
+        """Project one equal-total full-surface hypothesis to pseudo points."""
+        selected = full_surface_kinds == kind
+        full_weights = np.zeros(
+            (len(estimate.patches), isotope_count),
+            dtype=np.float64,
+        )
+        if np.any(selected):
+            full_weights[selected] = 1.0 / (
+                float(np.count_nonzero(selected)) * isotope_count
+            )
+        return np.einsum(
+            "rgi,gi->ri",
+            screening_patches.strength_projection,
+            full_weights,
+            optimize=True,
+        )
+
+    screening_floor_weights = pseudo_surface_weights("floor")
+    screening_ceiling_weights = pseudo_surface_weights("ceiling")
+    projected_alternatives = _project_alternative_strengths(
+        estimate,
+        alternative_estimates,
+    )
+    screening_alternatives = tuple(
+        np.einsum(
+            "rgi,gi->ri",
+            screening_patches.strength_projection,
+            alternative,
+            optimize=True,
+        )
+        for alternative in projected_alternatives
+    )
+    screening_z_scale = _vertical_basis_scale(
+        np.asarray([patch.centroid_xyz[2] for patch in estimate.patches]),
+        historical_basis,
+    )
+    geometry_scale = _geometry_normalization_scale(
+        poses,
+        historical_observations,
+    )
+    geometric_metrics = _geometric_ambiguity_metrics(
+        poses,
+        estimate,
+        historical_observations,
+        geometry_scale,
+    )
+    bootstrap_multiplier = (
+        1.0
+        if historical_observations.measurement_count
+        < int(config.geometry_bootstrap_measurements)
+        else 0.25
+    )
+
+    def pose_utility(
+        elevation: float,
+        geometry: float,
+        surface_coverage: float,
+    ) -> float:
+        """Return the pair-independent ambiguity utility for one pose."""
+        return (
+            float(config.elevation_diversity_weight) * float(elevation)
+            + bootstrap_multiplier
+            * float(config.geometry_exploration_weight)
+            * float(geometry)
+            + float(config.surface_coverage_weight) * float(surface_coverage)
+        )
+
     historical_strengths = np.asarray(
         estimate.patch_strength_by_isotope,
         dtype=np.float64,
@@ -3524,6 +3950,15 @@ def _screen_candidate_measurements(
         ),
     )
     cache_identity = (
+        tuple(
+            (
+                int(patch.patch_id),
+                str(patch.surface_kind),
+                str(patch.object_id),
+                np.asarray(patch.vertices_xyz, dtype=np.float64).tobytes(),
+            )
+            for patch in estimate.patches
+        ),
         np.asarray(
             estimate.patch_strength_by_isotope,
             dtype=np.float64,
@@ -3531,6 +3966,10 @@ def _screen_candidate_measurements(
         np.asarray(source_strengths, dtype=np.float64).tobytes(),
         np.asarray(basis, dtype=np.float64).tobytes(),
         np.asarray(background_rate, dtype=np.float64).tobytes(),
+        tuple(nuisance_names),
+        np.asarray(nuisance_coefficients, dtype=np.float64).tobytes(),
+        np.asarray(nuisance_scales, dtype=np.float64).tobytes(),
+        np.asarray(base_precision, dtype=np.float64).tobytes(),
         _cached_model_identity(
             historical_response_cache,
             "historical_factorized_design",
@@ -3540,6 +3979,25 @@ def _screen_candidate_measurements(
         config.to_dict(),
         mle_config.to_dict(),
         current_pair_id,
+        tuple(
+            (
+                tuple(alternative.isotope_names),
+                np.asarray(
+                    alternative.patch_strength_by_isotope,
+                    dtype=np.float64,
+                ).tobytes(),
+                tuple(
+                    (
+                        int(patch.patch_id),
+                        str(patch.surface_kind),
+                        str(patch.object_id),
+                        np.asarray(patch.vertices_xyz, dtype=np.float64).tobytes(),
+                    )
+                    for patch in alternative.patches
+                ),
+            )
+            for alternative in alternative_estimates
+        ),
     )
     cache_entry = (
         None
@@ -3608,19 +4066,22 @@ def _screen_candidate_measurements(
             station_ids=np.zeros(expanded.shape[0], dtype=np.int64),
         )
         response_started = perf_counter()
+        grouped_nb2_design: _GroupedNB2LineDesign | None = None
         if calibrated_screening:
-            response, background, observation_variance = (
-                _calibrated_screening_spectral_design(
-                    geometry,
-                    screening_patches,
-                    estimate.isotope_names,
-                    kernel,
-                    mle_config,
-                    source_strengths,
-                    background_rate,
-                    screening_edges,
-                )
+            grouped_nb2_design = _calibrated_screening_spectral_design(
+                geometry,
+                screening_patches,
+                estimate.isotope_names,
+                kernel,
+                mle_config,
+                background_rate,
+                screening_edges,
             )
+            response = grouped_nb2_design.grouped_response
+            background = grouped_nb2_design.grouped_background
+            observation_variance = grouped_nb2_design.project_hypothesis(
+                source_strengths
+            ).total_variance
         else:
             response = _screening_spectral_design(
                 geometry,
@@ -3647,6 +4108,38 @@ def _screen_candidate_measurements(
             gpu_device=str(mle_config.gpu_device),
         )
         fisher_seconds += perf_counter() - fisher_started
+
+        def project_screening(
+            weights: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
+            """Project one pseudo-source hypothesis through grouped response."""
+            return np.einsum(
+                "abgi,gi->ab",
+                response,
+                weights,
+                optimize=True,
+            )
+
+        def project_screening_moments(
+            weights: NDArray[np.float64],
+        ) -> _SpectralHypothesisMoments:
+            """Project exact fine-bin NB2 moments into screening groups."""
+            if grouped_nb2_design is None:
+                raise RuntimeError("Grouped NB2 screening design is unavailable.")
+            return grouped_nb2_design.project_hypothesis(weights)
+
+        response_ambiguity = _response_ambiguity_metrics(
+            project_screening,
+            information,
+            screening_floor_weights,
+            screening_ceiling_weights,
+            source_strengths,
+            screening_alternatives,
+            screening_z_scale,
+            np.zeros(response.shape[1], dtype=np.float64),
+            background,
+            (project_screening_moments if grouped_nb2_design is not None else None),
+        )
         information = information.reshape(
             local_count,
             representative_pairs.size,
@@ -3654,6 +4147,19 @@ def _screen_candidate_measurements(
             base_precision.shape[1],
         )
         totals = totals.reshape(local_count, representative_pairs.size)
+        ambiguity_by_pose = {
+            name: values.reshape(local_count, representative_pairs.size)
+            for name, values in response_ambiguity.items()
+        }
+        pair_utility_bonuses = (
+            float(config.floor_ceiling_separation_weight)
+            * ambiguity_by_pose["floor_ceiling"]
+            + float(config.support_hypothesis_separation_weight)
+            * ambiguity_by_pose["support"]
+            + float(config.z_fisher_weight) * ambiguity_by_pose["z_fisher"]
+            + float(config.response_correlation_reduction_weight)
+            * ambiguity_by_pose["correlation"]
+        )
         beam_started = perf_counter()
         _, local_ranked = select_fisher_action(
             local_poses,
@@ -3666,6 +4172,7 @@ def _screen_candidate_measurements(
             config=screening_config,
             travel_costs=costs[selected_indices],
             current_pair_id=current_pair_id,
+            pair_utility_bonus=pair_utility_bonuses,
             use_gpu=bool(mle_config.use_gpu),
             gpu_device=str(mle_config.gpu_device),
         )
@@ -3673,12 +4180,49 @@ def _screen_candidate_measurements(
         by_local_index = {action.candidate_index: action for action in local_ranked}
         for local_index, global_index in enumerate(selected_indices):
             action = by_local_index[local_index]
+            selected_pair_indices = np.asarray(
+                [
+                    int(np.flatnonzero(representative_pairs == pair_id)[0])
+                    for pair_id in action.shield_pair_ids
+                ],
+                dtype=np.int64,
+            )
+
+            def selected_mean(name: str) -> float:
+                """Return one selected screening-program ambiguity mean."""
+                return float(
+                    np.mean(
+                        ambiguity_by_pose[name][
+                            local_index,
+                            selected_pair_indices,
+                        ]
+                    )
+                )
+
+            floor_ceiling = selected_mean("floor_ceiling")
+            support = selected_mean("support")
+            z_fisher = selected_mean("z_fisher")
+            correlation = selected_mean("correlation")
+            elevation = float(geometric_metrics["elevation"][global_index])
+            geometry_value = float(geometric_metrics["geometry"][global_index])
+            surface_coverage = float(
+                geometric_metrics["surface_coverage"][global_index]
+            )
             actions_by_pose[
                 np.asarray(poses[global_index], dtype=np.float64).tobytes()
             ] = replace(
                 action,
                 candidate_index=int(global_index),
                 detector_pose_xyz=tuple(float(value) for value in poses[global_index]),
+                score=float(action.score)
+                + pose_utility(elevation, geometry_value, surface_coverage),
+                floor_ceiling_separation=floor_ceiling,
+                support_hypothesis_separation=support,
+                z_fisher_information=z_fisher,
+                response_correlation_reduction=correlation,
+                elevation_diversity=elevation,
+                geometry_exploration=geometry_value,
+                surface_coverage=surface_coverage,
             )
         completed_missing += local_count
         if progress_hook is not None:
@@ -3702,6 +4246,19 @@ def _screen_candidate_measurements(
     for index, pose in enumerate(poses):
         cached = actions_by_pose[np.asarray(pose, dtype=np.float64).tobytes()]
         travel_delta = float(costs[index]) - float(cached.travel_cost)
+        elevation = float(geometric_metrics["elevation"][index])
+        geometry_value = float(geometric_metrics["geometry"][index])
+        surface_coverage = float(geometric_metrics["surface_coverage"][index])
+        cached_pose_utility = pose_utility(
+            cached.elevation_diversity,
+            cached.geometry_exploration,
+            cached.surface_coverage,
+        )
+        current_pose_utility = pose_utility(
+            elevation,
+            geometry_value,
+            surface_coverage,
+        )
         actions.append(
             replace(
                 cached,
@@ -3709,7 +4266,12 @@ def _screen_candidate_measurements(
                 detector_pose_xyz=tuple(float(value) for value in pose),
                 travel_cost=float(costs[index]),
                 score=float(cached.score)
+                - cached_pose_utility
+                + current_pose_utility
                 - float(config.motion_cost_weight) * travel_delta,
+                elevation_diversity=elevation,
+                geometry_exploration=geometry_value,
+                surface_coverage=surface_coverage,
             )
         )
     ranked = tuple(
@@ -3731,6 +4293,7 @@ def _screen_candidate_measurements(
         ),
         "approximate": True,
         "stage": "screening",
+        "ambiguity_aware": True,
         "candidate_count": int(poses.shape[0]),
         "screening_energy_bin_count": bin_count,
         "screening_pair_ids": representative_pairs.astype(int).tolist(),
@@ -3768,6 +4331,7 @@ def _plan_next_measurement_exact(
     alternative_estimates: Sequence[MLEEstimate] = (),
     historical_response_cache: dict[str, object] | None = None,
     progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+    ambiguity_geometry_scale: float | None = None,
 ) -> MLEPlanningResult:
     """Exactly plan a joint next station and Fe/Pb program from one fitted MLE.
 
@@ -3800,6 +4364,13 @@ def _plan_next_measurement_exact(
         raise ValueError("Planner isotope order must match estimate and history.")
     resolved = MLEPlanningConfig() if planning_config is None else planning_config
     poses = _validated_candidate_poses(candidate_poses_xyz)
+    resolved_geometry_scale = (
+        _geometry_normalization_scale(poses, historical_observations)
+        if ambiguity_geometry_scale is None
+        else float(ambiguity_geometry_scale)
+    )
+    if not np.isfinite(resolved_geometry_scale) or resolved_geometry_scale <= 0.0:
+        raise ValueError("ambiguity_geometry_scale must be finite and positive.")
     costs = _validated_travel_costs(travel_costs, int(poses.shape[0]))
     orientations = np.asarray(kernel.orientations, dtype=np.float64)
     if orientations.ndim != 2 or orientations.shape[1:] != (3,):
@@ -3966,6 +4537,8 @@ def _plan_next_measurement_exact(
             historical_observations,
             source_basis,
             alternative_estimates,
+            nuisance_coefficients=nuisance_coefficients,
+            geometry_scale=resolved_geometry_scale,
         )
         information = information.reshape(
             local_count,
@@ -4209,10 +4782,19 @@ def plan_next_measurement(
         raise TypeError("kernel must be the shared runtime ContinuousKernel.")
     if not isinstance(mle_config, MLEConfig):
         raise TypeError("mle_config must be an MLEConfig.")
+    if not isinstance(alternative_estimates, Sequence) or any(
+        not isinstance(alternative, MLEEstimate)
+        for alternative in alternative_estimates
+    ):
+        raise TypeError("alternative_estimates must contain only MLEEstimate values.")
     resolved = MLEPlanningConfig() if planning_config is None else planning_config
     if not isinstance(screening_only, (bool, np.bool_)):
         raise TypeError("screening_only must be boolean.")
     poses = _validated_candidate_poses(candidate_poses_xyz)
+    ambiguity_geometry_scale = _geometry_normalization_scale(
+        poses,
+        historical_observations,
+    )
     costs = _validated_travel_costs(travel_costs, int(poses.shape[0]))
     orientations = np.asarray(kernel.orientations, dtype=np.float64)
     if orientations.ndim != 2 or orientations.shape[1:] != (3,):
@@ -4232,6 +4814,7 @@ def plan_next_measurement(
             alternative_estimates=alternative_estimates,
             historical_response_cache=historical_response_cache,
             progress_hook=progress_hook,
+            ambiguity_geometry_scale=ambiguity_geometry_scale,
         )
     screening = _screen_candidate_measurements(
         estimate,
@@ -4245,6 +4828,7 @@ def plan_next_measurement(
         resolved,
         historical_response_cache,
         progress_hook,
+        alternative_estimates,
     )
     if screening_only:
         return screening
@@ -4269,6 +4853,7 @@ def plan_next_measurement(
         alternative_estimates=alternative_estimates,
         historical_response_cache=historical_response_cache,
         progress_hook=progress_hook,
+        ambiguity_geometry_scale=ambiguity_geometry_scale,
     )
 
     def restore_index(action: MLEPlanningAction) -> MLEPlanningAction:

@@ -980,6 +980,11 @@ class _IndexedCudaResponse:
 
     matrix: object
     row_indices: object
+    measurement_indices: object
+    rows_per_measurement: int
+    measurement_group_order: object | None = None
+    measurement_group_indices: object | None = None
+    measurement_group_lengths: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -990,7 +995,134 @@ class _TorchLineFactorizedResponse:
     pulse_shapes: object
     line_isotope_indices: object
     source_mask: object
+    line_group_order: object | None = None
+    line_group_indices: object | None = None
+    line_group_lengths: object | None = None
     measurement_indices: object | None = None
+    measurement_group_order: object | None = None
+    measurement_group_indices: object | None = None
+    measurement_group_lengths: object | None = None
+
+
+def _torch_duplicate_grouping(
+    values: ArrayLike,
+    *,
+    device: object,
+    torch_module: object,
+) -> tuple[object | None, object | None, object | None]:
+    """Return stable grouping metadata, or an empty fast path for unique values."""
+    torch = torch_module
+    indices = np.asarray(values, dtype=np.int64)
+    unique = np.unique(indices)
+    if unique.size == indices.size:
+        return None, None, None
+    order = np.argsort(indices, kind="stable")
+    grouped_indices, lengths = np.unique(
+        indices[order],
+        return_counts=True,
+    )
+    return (
+        torch.as_tensor(order, dtype=torch.long, device=device),
+        torch.as_tensor(grouped_indices, dtype=torch.long, device=device),
+        torch.as_tensor(lengths, dtype=torch.long, device=device),
+    )
+
+
+def _torch_stable_group_sum(
+    values: object,
+    *,
+    order: object,
+    lengths: object,
+    torch_module: object,
+) -> object:
+    """Sum stable contiguous groups without duplicate-index CUDA atomics."""
+    torch = torch_module
+    ordered = values.index_select(0, order)
+    return torch.segment_reduce(
+        ordered,
+        reduce="sum",
+        lengths=lengths,
+        axis=0,
+    )
+
+
+def _torch_stable_index_sum(
+    values: object,
+    *,
+    indices: object,
+    output_size: int,
+    group_order: object | None,
+    group_indices: object | None,
+    group_lengths: object | None,
+    torch_module: object,
+) -> object:
+    """Return a deterministic indexed sum with a unique-index fast path."""
+    torch = torch_module
+    output = torch.zeros(
+        (int(output_size), *(int(size) for size in values.shape[1:])),
+        dtype=values.dtype,
+        device=values.device,
+    )
+    if group_order is None:
+        output.index_copy_(0, indices, values)
+        return output
+    assert group_indices is not None
+    assert group_lengths is not None
+    grouped = _torch_stable_group_sum(
+        values,
+        order=group_order,
+        lengths=group_lengths,
+        torch_module=torch,
+    )
+    output.index_copy_(0, group_indices, grouped)
+    return output
+
+
+def _torch_stable_incidence_transpose(
+    edge_values: object,
+    *,
+    incidence_rows: object,
+    incidence_columns: object,
+    incidence_coefficients: object,
+    patch_count: int,
+    group_order: object | None,
+    group_indices: object | None,
+    group_lengths: object | None,
+    torch_module: object,
+) -> object:
+    """Apply an incidence transpose without duplicate-column CUDA atomics."""
+    torch = torch_module
+    if group_order is None:
+        contributions = edge_values.index_select(0, incidence_rows)
+        contributions.mul_(incidence_coefficients[:, None])
+        return _torch_stable_index_sum(
+            contributions,
+            indices=incidence_columns,
+            output_size=patch_count,
+            group_order=None,
+            group_indices=None,
+            group_lengths=None,
+            torch_module=torch,
+        )
+    assert group_indices is not None
+    assert group_lengths is not None
+    ordered_rows = incidence_rows.index_select(0, group_order)
+    ordered_coefficients = incidence_coefficients.index_select(0, group_order)
+    ordered_contributions = edge_values.index_select(0, ordered_rows)
+    ordered_contributions.mul_(ordered_coefficients[:, None])
+    grouped = torch.segment_reduce(
+        ordered_contributions,
+        reduce="sum",
+        lengths=group_lengths,
+        axis=0,
+    )
+    output = torch.zeros(
+        (int(patch_count), int(edge_values.shape[1])),
+        dtype=edge_values.dtype,
+        device=edge_values.device,
+    )
+    output.index_copy_(0, group_indices, grouped)
+    return output
 
 
 def _torch_response_product(
@@ -1020,11 +1152,26 @@ def _torch_response_product(
                     dtype=vector.dtype,
                     device=vector.device,
                 )
-                base_residual.index_add_(
-                    0,
-                    dense_response.measurement_indices,
-                    residual,
-                )
+                if dense_response.measurement_group_order is None:
+                    base_residual.index_copy_(
+                        0,
+                        dense_response.measurement_indices,
+                        residual,
+                    )
+                else:
+                    assert dense_response.measurement_group_indices is not None
+                    assert dense_response.measurement_group_lengths is not None
+                    grouped_residual = _torch_stable_group_sum(
+                        residual,
+                        order=dense_response.measurement_group_order,
+                        lengths=dense_response.measurement_group_lengths,
+                        torch_module=torch,
+                    )
+                    base_residual.index_copy_(
+                        0,
+                        dense_response.measurement_group_indices,
+                        grouped_residual,
+                    )
                 residual = base_residual
             residual_by_line = residual @ dense_response.pulse_shapes.T
             gradient_by_line = torch.einsum(
@@ -1032,19 +1179,42 @@ def _torch_response_product(
                 spatial_factors,
                 residual_by_line,
             )
-            gradient = torch.zeros(
-                (
-                    operator.patch_count,
-                    operator.isotope_count,
-                ),
-                dtype=vector.dtype,
-                device=vector.device,
-            )
-            gradient.index_add_(
-                1,
-                dense_response.line_isotope_indices,
-                gradient_by_line,
-            )
+            if dense_response.line_group_order is None:
+                gradient = torch.zeros(
+                    (
+                        operator.patch_count,
+                        operator.isotope_count,
+                    ),
+                    dtype=vector.dtype,
+                    device=vector.device,
+                )
+                gradient.index_copy_(
+                    1,
+                    dense_response.line_isotope_indices,
+                    gradient_by_line,
+                )
+            else:
+                assert dense_response.line_group_indices is not None
+                assert dense_response.line_group_lengths is not None
+                grouped_gradient = _torch_stable_group_sum(
+                    gradient_by_line.T,
+                    order=dense_response.line_group_order,
+                    lengths=dense_response.line_group_lengths,
+                    torch_module=torch,
+                )
+                gradient = torch.zeros(
+                    (
+                        operator.patch_count,
+                        operator.isotope_count,
+                    ),
+                    dtype=vector.dtype,
+                    device=vector.device,
+                )
+                gradient.index_copy_(
+                    1,
+                    dense_response.line_group_indices,
+                    grouped_gradient.T,
+                )
             gradient *= dense_response.source_mask
             return gradient.reshape(-1)
         densities = vector.reshape(operator.patch_count, operator.isotope_count)
@@ -1069,13 +1239,18 @@ def _torch_response_product(
         matrix = dense_response.matrix
         row_indices = dense_response.row_indices
         if transpose:
-            original_rows = torch.zeros(
-                int(matrix.shape[0]),
-                dtype=vector.dtype,
-                device=vector.device,
+            rows_per_measurement = int(dense_response.rows_per_measurement)
+            selected_residual = vector.reshape(-1, rows_per_measurement)
+            original_residual = _torch_stable_index_sum(
+                selected_residual,
+                indices=dense_response.measurement_indices,
+                output_size=int(matrix.shape[0]) // rows_per_measurement,
+                group_order=dense_response.measurement_group_order,
+                group_indices=dense_response.measurement_group_indices,
+                group_lengths=dense_response.measurement_group_lengths,
+                torch_module=torch,
             )
-            original_rows.index_add_(0, row_indices, vector)
-            return matrix.T @ original_rows
+            return matrix.T @ original_residual.reshape(-1)
         return (matrix @ vector).index_select(0, row_indices)
     if dense_response is not None:
         return dense_response.T @ vector if transpose else dense_response @ vector
@@ -1304,6 +1479,19 @@ def _prepare_line_factorized_torch_response(
                             dtype=torch.bool,
                             device=device,
                         ),
+                        line_group_order=reusable_response.line_group_order,
+                        line_group_indices=reusable_response.line_group_indices,
+                        line_group_lengths=reusable_response.line_group_lengths,
+                        measurement_indices=(reusable_response.measurement_indices),
+                        measurement_group_order=(
+                            reusable_response.measurement_group_order
+                        ),
+                        measurement_group_indices=(
+                            reusable_response.measurement_group_indices
+                        ),
+                        measurement_group_lengths=(
+                            reusable_response.measurement_group_lengths
+                        ),
                     )
                     row_sums, column_sums = operator.response_sums()
                     diagnostics.update(
@@ -1319,10 +1507,23 @@ def _prepare_line_factorized_torch_response(
                     return masked, diagnostics, row_sums, column_sums
             if all(key in reusable_keys for key in row_keys):
                 key_to_index = {key: index for index, key in enumerate(reusable_keys)}
-                selected = torch.as_tensor(
+                selected_values = np.asarray(
                     [key_to_index[key] for key in row_keys],
+                    dtype=np.int64,
+                )
+                selected = torch.as_tensor(
+                    selected_values,
                     dtype=torch.long,
                     device=device,
+                )
+                (
+                    measurement_group_order,
+                    measurement_group_indices,
+                    measurement_group_lengths,
+                ) = _torch_duplicate_grouping(
+                    selected_values,
+                    device=device,
+                    torch_module=torch,
                 )
                 indexed = _TorchLineFactorizedResponse(
                     spatial_factors=reusable_response.spatial_factors,
@@ -1337,7 +1538,13 @@ def _prepare_line_factorized_torch_response(
                         if source_masked
                         else reusable_response.source_mask
                     ),
+                    line_group_order=reusable_response.line_group_order,
+                    line_group_indices=reusable_response.line_group_indices,
+                    line_group_lengths=reusable_response.line_group_lengths,
                     measurement_indices=selected,
+                    measurement_group_order=measurement_group_order,
+                    measurement_group_indices=measurement_group_indices,
+                    measurement_group_lengths=measurement_group_lengths,
                 )
                 row_sums, column_sums = operator.response_sums()
                 diagnostics.update(
@@ -1403,6 +1610,9 @@ def _prepare_line_factorized_torch_response(
             )
             pulse_shapes = previous_response.pulse_shapes
             line_isotope_indices = previous_response.line_isotope_indices
+            line_group_order = previous_response.line_group_order
+            line_group_indices = previous_response.line_group_indices
+            line_group_lengths = previous_response.line_group_lengths
             source_mask = (
                 torch.tensor(
                     operator.source_mask,
@@ -1433,6 +1643,15 @@ def _prepare_line_factorized_torch_response(
                 dtype=torch.long,
                 device=device,
             )
+            (
+                line_group_order,
+                line_group_indices,
+                line_group_lengths,
+            ) = _torch_duplicate_grouping(
+                operator.line_isotope_indices,
+                device=device,
+                torch_module=torch,
+            )
             source_mask = torch.tensor(
                 operator.source_mask,
                 dtype=torch.bool,
@@ -1445,6 +1664,9 @@ def _prepare_line_factorized_torch_response(
             pulse_shapes=pulse_shapes,
             line_isotope_indices=line_isotope_indices,
             source_mask=source_mask,
+            line_group_order=line_group_order,
+            line_group_indices=line_group_indices,
+            line_group_lengths=line_group_lengths,
         )
     except torch.OutOfMemoryError:
         if is_cuda:
@@ -1702,9 +1924,23 @@ def _prepare_dense_torch_response(
                 selected_t[:, None] * trailing
                 + torch.arange(trailing, dtype=torch.long, device=device)[None, :]
             ).reshape(-1)
+            (
+                measurement_group_order,
+                measurement_group_indices,
+                measurement_group_lengths,
+            ) = _torch_duplicate_grouping(
+                selected,
+                device=device,
+                torch_module=torch,
+            )
             indexed = _IndexedCudaResponse(
                 matrix=reusable_matrix,
                 row_indices=row_indices,
+                measurement_indices=selected_t,
+                rows_per_measurement=trailing,
+                measurement_group_order=measurement_group_order,
+                measurement_group_indices=measurement_group_indices,
+                measurement_group_lengths=measurement_group_lengths,
             )
             row_sums = np.asarray(reusable_rows[selected], dtype=np.float64).reshape(-1)
             column_sums = np.sum(
@@ -2167,6 +2403,26 @@ def fit_surface_map_poisson_operator(
         device=device,
         check_invariants=False,
     ).coalesce()
+    if tv_active:
+        incidence_rows_t = tensor(coo.row, integer=True)
+        incidence_columns_t = tensor(coo.col, integer=True)
+        incidence_coefficients_t = tensor(coo.data)
+        (
+            incidence_group_order,
+            incidence_group_indices,
+            incidence_group_lengths,
+        ) = _torch_duplicate_grouping(
+            coo.col,
+            device=device,
+            torch_module=torch,
+        )
+    else:
+        incidence_rows_t = None
+        incidence_columns_t = None
+        incidence_coefficients_t = None
+        incidence_group_order = None
+        incidence_group_indices = None
+        incidence_group_lengths = None
 
     if prepared_row_sums is None or prepared_column_sums is None:
         row_sums, flat_column_sums = response_operator.response_sums()
@@ -2254,6 +2510,23 @@ def fit_surface_map_poisson_operator(
             torch_module=torch,
             dense_response=dense_response,
         ).reshape(density_shape)
+
+    def incidence_transpose(edge_values: object) -> object:
+        """Apply the TV-incidence transpose with stable patch reductions."""
+        assert incidence_rows_t is not None
+        assert incidence_columns_t is not None
+        assert incidence_coefficients_t is not None
+        return _torch_stable_incidence_transpose(
+            edge_values,
+            incidence_rows=incidence_rows_t,
+            incidence_columns=incidence_columns_t,
+            incidence_coefficients=incidence_coefficients_t,
+            patch_count=response_operator.patch_count,
+            group_order=incidence_group_order,
+            group_indices=incidence_group_indices,
+            group_lengths=incidence_group_lengths,
+            torch_module=torch,
+        )
 
     def expected_counts(density_values: object, nuisance_values: object) -> object:
         """Return the current positive expected-count vector."""
@@ -2363,9 +2636,7 @@ def fit_surface_map_poisson_operator(
                 / norms[active]
             )
         if tv_active:
-            density_gradient = density_gradient + torch.sparse.mm(
-                incidence_t.transpose(0, 1), tv_dual
-            )
+            density_gradient = density_gradient + incidence_transpose(tv_dual)
         stationarity = torch.where(
             density_values > 1.0e-9,
             density_gradient,
@@ -2504,10 +2775,7 @@ def fit_surface_map_poisson_operator(
                     * edge_weights_t[:, None]
                     * torch.sign(differences)
                 )
-                gradient = gradient + torch.sparse.mm(
-                    incidence_t.transpose(0, 1),
-                    tv_dual,
-                )
+                gradient = gradient + incidence_transpose(tv_dual)
             # Diagonal response-sum preconditioning is damped for the
             # non-quadratic calibrated likelihood.  The diminishing factor is
             # deterministic and prevents large early nuisance corrections.
@@ -2608,7 +2876,7 @@ def fit_surface_map_poisson_operator(
         nuisance_old = nuisance
         gradient = transpose(observation_dual)
         if tv_active:
-            gradient = gradient + torch.sparse.mm(incidence_t.transpose(0, 1), tv_dual)
+            gradient = gradient + incidence_transpose(tv_dual)
         densities = torch.clamp(
             densities
             - density_steps

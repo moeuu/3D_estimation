@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import pickle
 import tracemalloc
 
 import numpy as np
@@ -15,6 +16,10 @@ from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import OctantShield, generate_octant_orientations
 from runtime.discrepancy_calibration import DiscrepancyCalibration
+from spectrum.additive_scatter import (
+    AdditiveNoncollidedTransportResponse,
+    PhysicsOnlyNoncollidedTransportResponse,
+)
 from spectrum.response_matrix import (
     BACKSCATTER_FRACTION,
     COMPTON_CONTINUUM_TO_PEAK,
@@ -23,6 +28,8 @@ from spectrum.response_matrix import (
     detector_response_kernel_for_incident_gamma,
 )
 import three_d_estimation.spectral_response_builder as spectral_builder
+from three_d_estimation.config import MLEConfig
+from three_d_estimation.replay import prepare_replay
 from three_d_estimation.spectral_response_builder import (
     build_spectral_nuisance_response,
     build_spectral_response,
@@ -170,6 +177,37 @@ def _kernel(
         use_gpu=use_gpu,
         gpu_device="cuda" if use_gpu else "cpu",
         gpu_dtype="float64",
+    )
+
+
+def _process_context(
+    kernel: ContinuousKernel,
+    isotopes: tuple[str, ...],
+) -> spectral_builder._SpectralProcessContext:
+    """Return a minimal process context sharing one kernel across isotopes."""
+    prepared = tuple(
+        spectral_builder._PreparedSpectralIsotope(
+            isotope_index=index,
+            isotope=isotope,
+            line_start=index,
+            weights=np.ones(1, dtype=np.float64),
+            positive_line_indices=np.zeros(1, dtype=np.int64),
+            kernel=kernel,
+            pulses=np.ones((1, 2), dtype=np.float64),
+        )
+        for index, isotope in enumerate(isotopes)
+    )
+    return spectral_builder._SpectralProcessContext(
+        detector_positions=np.zeros((1, 3), dtype=np.float64),
+        fe_indices=np.zeros(1, dtype=np.int64),
+        pb_indices=np.zeros(1, dtype=np.int64),
+        live_times=np.ones(1, dtype=np.float64),
+        areas=np.ones(1, dtype=np.float64),
+        quadrature_points=np.zeros((1, 1, 3), dtype=np.float64),
+        quadrature_weights=np.ones((1, 1), dtype=np.float64),
+        line_count=len(prepared),
+        prepared_isotopes=prepared,
+        kernel_chunk_size=1,
     )
 
 
@@ -365,9 +403,7 @@ def test_obstacle_line_slice_preserves_matching_compton_row() -> None:
         transport_boxes_m=((0.4, -0.1, -0.1, 0.6, 0.1, 0.1),),
         transport_mu_by_isotope={"Co-60": (0.4,)},
         transport_line_mu_by_isotope={"Co-60": ((0.2,), (0.4,))},
-        transport_line_compton_mu_by_isotope={
-            "Co-60": ((0.05,), (0.1,))
-        },
+        transport_line_compton_mu_by_isotope={"Co-60": ((0.05,), (0.1,))},
     )
 
     selected = spectral_builder._obstacle_grid_for_line(
@@ -733,6 +769,58 @@ def test_factor_cache_namespace_is_stable_across_physical_object_instances(
     }
 
 
+def test_factor_cache_namespace_tracks_requested_isotope_order(
+    tmp_path: Path,
+) -> None:
+    """Cached line columns must never be reused under another isotope order."""
+    edges = np.arange(0.0, 1505.0, 10.0)
+    observations = _observations(np.asarray([[0.0, 0.0, 0.5]]), edges)
+    patches = _patches(np.asarray([[[1.0, 0.0, 0.5]], [[2.0, 0.0, 0.5]]]))
+    kernel = _kernel({"Cs-137": _CS_LINE, "Co-60": _CO_LINES_UNATTENUATED})
+    cache = tmp_path / "cache"
+
+    original = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137", "Co-60"),
+        kernel,
+        cache_directory=cache,
+    )
+    reordered = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Co-60", "Cs-137"),
+        kernel,
+        cache_directory=cache,
+    )
+    repeated = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Co-60", "Cs-137"),
+        kernel,
+        cache_directory=cache,
+    )
+    fresh = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Co-60", "Cs-137"),
+        kernel,
+    )
+
+    assert original.cache_directory != reordered.cache_directory
+    assert repeated.cache_directory == reordered.cache_directory
+    assert (
+        original.operator.diagnostics["device_cache_key"]
+        != reordered.operator.diagnostics["device_cache_key"]
+    )
+    assert reordered.operator.diagnostics["cache_stats"]["misses"] == 1
+    assert repeated.operator.diagnostics["cache_stats"]["hits"] == 1
+    np.testing.assert_array_equal(
+        reordered.operator.materialize(),
+        fresh.operator.materialize(),
+    )
+
+
 def test_spatial_factor_cache_separates_backend_and_numeric_precision() -> None:
     """Float32 GPU factors must never be reused as float64 CPU truth."""
     points = np.asarray([[[1.0, 0.0, 0.5]]], dtype=np.float64)
@@ -807,9 +895,7 @@ def test_factor_builder_deduplicates_identical_measurement_rows(
         _kernel({"Cs-137": _CS_LINE}),
         cache_directory=tmp_path,
     )
-    construction = result.operator.diagnostics["performance"][
-        "response_construction"
-    ]
+    construction = result.operator.diagnostics["performance"]["response_construction"]
 
     assert len(tuple(tmp_path.rglob("factors.npy"))) == 1
     assert construction["kernel_batched_measurements"] == 1
@@ -929,6 +1015,120 @@ def test_matrix_free_cpu_workers_preserve_exact_response() -> None:
     assert construction["iterations"] == 1
 
 
+def test_real_runtime_kernel_is_spawn_safe_and_bitwise_exact() -> None:
+    """Spawn workers must rebuild the authenticated runtime scatter response."""
+    fixture = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "shared_measurement_log"
+        / "measurement_log"
+    )
+    replay = prepare_replay(
+        fixture,
+        config=MLEConfig(
+            mode="spectral",
+            isotope_names=("Co-60", "Cs-137", "Eu-154"),
+            patch_spacing_m=(6.0, 6.0, 3.0),
+            max_iterations=2,
+            debias_refit=False,
+            use_gpu=False,
+        ),
+    )
+    assert (
+        type(replay.kernel.additive_scatter_response)
+        is AdditiveNoncollidedTransportResponse
+    )
+    kernel = replace(replay.kernel, gpu_dtype="float64")
+    observations = _observations(
+        replay.batch.detector_positions_xyz[:1],
+        replay.batch.energy_bin_edges_keV,
+        live_times_s=replay.batch.live_times_s[:1],
+        fe_indices=replay.batch.fe_indices[:1],
+        pb_indices=replay.batch.pb_indices[:1],
+    )
+    patches = _patches(
+        np.asarray(
+            [
+                [[1.0, 0.25, 0.0]],
+                [[1.25, 0.25, 0.0]],
+                [[1.0, 0.75, 0.0]],
+                [[1.25, 0.75, 0.0]],
+            ],
+            dtype=np.float64,
+        )
+    )
+    options = {
+        "observations": observations,
+        "patches": patches,
+        "isotopes": ("Cs-137",),
+        "kernel": kernel,
+        "measurement_chunk_size": 1,
+        "patch_chunk_size": 1,
+    }
+
+    serial = build_spectral_response_operator(**options, worker_count=1)
+    parallel = build_spectral_response_operator(**options, worker_count=4)
+
+    serial_response = serial.operator.materialize()
+    parallel_response = parallel.operator.materialize()
+    assert serial_response.dtype == np.float64
+    assert parallel_response.dtype == np.float64
+    np.testing.assert_array_equal(parallel_response, serial_response)
+    construction = parallel.operator.diagnostics["performance"]["response_construction"]
+    assert construction["worker_count"] == 4
+
+
+def test_physics_only_process_payload_preserves_shared_kernel_identity() -> None:
+    """Physics-only payloads must round-trip once per shared runtime kernel."""
+    response = PhysicsOnlyNoncollidedTransportResponse(
+        detector_radius_m=0.0254,
+        fe_scatter_distance_m=0.1,
+        pb_scatter_distance_m=0.1,
+    )
+    kernel = ContinuousKernel(
+        additive_scatter_response=response,
+        use_gpu=False,
+    )
+    context = _process_context(kernel, ("Cs-137", "Co-60"))
+
+    spawn_context = spectral_builder._fresh_spectral_process_context(context)
+    spawn_context = pickle.loads(pickle.dumps(spawn_context))
+    first_recipe, second_recipe = (
+        prepared.kernel for prepared in spawn_context.prepared_isotopes
+    )
+    assert first_recipe is second_recipe
+
+    restored = spectral_builder._materialize_spectral_process_context(spawn_context)
+    first_kernel, second_kernel = (
+        prepared.kernel for prepared in restored.prepared_isotopes
+    )
+    assert first_kernel is second_kernel
+    assert isinstance(first_kernel, ContinuousKernel)
+    restored_response = first_kernel.additive_scatter_response
+    assert type(restored_response) is PhysicsOnlyNoncollidedTransportResponse
+    assert restored_response.to_payload() == response.to_payload()
+
+
+def test_process_payload_rejects_response_subclasses() -> None:
+    """Worker serialization must fail fast for unsupported response subtypes."""
+
+    class _DerivedPhysicsResponse(PhysicsOnlyNoncollidedTransportResponse):
+        """Represent an unsupported behavior-bearing runtime response subtype."""
+
+    response = _DerivedPhysicsResponse(
+        detector_radius_m=0.0254,
+        fe_scatter_distance_m=0.1,
+        pb_scatter_distance_m=0.1,
+    )
+    context = _process_context(
+        ContinuousKernel(additive_scatter_response=response, use_gpu=False),
+        ("Cs-137",),
+    )
+
+    with pytest.raises(TypeError, match="Unsupported additive scatter response type"):
+        spectral_builder._fresh_spectral_process_context(context)
+
+
 def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -950,9 +1150,7 @@ def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
     )
     scalar_values = scalar.operator.materialize()
     original_pulse = spectral_builder.detector_response_kernel_for_incident_gamma
-    original_joint = (
-        ContinuousKernel.kernel_values_selected_pairs_for_detectors_by_line
-    )
+    original_joint = ContinuousKernel.kernel_values_selected_pairs_for_detectors_by_line
     original_scalar = ContinuousKernel.kernel_values_selected_pairs_for_detectors
     pulse_energies: list[float] = []
     joint_calls: list[tuple[str, int]] = []

@@ -14,6 +14,7 @@ import three_d_estimation.information_planner as information_planner
 from three_d_estimation.cli import _estimate_history_indices, build_argument_parser
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.information_planner import (
+    PLANNING_METHOD,
     MLEPlanningAction,
     MLEPlanningConfig,
     MLEPlanningResult,
@@ -26,6 +27,7 @@ from three_d_estimation.information_planner import (
     _historical_factorized_fisher_precision,
     _historical_factorized_spectral_design,
     _planning_prior_precision,
+    _plan_next_measurement_exact,
     _historical_fisher_precision,
     _historical_spectral_design,
     _representative_pair_ids,
@@ -58,6 +60,11 @@ def test_default_profiles_use_eight_measurements_per_station() -> None:
         ranked_action_limit=1,
     )
     assert legacy.two_stage_screening is False
+
+
+def test_planning_method_tracks_ambiguity_objective_version() -> None:
+    """Planning artifacts must identify the nuisance-aware ambiguity objective."""
+    assert PLANNING_METHOD.endswith("_v5")
 
 
 def _planning_action(index: int, pose: np.ndarray, score: float) -> MLEPlanningAction:
@@ -327,6 +334,16 @@ def test_refinement_screening_computes_only_new_candidate_poses(
         cache,
         None,
     )
+    uncached_refined = _screen_candidate_measurements(
+        *common,
+        refined_poses,
+        np.asarray([0], dtype=np.int64),
+        np.zeros(3),
+        0,
+        config,
+        None,
+        None,
+    )
     changed_live_time = _screen_candidate_measurements(
         *common,
         refined_poses,
@@ -355,13 +372,23 @@ def test_refinement_screening_computes_only_new_candidate_poses(
         None,
     )
 
-    assert computed_rows == [2, 1, 3, 3]
+    assert computed_rows == [2, 1, 3, 3, 3]
     assert refined.diagnostics["reused_candidates"] == 2
     assert refined.diagnostics["computed_candidates"] == 1
     assert changed_live_time.diagnostics["reused_candidates"] == 0
     assert changed_live_time.diagnostics["computed_candidates"] == 3
     assert changed_counts.diagnostics["reused_candidates"] == 0
     assert changed_counts.diagnostics["computed_candidates"] == 3
+    cached_by_index = {
+        action.candidate_index: action for action in refined.ranked_actions
+    }
+    for action in uncached_refined.ranked_actions:
+        cached_action = cached_by_index[action.candidate_index]
+        np.testing.assert_allclose(cached_action.score, action.score)
+        np.testing.assert_allclose(
+            cached_action.geometry_exploration,
+            action.geometry_exploration,
+        )
 
 
 def test_kernel_cache_identity_changes_with_physical_mutation() -> None:
@@ -428,6 +455,396 @@ def _ceiling_patch(patch_id: int, x_offset: float) -> SurfacePatch:
         ),
         quadrature_points_xyz=np.asarray([[x_offset + 0.5, 0.5, 2.0]]),
         quadrature_weights=np.asarray([1.0]),
+    )
+
+
+def _planner_regression_fixture() -> tuple[
+    MLEEstimate,
+    ObservationBatch,
+    ContinuousKernel,
+    MLEConfig,
+    tuple[int, ...],
+    MLEPlanningConfig,
+]:
+    """Return one small line-resolved physical planning regression fixture."""
+    patches = (
+        _floor_patch(0, 0.0),
+        _floor_patch(1, 1.0),
+        _ceiling_patch(2, 0.0),
+        _ceiling_patch(3, 1.0),
+    )
+    strengths = np.asarray([[2.0, 0.5, 1.5, 0.2]])
+    estimate = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=patches,
+        density_by_isotope=strengths.copy(),
+        patch_strength_by_isotope=strengths.copy(),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.zeros(0),
+        nuisance_parameters=np.zeros(0),
+        objective_value=1.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+    historical_positions = np.asarray(
+        [[0.5, -1.0, 1.0], [2.5, -1.0, 1.0], [1.0, 2.5, 0.5]],
+        dtype=np.float64,
+    )
+    energy_edges = np.linspace(0.0, 800.0, 65)
+    history = ObservationBatch(
+        detector_positions_xyz=historical_positions,
+        detector_quaternions_wxyz=np.tile(
+            np.asarray([1.0, 0.0, 0.0, 0.0]),
+            (3, 1),
+        ),
+        fe_indices=np.asarray([0, 1, 2]),
+        pb_indices=np.asarray([0, 1, 2]),
+        live_times_s=np.full(3, 10.0),
+        spectrum_counts=np.ones((3, 64)),
+        spectrum_variances=None,
+        energy_bin_edges_keV=energy_edges,
+        isotope_counts=None,
+        isotope_covariances=None,
+        station_ids=np.arange(3),
+        isotope_names=("Cs-137",),
+    )
+    kernel = ContinuousKernel(
+        use_gpu=False,
+        mu_by_isotope={"Cs-137": {"fe": 0.1, "pb": 0.2}},
+        line_mu_by_isotope={
+            "Cs-137": (
+                {
+                    "energy_keV": 661.7,
+                    "weight": 1.0,
+                    "fe": 0.1,
+                    "pb": 0.2,
+                },
+            )
+        },
+    )
+    mle_config = MLEConfig(
+        mode="spectral",
+        isotope_names=("Cs-137",),
+        fit_background_nuisance=False,
+        fit_scatter_nuisance=False,
+        response_energy_chunk_size=7,
+        use_gpu=False,
+    )
+    planning_config = MLEPlanningConfig(
+        shield_program_length=2,
+        ranked_action_limit=32,
+        candidate_pose_chunk_size=8,
+        screening_pair_limit=4,
+        screening_pose_chunk_size=64,
+        exact_candidate_min=4,
+        exact_candidate_max=8,
+    )
+    return (
+        estimate,
+        history,
+        kernel,
+        mle_config,
+        (0, 7, 56, 63),
+        planning_config,
+    )
+
+
+def _planner_regression_poses(seed: int) -> np.ndarray:
+    """Return the fixed 40-pose candidate cloud used by planner regressions."""
+    generator = np.random.default_rng(seed)
+    return np.column_stack(
+        (
+            generator.uniform(-2.0, 4.0, 40),
+            generator.uniform(-3.0, 4.0, 40),
+            generator.uniform(0.15, 1.85, 40),
+        )
+    )
+
+
+def test_exact_ambiguity_is_invariant_to_candidate_pose_chunk_size() -> None:
+    """Performance chunks must not change the exact action, program, or score."""
+    estimate, history, kernel, mle_config, pair_ids, config = (
+        _planner_regression_fixture()
+    )
+    poses = _planner_regression_poses(17)
+    results = tuple(
+        _plan_next_measurement_exact(
+            estimate,
+            history,
+            kernel,
+            mle_config,
+            poses,
+            planning_config=replace(
+                config,
+                two_stage_screening=False,
+                ranked_action_limit=40,
+                candidate_pose_chunk_size=chunk_size,
+            ),
+            allowed_pair_ids=pair_ids,
+        )
+        for chunk_size in (1, 8, 40)
+    )
+
+    selected = tuple(
+        (
+            result.selected_action.candidate_index,
+            result.selected_action.shield_pair_ids,
+        )
+        for result in results
+    )
+    assert selected == ((30, (7, 0)),) * 3
+    np.testing.assert_allclose(
+        [result.selected_action.score for result in results],
+        results[0].selected_action.score,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+
+
+def test_two_stage_screening_retains_known_full_exact_winner() -> None:
+    """Ambiguity-aware screening must retain the fixed full-exact winner."""
+    estimate, history, kernel, mle_config, pair_ids, config = (
+        _planner_regression_fixture()
+    )
+    poses = _planner_regression_poses(10)
+    full = _plan_next_measurement_exact(
+        estimate,
+        history,
+        kernel,
+        mle_config,
+        poses,
+        planning_config=replace(
+            config,
+            two_stage_screening=False,
+            ranked_action_limit=40,
+            candidate_pose_chunk_size=40,
+        ),
+        allowed_pair_ids=pair_ids,
+    )
+    staged = plan_next_measurement(
+        estimate,
+        history,
+        kernel,
+        mle_config,
+        poses,
+        planning_config=config,
+        allowed_pair_ids=pair_ids,
+    )
+
+    assert full.selected_action.candidate_index == 29
+    assert 29 in staged.diagnostics["exact_candidate_indices"]
+    assert staged.selected_action.candidate_index == 29
+    assert (
+        staged.selected_action.shield_pair_ids == full.selected_action.shield_pair_ids
+    )
+    np.testing.assert_allclose(
+        staged.selected_action.score,
+        full.selected_action.score,
+        rtol=1.0e-14,
+        atol=1.0e-14,
+    )
+    full_by_candidate = {
+        action.candidate_index: action for action in full.ranked_actions
+    }
+    for action in staged.ranked_actions:
+        oracle = full_by_candidate[action.candidate_index]
+        assert action.shield_pair_ids == oracle.shield_pair_ids
+        np.testing.assert_allclose(
+            action.score,
+            oracle.score,
+            rtol=1.0e-14,
+            atol=1.0e-14,
+        )
+
+
+def test_screening_cache_tracks_fitted_nuisance_state() -> None:
+    """Candidate reuse must invalidate when fitted nuisance precision changes."""
+    estimate, history, kernel, mle_config, pair_ids, config = (
+        _planner_regression_fixture()
+    )
+    poses = _planner_regression_poses(3)[:4]
+    config = replace(
+        config,
+        screening_pair_limit=2,
+        screening_pose_chunk_size=4,
+        ranked_action_limit=4,
+        exact_candidate_min=2,
+        exact_candidate_max=4,
+    )
+    mle_config = replace(mle_config, fit_background_nuisance=True)
+    diagnostics = {"nuisance_names": ["background_rate_cps"]}
+    low_background = replace(
+        estimate,
+        background_parameters=np.asarray([0.01]),
+        diagnostics=diagnostics,
+    )
+    high_background = replace(
+        estimate,
+        background_parameters=np.asarray([100.0]),
+        diagnostics=diagnostics,
+    )
+    common = (
+        history,
+        kernel,
+        mle_config,
+        poses,
+        np.asarray(pair_ids[:2], dtype=np.int64),
+        np.zeros(poses.shape[0]),
+        None,
+        config,
+    )
+    cache: dict[str, object] = {}
+
+    low = _screen_candidate_measurements(
+        low_background,
+        *common,
+        cache,
+        None,
+    )
+    invalidated = _screen_candidate_measurements(
+        high_background,
+        *common,
+        cache,
+        None,
+    )
+    fresh = _screen_candidate_measurements(
+        high_background,
+        *common,
+        None,
+        None,
+    )
+    reused = _screen_candidate_measurements(
+        high_background,
+        *common,
+        cache,
+        None,
+    )
+    relabeled = replace(
+        high_background,
+        patches=tuple(
+            replace(patch, patch_id=100 + index)
+            for index, patch in enumerate(high_background.patches)
+        ),
+    )
+    relabeled_result = _screen_candidate_measurements(
+        relabeled,
+        *common,
+        cache,
+        None,
+    )
+
+    assert invalidated.diagnostics["computed_candidates"] == poses.shape[0]
+    assert invalidated.diagnostics["reused_candidates"] == 0
+    assert reused.diagnostics["computed_candidates"] == 0
+    assert reused.diagnostics["reused_candidates"] == poses.shape[0]
+    assert relabeled_result.diagnostics["computed_candidates"] == poses.shape[0]
+    assert relabeled_result.diagnostics["reused_candidates"] == 0
+    assert invalidated.selected_action.to_dict() == fresh.selected_action.to_dict()
+    assert reused.selected_action.to_dict() == fresh.selected_action.to_dict()
+    assert tuple(action.to_dict() for action in invalidated.ranked_actions) == tuple(
+        action.to_dict() for action in fresh.ranked_actions
+    )
+    assert tuple(action.to_dict() for action in reused.ranked_actions) == tuple(
+        action.to_dict() for action in fresh.ranked_actions
+    )
+    assert not np.isclose(
+        low.selected_action.score,
+        fresh.selected_action.score,
+    )
+
+
+def test_screening_projects_alternative_support_to_pseudo_patches() -> None:
+    """Screening must retain support alternatives after pseudo compression."""
+    estimate, history, kernel, mle_config, pair_ids, config = (
+        _planner_regression_fixture()
+    )
+    patches = (
+        _floor_patch(0, 0.0),
+        _floor_patch(1, 10.0),
+        _floor_patch(2, 20.0),
+    )
+    poses = np.asarray(
+        [
+            [0.5, -1.0, 1.0],
+            [10.5, -1.0, 1.0],
+            [20.5, -1.0, 1.0],
+            [5.5, 3.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    config = replace(
+        config,
+        screening_pair_limit=2,
+        screening_pose_chunk_size=4,
+        screening_points_per_mode=2,
+        ranked_action_limit=4,
+        exact_candidate_min=2,
+        exact_candidate_max=4,
+    )
+    estimate = replace(
+        estimate,
+        patches=patches,
+        density_by_isotope=np.asarray([[5.0, 0.0, 0.0]]),
+        patch_strength_by_isotope=np.asarray([[5.0, 0.0, 0.0]]),
+    )
+    alternative = replace(
+        estimate,
+        density_by_isotope=np.asarray([[0.0, 0.0, 5.0]]),
+        patch_strength_by_isotope=np.asarray([[0.0, 0.0, 5.0]]),
+    )
+    view, strengths, pseudo_basis, _, _ = _screening_pseudo_model(estimate, config)
+    base_projection = np.einsum(
+        "rgi,gi->ri",
+        view.strength_projection,
+        estimate.patch_strength_by_isotope.T,
+        optimize=True,
+    )
+    alternative_projection = np.einsum(
+        "rgi,gi->ri",
+        view.strength_projection,
+        alternative.patch_strength_by_isotope.T,
+        optimize=True,
+    )
+    base_row = int(np.argmax(base_projection[:, 0]))
+    alternative_row = int(np.argmax(alternative_projection[:, 0]))
+    common = (
+        estimate,
+        history,
+        kernel,
+        mle_config,
+        poses,
+        np.asarray(pair_ids[:2], dtype=np.int64),
+        np.zeros(poses.shape[0]),
+        None,
+        config,
+        None,
+        None,
+    )
+
+    assert view.quadrature_points_xyz.shape == (2, 1, 3)
+    np.testing.assert_allclose(
+        np.sort(view.quadrature_points_xyz[:, 0, 0]),
+        [0.5, 20.5],
+    )
+    assert base_row != alternative_row
+    np.testing.assert_allclose(base_projection, strengths)
+    assert pseudo_basis[alternative_row, 0, 0] == 0.0
+    baseline = _screen_candidate_measurements(*common)
+    projected = _screen_candidate_measurements(
+        *common,
+        alternative_estimates=(alternative,),
+    )
+
+    assert all(
+        action.support_hypothesis_separation == 0.0
+        for action in baseline.ranked_actions
+    )
+    assert any(
+        action.support_hypothesis_separation > 0.0
+        for action in projected.ranked_actions
     )
 
 
@@ -1378,6 +1795,19 @@ def test_screening_pseudo_model_preserves_compact_mode_scales() -> None:
         np.sum(pseudo_basis, axis=(0, 1)),
         np.sum(full_basis, axis=(0, 1)),
     )
+    np.testing.assert_array_equal(
+        np.sum(view.strength_projection, axis=0),
+        np.ones((len(patches), 1), dtype=np.float64),
+    )
+    np.testing.assert_allclose(
+        np.einsum(
+            "rgi,gi->ri",
+            view.strength_projection,
+            density.T,
+            optimize=True,
+        ),
+        strengths,
+    )
 
 
 def test_screening_fisher_cpu_gpu_equivalence_when_cuda_is_available() -> None:
@@ -1424,6 +1854,137 @@ def test_grouped_overdispersion_preserves_fine_bin_variance() -> None:
     )
 
     np.testing.assert_allclose(variance, [[7.2]])
+
+
+def test_grouped_nb2_ambiguity_uses_hypothesis_specific_fine_variance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fine-bin NB2 moments must prevent a base-alpha ranking reversal."""
+    spatial = np.zeros((2, 3, 2), dtype=np.float64)
+    spatial[0, 0, 0] = 10.0
+    spatial[0, 1, 1] = 5.0
+    spatial[0, 2, 1] = 10.0
+    spatial[1, 0, 1] = 10.0
+    spatial[1, 1, 1] = 5.0
+    spatial[1, 2, 0] = 10.0
+    grouped_response = np.sum(spatial, axis=2)[:, None, :, None]
+    design = information_planner._GroupedNB2LineDesign(
+        grouped_response=grouped_response,
+        grouped_background=np.ones((2, 1), dtype=np.float64),
+        spatial_factors=spatial,
+        pulse_shapes=np.eye(2, dtype=np.float64),
+        line_isotope_indices=np.zeros(2, dtype=np.int64),
+        live_times_s=np.ones(2, dtype=np.float64),
+        background_rate_by_bin=np.asarray([0.0, 1.0]),
+        overdispersion_alpha_by_bin=np.asarray([1.0, 0.0]),
+        fine_group_indices=np.zeros(2, dtype=np.int64),
+        group_count=1,
+        energy_chunk_size=1,
+    )
+    first_weights = np.asarray([[1.0], [0.0], [0.0]])
+    second_weights = np.asarray([[0.0], [1.0], [0.0]])
+    base_weights = np.asarray([[0.0], [0.0], [1.0]])
+    grouped_shapes: list[tuple[int, ...]] = []
+    original_group_last_axis = information_planner._group_last_axis
+
+    def track_grouped_workspace(
+        values: np.ndarray,
+        group_indices: np.ndarray,
+        group_count: int,
+    ) -> np.ndarray:
+        """Require hypothesis projection to group only action-by-chunk arrays."""
+        grouped_shapes.append(values.shape)
+        assert values.ndim == 2
+        assert values.shape[0] == spatial.shape[0]
+        assert values.shape[1] <= design.energy_chunk_size
+        return original_group_last_axis(values, group_indices, group_count)
+
+    monkeypatch.setattr(
+        information_planner,
+        "_group_last_axis",
+        track_grouped_workspace,
+    )
+    first = design.project_hypothesis(first_weights)
+    second = design.project_hypothesis(second_weights)
+    base = design.project_hypothesis(base_weights)
+    monkeypatch.setattr(
+        information_planner,
+        "_group_last_axis",
+        original_group_last_axis,
+    )
+
+    def project(weights: np.ndarray) -> np.ndarray:
+        """Return grouped source counts for one test hypothesis."""
+        return design.project_hypothesis(weights).source_counts
+
+    metrics = information_planner._response_ambiguity_metrics(
+        project,
+        np.ones((2, 1, 1), dtype=np.float64),
+        first_weights,
+        second_weights,
+        base_weights,
+        (),
+        np.zeros(1, dtype=np.float64),
+        np.zeros(1, dtype=np.float64),
+        design.grouped_background,
+        design.project_hypothesis,
+    )
+    expected = -np.expm1(
+        -0.5
+        * (np.asarray([10.0, 10.0]) - np.asarray([5.0, 5.0])) ** 2
+        / np.asarray([117.0, 17.0])
+    )
+    base_mean = base.source_counts + design.grouped_background
+    legacy_alpha = (base.total_variance - base_mean) / base_mean**2
+    legacy = _symmetric_spectral_separation(
+        first.source_counts,
+        second.source_counts,
+        legacy_alpha,
+        design.grouped_background,
+    )
+    base_fine_mean = np.asarray([[0.0, 11.0], [10.0, 1.0]])
+    base_variance_oracle = _grouped_overdispersed_variance(
+        base_fine_mean,
+        design.overdispersion_alpha_by_bin,
+        design.fine_group_indices,
+        design.group_count,
+    )
+    source_basis = np.zeros((3, 1, 2), dtype=np.float64)
+    source_basis[0, 0, 0] = 1.0
+    source_basis[2, 0, 1] = 1.0
+    information, expected_totals = _screening_fisher_information(
+        design.grouped_response,
+        source_basis,
+        base_weights,
+        design.grouped_background,
+        minimum_expected_count=1.0e-12,
+        observation_variance=base.total_variance,
+    )
+    jacobian = np.einsum(
+        "abgi,gik->abk",
+        design.grouped_response,
+        source_basis,
+        optimize=True,
+    )
+    information_oracle = np.einsum(
+        "abp,abq,ab->apq",
+        jacobian,
+        jacobian,
+        1.0 / base_variance_oracle,
+        optimize=True,
+    )
+
+    assert len(grouped_shapes) == 12
+    np.testing.assert_allclose(first.source_counts, [[10.0], [10.0]])
+    np.testing.assert_allclose(second.source_counts, [[5.0], [5.0]])
+    np.testing.assert_allclose(first.total_variance, [[111.0], [11.0]])
+    np.testing.assert_allclose(second.total_variance, [[6.0], [6.0]])
+    np.testing.assert_allclose(base.total_variance, base_variance_oracle)
+    np.testing.assert_allclose(information, information_oracle)
+    np.testing.assert_allclose(expected_totals, [11.0, 11.0])
+    np.testing.assert_allclose(metrics["floor_ceiling"], expected)
+    assert legacy[0] > legacy[1]
+    assert metrics["floor_ceiling"][1] > metrics["floor_ceiling"][0]
 
 
 def test_screening_overdispersion_can_reverse_poisson_ranking() -> None:
@@ -1666,6 +2227,116 @@ def test_spectral_separation_respects_counts_and_overdispersion() -> None:
     assert overdispersed[0] < high_count[0]
 
 
+def test_spectral_separation_includes_common_background_variance() -> None:
+    """Common background must reduce both Poisson and NB2 discrimination."""
+    first = np.asarray([[1.0]])
+    second = np.asarray([[0.0]])
+    background = np.asarray([[100.0]])
+
+    poisson_source_only = _symmetric_spectral_separation(first, second)
+    poisson_complete = _symmetric_spectral_separation(
+        first,
+        second,
+        common_counts=background,
+    )
+    nb2_source_only = _symmetric_spectral_separation(
+        first,
+        second,
+        np.asarray([0.1]),
+    )
+    nb2_complete = _symmetric_spectral_separation(
+        first,
+        second,
+        np.asarray([0.1]),
+        background,
+    )
+
+    np.testing.assert_allclose(poisson_complete, [0.002484470770129418])
+    np.testing.assert_allclose(nb2_complete, [0.00022508834622582234])
+    assert poisson_complete[0] < poisson_source_only[0]
+    assert nb2_complete[0] < nb2_source_only[0]
+
+
+def test_ambiguity_metrics_include_fitted_nuisance_counts() -> None:
+    """Exact ambiguity must carry fitted common nuisance into NB2 means."""
+    patches = (_floor_patch(0, 0.0), _ceiling_patch(1, 0.0))
+    estimate = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=patches,
+        density_by_isotope=np.asarray([[1.0, 1.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0, 1.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.asarray([1.0]),
+        nuisance_parameters=np.zeros(0),
+        objective_value=0.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={"nuisance_names": ["background_rate_cps"]},
+    )
+    history = ObservationBatch(
+        detector_positions_xyz=np.asarray([[0.5, 0.5, 1.0]]),
+        detector_quaternions_wxyz=np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+        fe_indices=np.asarray([0]),
+        pb_indices=np.asarray([0]),
+        live_times_s=np.asarray([1.0]),
+        spectrum_counts=np.ones((1, 2)),
+        spectrum_variances=None,
+        energy_bin_edges_keV=np.asarray([0.0, 1.0, 2.0]),
+        isotope_counts=None,
+        isotope_covariances=None,
+        station_ids=np.asarray([0]),
+        isotope_names=("Cs-137",),
+    )
+    spatial = np.zeros((1, 2, 2), dtype=np.float64)
+    spatial[0, 0, 0] = 1.0
+    spatial[0, 1, 1] = 1.0
+    design = _LineSpectralDesign(
+        spatial_factors=spatial,
+        pulse_shapes=np.eye(2, dtype=np.float64),
+        line_isotope_indices=np.zeros(2, dtype=np.int64),
+        nuisance_response=np.full((1, 2, 1), 100.0),
+        nuisance_names=("background_rate_cps",),
+        energy_chunk_size=1,
+        overdispersion_alpha_by_bin=np.full(2, 0.1),
+    )
+    basis = np.zeros((2, 1, 2), dtype=np.float64)
+    basis[0, 0, 0] = 1.0
+    basis[1, 0, 1] = 1.0
+    information = np.eye(3, dtype=np.float64)[None, :, :]
+
+    source_only = _ambiguity_metrics(
+        design,
+        information,
+        np.asarray([[0.5, 0.5, 1.0]]),
+        estimate,
+        history,
+        basis,
+        (),
+        nuisance_coefficients=np.zeros(1),
+    )
+    complete = _ambiguity_metrics(
+        design,
+        information,
+        np.asarray([[0.5, 0.5, 1.0]]),
+        estimate,
+        history,
+        basis,
+        (),
+        nuisance_coefficients=np.ones(1),
+    )
+    expected = _symmetric_spectral_separation(
+        np.asarray([[1.0, 0.0]]),
+        np.asarray([[0.0, 1.0]]),
+        np.full(2, 0.1),
+        np.full((1, 2), 100.0),
+    )
+
+    np.testing.assert_allclose(complete["floor_ceiling"], expected)
+    assert complete["floor_ceiling"][0] < source_only["floor_ceiling"][0]
+
+
 def test_support_ambiguity_projects_alternative_patch_grids() -> None:
     """Alternative support utility must survive coarse-to-fine patch changes."""
 
@@ -1751,8 +2422,38 @@ def test_support_ambiguity_projects_alternative_patch_grids() -> None:
         basis,
         (alternative,),
     )
+    scaled_alternative = replace(
+        alternative,
+        density_by_isotope=np.asarray([[9.0]]),
+        patch_strength_by_isotope=np.asarray([[9.0]]),
+    )
+    scaled_metrics = _ambiguity_metrics(
+        response,
+        np.eye(2, dtype=np.float64)[None, :, :],
+        np.asarray([[0.5, 0.5, 1.0]]),
+        base,
+        history,
+        basis,
+        (scaled_alternative,),
+    )
+    same_support_different_total = replace(
+        base,
+        density_by_isotope=10.0 * base.density_by_isotope,
+        patch_strength_by_isotope=10.0 * base.patch_strength_by_isotope,
+    )
+    same_support_metrics = _ambiguity_metrics(
+        response,
+        np.eye(2, dtype=np.float64)[None, :, :],
+        np.asarray([[0.5, 0.5, 1.0]]),
+        base,
+        history,
+        basis,
+        (same_support_different_total,),
+    )
 
     assert metrics["support"][0] > 0.0
+    np.testing.assert_allclose(scaled_metrics["support"], metrics["support"])
+    np.testing.assert_allclose(same_support_metrics["support"], 0.0, atol=1.0e-15)
 
 
 def test_vertical_fisher_uses_cross_terms_and_marginalizes_nuisance() -> None:

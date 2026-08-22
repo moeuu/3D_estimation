@@ -8,7 +8,9 @@ import pytest
 from three_d_estimation.solver import (
     _enforce_cuda_response_cache_requirement,
     _prepare_dense_torch_response,
+    _torch_duplicate_grouping,
     _torch_response_product,
+    _torch_stable_incidence_transpose,
     SurfaceMapConfig,
     evaluate_surface_map_objective,
     fit_surface_map_poisson,
@@ -991,6 +993,337 @@ def test_line_factorized_cpu_gpu_products_are_equivalent_when_available() -> Non
     )
 
 
+@pytest.mark.parametrize(
+    ("gpu_dtype", "rtol", "atol"),
+    (("float64", 2.0e-12, 2.0e-13), ("float32", 3.0e-5, 3.0e-6)),
+)
+def test_line_factorized_cuda_transpose_is_bitwise_deterministic(
+    gpu_dtype: str,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Duplicate rows and isotope lines must reduce deterministically on CUDA."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(20260822)
+    measurement_count = 64
+    selected_count = 256
+    energy_count = 851
+    patch_count = 1292
+    line_isotopes = np.asarray([0, 0, 1, 2, 2, 2, 2, 2, 2], dtype=np.int64)
+    spatial = rng.uniform(
+        1.0e-5,
+        1.0e-2,
+        (measurement_count, patch_count, line_isotopes.size),
+    )
+    pulses = rng.uniform(0.1, 1.0, (line_isotopes.size, energy_count))
+    pulses /= np.sum(pulses, axis=1, keepdims=True)
+    row_keys = [f"row-{index}" for index in range(measurement_count)]
+    operator = LineFactorizedResponseOperator(
+        spatial,
+        pulses,
+        line_isotopes,
+        3,
+        diagnostics={
+            "device_cache_key": f"deterministic-{gpu_dtype}",
+            "measurement_row_keys": row_keys,
+        },
+    )
+    dtype = torch.float64 if gpu_dtype == "float64" else torch.float32
+    cache: dict[str, object] = {}
+    base_response, _, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cuda"),
+        dtype=dtype,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    selection = np.arange(selected_count, dtype=np.int64) % measurement_count
+    rng.shuffle(selection)
+    selected = operator.select_measurements(selection.tolist())
+    selected_response, diagnostics, _, _ = _prepare_dense_torch_response(
+        selected,
+        device=torch.device("cuda"),
+        dtype=dtype,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    assert base_response is not None
+    assert selected_response is not None
+    assert diagnostics["mode"] == "persistent_line_factor_row_gather"
+    assert base_response.line_group_order is not None
+    assert selected_response.measurement_group_order is not None
+
+    for current_operator, prepared_response in (
+        (operator, base_response),
+        (selected, selected_response),
+    ):
+        residual = rng.normal(size=current_operator.observation_count).astype(
+            np.float64 if gpu_dtype == "float64" else np.float32
+        )
+        residual_t = torch.as_tensor(residual, dtype=dtype, device="cuda")
+        outputs = tuple(
+            _torch_response_product(
+                current_operator,
+                residual_t,
+                transpose=True,
+                torch_module=torch,
+                dense_response=prepared_response,
+            )
+            for _ in range(30)
+        )
+        torch.cuda.synchronize()
+        assert all(torch.equal(outputs[0], output) for output in outputs[1:])
+        np.testing.assert_allclose(
+            outputs[0].cpu().numpy(),
+            current_operator.rmatvec(residual),
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+@pytest.mark.parametrize(
+    ("gpu_dtype", "rtol", "atol"),
+    (("float64", 2.0e-12, 2.0e-13), ("float32", 3.0e-5, 3.0e-6)),
+)
+def test_dense_cuda_row_gather_transpose_is_bitwise_deterministic(
+    gpu_dtype: str,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Dense cached bootstrap rows must sum repeats without CUDA atomics."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(20260823)
+    measurement_count = 64
+    selected_count = 1024
+    energy_count = 32
+    patch_count = 16
+    response = rng.uniform(
+        1.0e-5,
+        1.0e-2,
+        (measurement_count, energy_count, patch_count, 1),
+    )
+    areas = rng.uniform(0.5, 2.0, patch_count)
+    row_keys = [f"dense-row-{index}" for index in range(measurement_count)]
+    operator = _dense_density_operator(
+        response,
+        areas,
+        isotope_count=1,
+        diagnostics={
+            "device_cache_key": f"dense-deterministic-{gpu_dtype}",
+            "measurement_row_keys": row_keys,
+        },
+    )
+    dtype = torch.float64 if gpu_dtype == "float64" else torch.float32
+    cache: dict[str, object] = {}
+    base_response, _, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=torch.device("cuda"),
+        dtype=dtype,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    selection = np.arange(selected_count, dtype=np.int64) % measurement_count
+    rng.shuffle(selection)
+    selected_operator = _dense_density_operator(
+        response[selection],
+        areas,
+        isotope_count=1,
+        diagnostics={
+            "device_cache_key": f"dense-deterministic-{gpu_dtype}",
+            "measurement_row_keys": [row_keys[index] for index in selection],
+        },
+    )
+    selected_response, diagnostics, _, _ = _prepare_dense_torch_response(
+        selected_operator,
+        device=torch.device("cuda"),
+        dtype=dtype,
+        cache_fraction=0.6,
+        torch_module=torch,
+        persistent_cache=cache,
+    )
+    assert base_response is not None
+    assert selected_response is not None
+    assert diagnostics["mode"] == "persistent_cuda_row_gather"
+    residual = rng.normal(size=selected_operator.observation_count).astype(
+        np.float64 if gpu_dtype == "float64" else np.float32
+    )
+    residual_t = torch.as_tensor(residual, dtype=dtype, device="cuda")
+    outputs = tuple(
+        _torch_response_product(
+            selected_operator,
+            residual_t,
+            transpose=True,
+            torch_module=torch,
+            dense_response=selected_response,
+        )
+        for _ in range(30)
+    )
+    torch.cuda.synchronize()
+
+    assert all(torch.equal(outputs[0], output) for output in outputs[1:])
+    np.testing.assert_allclose(
+        outputs[0].cpu().numpy(),
+        selected_operator.rmatvec(residual),
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+@pytest.mark.parametrize("gpu_dtype", ("float64", "float32"))
+def test_cuda_tv_incidence_transpose_is_bitwise_deterministic(
+    gpu_dtype: str,
+) -> None:
+    """TV edge contributions must reduce stably into repeated patch columns."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(20260824)
+    patch_count = 1024
+    edge_count = 16384
+    isotope_count = 3
+    edges = rng.integers(0, patch_count, size=(edge_count, 2), dtype=np.int64)
+    edges = edges[edges[:, 0] != edges[:, 1]]
+    edge_count = int(edges.shape[0])
+    incidence_rows = np.repeat(np.arange(edge_count, dtype=np.int64), 2)
+    incidence_columns = edges.reshape(-1)
+    incidence_coefficients = np.tile(
+        np.asarray([-1.0, 1.0], dtype=np.float64),
+        edge_count,
+    )
+    dtype = torch.float64 if gpu_dtype == "float64" else torch.float32
+    device = torch.device("cuda")
+    group_order, group_indices, group_lengths = _torch_duplicate_grouping(
+        incidence_columns,
+        device=device,
+        torch_module=torch,
+    )
+    assert group_order is not None
+    edge_values = rng.normal(size=(edge_count, isotope_count)).astype(
+        np.float64 if gpu_dtype == "float64" else np.float32
+    )
+    edge_values_t = torch.as_tensor(edge_values, dtype=dtype, device=device)
+    rows_t = torch.as_tensor(incidence_rows, dtype=torch.long, device=device)
+    columns_t = torch.as_tensor(incidence_columns, dtype=torch.long, device=device)
+    coefficients_t = torch.as_tensor(
+        incidence_coefficients,
+        dtype=dtype,
+        device=device,
+    )
+    outputs = tuple(
+        _torch_stable_incidence_transpose(
+            edge_values_t,
+            incidence_rows=rows_t,
+            incidence_columns=columns_t,
+            incidence_coefficients=coefficients_t,
+            patch_count=patch_count,
+            group_order=group_order,
+            group_indices=group_indices,
+            group_lengths=group_lengths,
+            torch_module=torch,
+        )
+        for _ in range(30)
+    )
+    torch.cuda.synchronize()
+
+    assert all(torch.equal(outputs[0], output) for output in outputs[1:])
+    expected = np.zeros((patch_count, isotope_count), dtype=edge_values.dtype)
+    np.add.at(
+        expected,
+        incidence_columns,
+        incidence_coefficients.astype(edge_values.dtype, copy=False)[:, None]
+        * edge_values[incidence_rows],
+    )
+    np.testing.assert_allclose(
+        outputs[0].cpu().numpy(),
+        expected,
+        rtol=2.0e-12 if gpu_dtype == "float64" else 3.0e-5,
+        atol=2.0e-13 if gpu_dtype == "float64" else 3.0e-6,
+    )
+
+
+def test_cuda_tv_active_fit_is_bitwise_deterministic() -> None:
+    """Repeated CUDA fits with active graph TV must be bitwise identical."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(20260827)
+    patch_count = 1024
+    edge_count = 16384
+    measurement_count = 4
+    energy_count = 4
+    isotope_count = 3
+    spatial = rng.lognormal(
+        -4.0,
+        1.0,
+        (measurement_count, patch_count, isotope_count),
+    )
+    pulses = rng.uniform(0.1, 1.0, (isotope_count, energy_count))
+    pulses /= np.sum(pulses, axis=1, keepdims=True)
+    operator = LineFactorizedResponseOperator(
+        spatial,
+        pulses,
+        np.arange(isotope_count, dtype=np.int64),
+        isotope_count,
+    )
+    edges = rng.integers(
+        0,
+        patch_count,
+        size=(edge_count, 2),
+        dtype=np.int64,
+    )
+    edges = edges[edges[:, 0] != edges[:, 1]]
+    observed = rng.uniform(1.0, 100.0, (measurement_count, energy_count))
+    initial = rng.lognormal(1.0, 2.0, (patch_count, isotope_count))
+    config = SurfaceMapConfig(
+        tv_weight=1.0e6,
+        max_iterations=3,
+        check_interval=3,
+        tolerance=0.0,
+        objective_tolerance=0.0,
+        kkt_tolerance=0.0,
+    )
+    cache: dict[str, object] = {}
+
+    results = tuple(
+        fit_surface_map_poisson_operator(
+            observed,
+            operator,
+            np.ones(patch_count, dtype=np.float64),
+            adjacency_edges=edges,
+            initial_densities_cps_1m_m2=initial,
+            config=config,
+            use_gpu=True,
+            gpu_dtype="float64",
+            persistent_response_cache=cache,
+        )
+        for _ in range(6)
+    )
+
+    reference = results[0]
+    assert reference.iterations == config.max_iterations
+    assert reference.tv_penalty > 0.0
+    assert np.isfinite(reference.kkt_residual)
+    for result in results[1:]:
+        np.testing.assert_array_equal(
+            result.densities_cps_1m_m2,
+            reference.densities_cps_1m_m2,
+        )
+        np.testing.assert_array_equal(
+            result.expected_counts,
+            reference.expected_counts,
+        )
+        assert result.objective == reference.objective
+        assert result.objective_history == reference.objective_history
+        assert result.kkt_residual == reference.kkt_residual
+
+
 def test_line_factorized_cuda_cache_appends_and_gathers_rows() -> None:
     """CUDA factor caches must append prefixes and gather bootstrap rows."""
     torch = pytest.importorskip("torch")
@@ -1048,6 +1381,7 @@ def test_line_factorized_cuda_cache_appends_and_gathers_rows() -> None:
         < extended_diagnostics["required_bytes"]
     )
     assert gathered_diagnostics["mode"] == "persistent_line_factor_row_gather"
+    assert gathered_response.measurement_group_order is None
     source = torch.arange(
         1,
         gathered.source_count + 1,
@@ -1062,6 +1396,26 @@ def test_line_factorized_cuda_cache_appends_and_gathers_rows() -> None:
         dense_response=gathered_response,
     )
     np.testing.assert_allclose(actual.cpu().numpy(), gathered.matvec(source.cpu()))
+    residual = torch.linspace(
+        0.1,
+        0.9,
+        gathered.observation_count,
+        dtype=torch.float64,
+        device="cuda",
+    )
+    transpose = _torch_response_product(
+        gathered,
+        residual,
+        transpose=True,
+        torch_module=torch,
+        dense_response=gathered_response,
+    )
+    np.testing.assert_allclose(
+        transpose.cpu().numpy(),
+        gathered.rmatvec(residual.cpu().numpy()),
+        rtol=1.0e-13,
+        atol=1.0e-14,
+    )
 
     masked = extended.masked_sources(np.asarray([[True, False], [False, True]]))
     masked_response, masked_diagnostics, _, _ = _prepare_dense_torch_response(
