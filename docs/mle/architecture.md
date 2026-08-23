@@ -309,19 +309,25 @@ PyTorch/device support raises an error rather than falling back. `gpu_dtype` acc
 `response_patch_chunk_size` bound streamed spectral blocks. The default measurement
 chunk is eight, so one complete station enters each shared-runtime kernel call
 together. Gamma-line detector pulses are constructed once per line and reused across
-all measurement/patch chunks. `response_cache_dir` stores content-addressed
-per-measurement blocks and
-prefix-reuse diagnostics. CPU cache misses are distributed over a bounded process
+all measurement/patch chunks. `response_cache_dir` stores one contiguous full-energy
+file per content-addressed measurement/patch chunk; emitted energy blocks are sliced
+from that file in memory. This keeps causal prefix reuse while preventing the cache
+inode count and load calls from scaling with the number of energy chunks. Cache and
+prefix-reuse diagnostics report both physical files and emitted blocks. CPU cache
+misses are distributed over a bounded process
 pool controlled by `response_worker_count`; zero selects the hardware-aware default,
 while CUDA kernel construction remains single-launch-streamed to avoid competing
 allocations. During a CUDA solve, the exact float64 response is opportunistically
 cached as one device matrix when it fits within
 `response_device_cache_fraction` of currently free VRAM. This removes all iterative
 host-to-device response transfers. If it does not fit, the solver preserves the same
-objective and falls back to bounded streamed blocks. Construction time, solver time,
-cache bytes, response-product calls, and estimated iterative transfer bytes are
-included in response-operator diagnostics. Materialized builder mode remains
-available only for small deterministic diagnostics and equivalence tests.
+objective and normally falls back to bounded streamed blocks. Production profiles
+may set `require_gpu_response_cache=true`; those fits fail before iteration with the
+required, free, and budgeted byte counts instead of silently accepting an extreme
+streamed runtime. Construction time, solver time, cache bytes, response-product
+calls, and estimated iterative transfer bytes are included in response-operator
+diagnostics. Materialized builder mode remains available only for small deterministic
+diagnostics and equivalence tests.
 
 The device cache persists across causal station fits. A station extension copies the
 resident prefix device-to-device and transfers only the new eight rows; bootstrap
@@ -330,7 +336,10 @@ without rebuilding physics or transferring response blocks from the host. Row su
 column sums, and device-cache population share one block traversal. Final bootstrap
 replicates are scheduled in exact concurrent batches controlled by
 `bootstrap_batch_size`; each replicate retains its original station resample,
-float64 solver, convergence checks, refinement, and debias path.
+configured bootstrap solver dtype, convergence checks, refinement, and debias path.
+Live estimation reports phase changes, checked iterations, KKT residuals,
+maximum-iteration ETA, and completed bootstrap replicates on stderr. JSON summaries
+therefore remain clean on stdout.
 
 Online and final spatial budgets are separate: `online_patch_spacing_m` and
 `online_coarse_to_fine_levels` define low-latency causal fits, while
@@ -349,8 +358,8 @@ The implemented public JSON fields are grouped below:
 | Nuisance model | background/scatter and calibrated leakage/station/low-rank/drift switches, `discrepancy_calibration_path`, nuisance penalties |
 | Likelihood | `spectral_likelihood`, `count_likelihood`, Student-t and covariance-conditioning fields |
 | Regularization selection | `regularization_selection`, grouped CV fields, tuning/final environment IDs |
-| Iteration | `max_iterations`, `tolerance`, `objective_tolerance`, `check_interval`, `step_safety`, `over_relaxation`, `min_mean` |
-| Compute | response mode/chunk/cache fields, `use_gpu`, `gpu_device`, `gpu_dtype` |
+| Iteration | `max_iterations`, `poisson_em_warm_start_iterations`, `tolerance`, `objective_tolerance`, `kkt_tolerance`, `check_interval`, `step_safety`, `over_relaxation`, `min_mean` |
+| Compute | response mode/chunk/cache fields, `require_gpu_response_cache`, `use_gpu`, `gpu_device`, `gpu_dtype` |
 | Online/final split | `online_fit_scope=station_complete`, `online_patch_spacing_m`, `online_coarse_to_fine_levels` |
 | Spectral pulse | `continuum_to_peak`, `backscatter_fraction` |
 | Refinement/debias | `coarse_to_fine_levels`, `refinement_fraction`, `debias_refit`, `support_threshold_fraction` |

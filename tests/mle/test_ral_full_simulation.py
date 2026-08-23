@@ -158,6 +158,14 @@ def test_mle_config_rejects_invalid_online_and_laplace_controls() -> None:
         MLEConfig(bootstrap_refit_mode="approximate")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="bootstrap_max_iterations"):
         MLEConfig(bootstrap_max_iterations=0)
+    with pytest.raises(ValueError, match="poisson_em_warm_start_iterations"):
+        MLEConfig(poisson_em_warm_start_iterations=-1)
+    with pytest.raises(ValueError, match="poisson_em_warm_start_iterations"):
+        MLEConfig(poisson_em_warm_start_iterations=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="kkt_tolerance"):
+        MLEConfig(kkt_tolerance=-1.0)
+    with pytest.raises(TypeError, match="require_gpu_response_cache"):
+        MLEConfig(require_gpu_response_cache=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="bootstrap_gpu_dtype"):
         MLEConfig(bootstrap_gpu_dtype="float16")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="debias_max_active_parameters"):
