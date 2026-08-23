@@ -52,6 +52,11 @@ def test_default_profiles_use_eight_measurements_per_station() -> None:
         config = MLEPlanningConfig.load(root / "configs" / "mle" / name)
         assert config.shield_program_length == 8
 
+    ral_config = MLEPlanningConfig.load(
+        root / "configs" / "mle" / "ral_full_planning.json"
+    )
+    assert ral_config.live_time_s == pytest.approx(20.0)
+
     legacy = MLEPlanningConfig(
         two_stage_screening=False,
         shield_program_length=2,

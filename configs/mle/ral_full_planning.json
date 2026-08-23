@@ -11,7 +11,7 @@
   "geometry_bootstrap_measurements": 8,
   "geometry_exploration_weight": 0.75,
   "laplace_prior_precision": 1.0,
-  "live_time_s": 30.0,
+  "live_time_s": 20.0,
   "local_refinement_top_k": 8,
   "max_active_source_parameters": 48,
   "max_total_source_parameters": 96,

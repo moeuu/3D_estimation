@@ -51,66 +51,27 @@ generated source-layout JSON maps to the current runtime scenario as follows:
 | source surface chart/UV/normal/transport metadata | unchanged |
 | PF estimator/planner configuration | **not copied** |
 
-The runtime requires exactly these top-level fields for adaptive scenario schema 1:
+Do not hand-author or copy the environment block into an MLE configuration. The
+runtime's `runtime.scenarios.RAL_ENVIRONMENT_CONFIG` is the single source of the
+room dimensions and initial detector position. `generate-ral-scenario` derives both
+`environment` and `scene.room_size_xyz` from that profile, and MLE consumes the same
+truth-free environment from the adaptive-session context and finalized
+MeasurementLog.
 
-```json
-{
-  "schema_version": 1,
-  "run_id": "ral-mix9-mle-YYYYMMDD-NNN",
-  "backend": "geant4",
-  "runtime_config_path": "/home/moeu/research/Rotating-shield-simulation-runtime/configs/geant4/variance_reduction_external_no_isaac_32threads.json",
-  "output_dir": "/secure/runtime-logs/ral-mix9-mle-YYYYMMDD-NNN",
-  "environment": {
-    "size_x": 10.0,
-    "size_y": 20.0,
-    "size_z": 10.0,
-    "detector_position": [0.5, 0.5, 0.5],
-    "adaptive_measurement": {
-      "candidate_count": 256,
-      "candidate_seed": 20260805,
-      "detector_height_min_m": 0.5,
-      "detector_height_max_m": 9.9,
-      "local_refinement_count": 64,
-      "local_refinement_radius_m": 0.5
-    }
-  },
-  "scene": {
-    "room_size_xyz": [10.0, 20.0, 10.0],
-    "sources": [
-      {
-        "isotope": "Cs-137",
-        "position": ["PF_LAYOUT_X", "PF_LAYOUT_Y", "PF_LAYOUT_Z"],
-        "transport_position": [
-          "PF_LAYOUT_TRANSPORT_X",
-          "PF_LAYOUT_TRANSPORT_Y",
-          "PF_LAYOUT_TRANSPORT_Z"
-        ],
-        "intensity_cps_1m": "PF_LAYOUT_STRENGTH",
-        "surface_chart_id": "PF_LAYOUT_CHART_ID",
-        "surface_uv": ["PF_LAYOUT_U", "PF_LAYOUT_V"],
-        "surface_normal": [
-          "PF_LAYOUT_NORMAL_X",
-          "PF_LAYOUT_NORMAL_Y",
-          "PF_LAYOUT_NORMAL_Z"
-        ],
-        "surface_emission_policy_sha256": "PF_LAYOUT_POLICY_SHA256"
-      }
-    ]
-  },
-  "isotopes": ["Co-60", "Cs-137", "Eu-154"],
-  "metadata": {
-    "scenario_family": "ral_mix9",
-    "scene_seed": 20260805
-  },
-  "obstacle_layout_path": null
-}
+Generate the standard MIX-9 scenario with the runtime CLI:
+
+```bash
+uv run --project ../Rotating-shield-simulation-runtime \
+  rotating-shield-sim generate-ral-scenario /private/ral-mix9.json \
+  --truth-manifest-output /private/ral-mix9-truth.json \
+  --measurement-log-output /runtime-logs/ral-mix9 \
+  --run-id ral-mix9-mle-YYYYMMDD-NNN \
+  --runtime-config ../Rotating-shield-simulation-runtime/configs/geant4/variance_reduction_external_no_isaac_32threads.json \
+  --source-profile ral-mix9
 ```
 
-The strings beginning with `PF_LAYOUT_` are placeholders, so the block above is a
-shape reference rather than an executable scenario. Replace `scene.sources` with all
-nine complete source objects from the newly authored PF-style surface layout. The
-runtime's private `ral-mix9` profile requires exactly Cs-137 x4, Co-60 x3, and
-Eu-154 x2.
+The runtime's private `ral-mix9` profile requires exactly Cs-137 x4, Co-60 x3,
+and Eu-154 x2.
 
 For an explicit absent-isotope test, generate with runtime profile
 `ral-cs4-co3-eu0`. It contains Cs-137 x4 and Co-60 x3 with no Eu-154 truth source,
@@ -120,17 +81,17 @@ map rather than removing that parameter:
 ```bash
 uv run --project ../Rotating-shield-simulation-runtime \
   rotating-shield-sim generate-ral-scenario /private/ral-cs4-co3-eu0.json \
+  --truth-manifest-output /private/ral-cs4-co3-eu0-truth.json \
   --measurement-log-output /runtime-logs/ral-cs4-co3-eu0 \
   --run-id ral-cs4-co3-eu0 \
   --runtime-config ../Rotating-shield-simulation-runtime/configs/geant4/variance_reduction_external_no_isaac_32threads.json \
   --source-profile ral-cs4-co3-eu0
 ```
 
-Each source object must contain exactly the eight fields shown above. In particular,
-do not recompute or round `transport_position`, `surface_uv`, the air-facing normal,
-or the surface-emission policy digest when copying a generated layout. They form a
-strict physical surface contract. `intensity_cps_1m` remains expected net detector
-cps at 1 m, not activity in Bq or total emitted gamma/s.
+Do not recompute or round a generated source's `transport_position`, `surface_uv`,
+air-facing normal, or surface-emission policy digest. They form a strict physical
+surface contract. `intensity_cps_1m` remains expected net detector cps at 1 m, not
+activity in Bq or total emitted gamma/s.
 
 For obstacles, keep three descriptions consistent:
 
@@ -179,8 +140,9 @@ The live loop is:
 8. Steps 3--7 repeat until the compound stop rule passes or an emergency safety bound
    is reached.
 
-`ral_full_planning.json` uses `shield_program_length = 8`. These are eight newly
-selected measurements at one detector pose, not a fixed legacy shield sequence. The
+`ral_full_planning.json` uses `shield_program_length = 8` and 20.0 s live time per
+view. These are eight newly selected measurements at one detector pose, not a fixed
+legacy shield sequence. The
 eight distinct Fe/Pb pairs are jointly optimized by station-block beam search rather
 than selected greedily one at a time. The estimate remains unchanged until all eight
 views are durable and the station closes, which preserves the statistical block used
