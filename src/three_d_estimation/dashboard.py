@@ -608,7 +608,7 @@ def _render_dashboard_images(
         fontsize=8,
         transform=info_axis.transAxes,
     )
-    overview.suptitle("RA-L experiment overview", fontsize=13, fontweight="bold")
+    overview.suptitle("Live experiment overview", fontsize=13, fontweight="bold")
     overview.subplots_adjust(
         left=0.06,
         right=0.98,

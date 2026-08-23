@@ -68,7 +68,7 @@ def test_completed_log_estimator_api_is_absent() -> None:
     import three_d_estimation
     import three_d_estimation.observation_batch as observation_batch
     import three_d_estimation.online as online
-    import three_d_estimation.ral as ral
+    import three_d_estimation.live_validation as live_validation
 
     assert importlib.util.find_spec("three_d_estimation.replay") is None
     assert importlib.util.find_spec("three_d_estimation.holdout") is None
@@ -89,8 +89,7 @@ def test_completed_log_estimator_api_is_absent() -> None:
         assert not hasattr(three_d_estimation, name)
     assert not hasattr(observation_batch, "observation_batch_from_log")
     assert not hasattr(online, "run_online_replay")
-    assert not hasattr(ral, "RALFullSimulationResult")
-    assert not hasattr(ral, "run_ral_full_simulation")
+    assert not hasattr(live_validation, "run_completed_log_estimation")
 
 
 def test_package_discovery_contains_only_mle_code() -> None:

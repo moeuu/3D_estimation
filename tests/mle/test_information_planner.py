@@ -41,6 +41,8 @@ from three_d_estimation.information_planner import (
     select_fisher_action,
 )
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
+from three_d_estimation.live_validation import load_live_planning_config
 
 
 def test_default_profiles_use_eight_measurements_per_station() -> None:
@@ -48,14 +50,16 @@ def test_default_profiles_use_eight_measurements_per_station() -> None:
     root = Path(__file__).resolve().parents[2]
 
     assert MLEPlanningConfig().shield_program_length == 8
-    for name in ("default_planning.json", "ral_full_planning.json"):
-        config = MLEPlanningConfig.load(root / "configs" / "mle" / name)
-        assert config.shield_program_length == 8
-
-    ral_config = MLEPlanningConfig.load(
-        root / "configs" / "mle" / "ral_full_planning.json"
+    default_config = MLEPlanningConfig.load(
+        root / "configs" / "mle" / "default_planning.json"
     )
-    assert ral_config.live_time_s == pytest.approx(20.0)
+    assert default_config.shield_program_length == 8
+    live_config = load_live_planning_config(
+        root / "configs" / "mle" / "live_surface_planning.json",
+        STANDARD_EXPERIMENT_PROFILE.acquisition,
+    )
+    assert live_config.shield_program_length == 8
+    assert live_config.live_time_s == pytest.approx(20.0)
 
     legacy = MLEPlanningConfig(
         two_stage_screening=False,

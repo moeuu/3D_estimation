@@ -811,7 +811,7 @@ wheels = [
 [[package]]
 name = "rotating-shield-simulation-runtime"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git?rev=421d4e0715c7a71d7323b909dbf6caa37e05d251#421d4e0715c7a71d7323b909dbf6caa37e05d251" }
+source = { git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git?rev=c35f2f533190c8ba6aee1678d4cd9f31d5956240#c35f2f533190c8ba6aee1678d4cd9f31d5956240" }
 dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
@@ -956,7 +956,7 @@ dev = [
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.7" },
     { name = "numpy", specifier = ">=2.3.5" },
-    { name = "rotating-shield-simulation-runtime", git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git?rev=421d4e0715c7a71d7323b909dbf6caa37e05d251" },
+    { name = "rotating-shield-simulation-runtime", git = "ssh://git@github.com/moeuu/radiation-simulation-runtime.git?rev=c35f2f533190c8ba6aee1678d4cd9f31d5956240" },
     { name = "scipy", specifier = ">=1.16.3" },
     { name = "threadpoolctl", specifier = ">=3.6.0" },
     { name = "torch" },

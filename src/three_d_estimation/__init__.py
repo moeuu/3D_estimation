@@ -1,6 +1,6 @@
 """Standalone surface maximum-likelihood radiation estimation."""
 
-from .closed_loop import RALClosedLoopResult, run_ral_closed_loop
+from .closed_loop import LiveClosedLoopResult, run_live_closed_loop
 from .config import MLEConfig, build_default_config
 from .conformance import (
     ForwardConformanceResult,
@@ -30,10 +30,10 @@ from .online import (
     OnlineMLESession,
     OnlineStationReport,
 )
-from .ral import (
-    RALPreflightResult,
-    preflight_ral_full_simulation,
-    validate_ral_measurement_log,
+from .live_validation import (
+    LivePreflightResult,
+    preflight_live_simulation,
+    validate_live_measurement_log,
 )
 from .reporting import (
     MLEReportPaths,
@@ -84,8 +84,8 @@ __all__ = [
     "OnlineMLERunResult",
     "OnlineMLESession",
     "OnlineStationReport",
-    "RALClosedLoopResult",
-    "RALPreflightResult",
+    "LiveClosedLoopResult",
+    "LivePreflightResult",
     "SpectralResponseResult",
     "SurfaceMLEBackend",
     "SurfaceMLEEstimator",
@@ -111,12 +111,12 @@ __all__ = [
     "mle_report_sha256",
     "observation_batch_from_records",
     "plan_next_measurement",
-    "preflight_ral_full_simulation",
+    "preflight_live_simulation",
     "refine_surface_patches",
-    "run_ral_closed_loop",
+    "run_live_closed_loop",
     "save_forward_conformance",
     "save_mle_estimate",
     "save_mle_planning_result",
     "select_fisher_action",
-    "validate_ral_measurement_log",
+    "validate_live_measurement_log",
 ]

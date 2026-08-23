@@ -17,17 +17,16 @@ from runtime.defaults import (
 
 from .closed_loop import (
     MLEStopConfig,
-    RAL_PRIVATE_SCENE_PROFILES,
-    run_ral_closed_loop,
+    run_live_closed_loop,
 )
 from .conformance import compute_forward_conformance, save_forward_conformance
-from .ral import preflight_ral_full_simulation
+from .live_validation import preflight_live_simulation
 from .reporting import load_mle_estimate
 
 ROOT = Path(__file__).resolve().parents[2]
-RAL_MLE_CONFIG = ROOT / "configs" / "mle" / "ral_full_spectral.json"
-RAL_PLANNING_CONFIG = ROOT / "configs" / "mle" / "ral_full_planning.json"
-RAL_STOP_CONFIG = ROOT / "configs" / "mle" / "ral_full_stop.json"
+LIVE_MLE_CONFIG = ROOT / "configs" / "mle" / "live_surface_spectral.json"
+LIVE_PLANNING_CONFIG = ROOT / "configs" / "mle" / "live_surface_planning.json"
+LIVE_STOP_CONFIG = ROOT / "configs" / "mle" / "live_surface_stop.json"
 
 
 def _print_cui_dashboard_url(url: str, *, json_output: bool) -> None:
@@ -43,14 +42,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description="Standalone rotating-shield surface maximum-likelihood estimation.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    ral_parser = subparsers.add_parser(
-        "ral-full-simulation",
-        help=(
-            "Run a private RA-L scenario through a live MLE-controlled shared "
-            "runtime session."
-        ),
+    live_parser = subparsers.add_parser(
+        "live-simulation",
+        help="Run a private scenario through a live MLE-controlled runtime session.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--scenario",
         type=Path,
         default=None,
@@ -60,16 +56,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "does not discover or generate this file."
         ),
     )
-    ral_parser.add_argument(
-        "--private-scene-profile",
-        choices=RAL_PRIVATE_SCENE_PROFILES,
-        default="ral-mix9",
-        help=(
-            "Runtime-private source-cardinality contract used only for live "
-            "scenario validation."
-        ),
-    )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--resume-stage",
         type=Path,
         default=None,
@@ -78,7 +65,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "station in a shared-runtime stream stage."
         ),
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--resume-compatibility",
         type=Path,
         default=None,
@@ -87,91 +74,85 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "adaptive resume."
         ),
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
         help="MLE output outside the immutable MeasurementLog directory.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--mle-config",
         type=Path,
-        default=RAL_MLE_CONFIG,
-        help="RAL spectral-MLE configuration.",
+        default=LIVE_MLE_CONFIG,
+        help="Live spectral-MLE configuration.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--planning-config",
         type=Path,
-        default=RAL_PLANNING_CONFIG,
-        help="RAL MLE planning profile checked during preflight.",
+        default=LIVE_PLANNING_CONFIG,
+        help="Live MLE planning policy checked during preflight.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--stop-config",
         type=Path,
-        default=RAL_STOP_CONFIG,
+        default=LIVE_STOP_CONFIG,
         help="Compound MLE convergence and coverage stop configuration.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--runtime-root",
         type=Path,
         default=None,
         help="Optional shared-runtime checkout override.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--preflight-only",
         action="store_true",
         help="Verify Geant4/runtime/MLE readiness without starting acquisition.",
     )
-    ral_parser.add_argument(
-        "--max-measurements",
-        type=int,
-        default=256,
-        help="Emergency safety bound; MLE information convergence normally stops first.",
-    )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--minimum-information-gain-nats",
         type=float,
         default=None,
         help="Optional override of the compound stop profile's EIG threshold.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--low-information-patience",
         type=int,
         default=None,
         help="Optional override of the compound stop profile's patience window.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace an existing MLE output directory.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--no-dashboard",
         action="store_true",
         help="Disable the MLE browser dashboard.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--no-serve",
         action="store_true",
         help="Write dashboard files without starting its URL server.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--dashboard-host",
         default=DEFAULT_CUI_SPLIT_VIEW_HOST,
         help=f"Dashboard bind host (default: {DEFAULT_CUI_SPLIT_VIEW_HOST}).",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--dashboard-port",
         type=int,
         default=DEFAULT_CUI_SPLIT_VIEW_PORT,
         help=f"Dashboard TCP port (default: {DEFAULT_CUI_SPLIT_VIEW_PORT}).",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--dashboard-public-host",
         default=None,
         help="Browser-visible dashboard host.",
     )
-    ral_parser.add_argument(
+    live_parser.add_argument(
         "--json",
         action="store_true",
         help="Print preflight or completed pipeline data as JSON.",
@@ -252,9 +233,9 @@ def _run_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_ral_live_acquisition(args: argparse.Namespace) -> int:
+def _run_live_acquisition(args: argparse.Namespace) -> int:
     """Preflight and run the strict runtime-acquisition plus MLE pipeline."""
-    preflight = preflight_ral_full_simulation(
+    preflight = preflight_live_simulation(
         mle_config_path=args.mle_config,
         planning_config_path=args.planning_config,
         stop_config_path=args.stop_config,
@@ -273,12 +254,12 @@ def _run_ral_live_acquisition(args: argparse.Namespace) -> int:
         return 0 if preflight.ready else 1
     if not preflight.ready:
         raise RuntimeError(
-            "RA-L full-simulation preflight failed:\n- " + "\n- ".join(preflight.errors)
+            "Live-simulation preflight failed:\n- " + "\n- ".join(preflight.errors)
         )
     if args.output_dir is None:
-        raise ValueError("ral-full-simulation requires --output-dir.")
+        raise ValueError("live-simulation requires --output-dir.")
     if args.scenario is None:
-        raise ValueError("ral-full-simulation requires a private --scenario.")
+        raise ValueError("live-simulation requires a private --scenario.")
     if args.resume_compatibility is not None and args.resume_stage is None:
         raise ValueError("--resume-compatibility requires --resume-stage.")
 
@@ -302,16 +283,14 @@ def _run_ral_live_acquisition(args: argparse.Namespace) -> int:
             stop_config,
             low_information_patience=args.low_information_patience,
         )
-    result = run_ral_closed_loop(
+    result = run_live_closed_loop(
         args.scenario,
         runtime_root=preflight.runtime_root,
-        private_scene_profile=args.private_scene_profile,
         resume_stage_path=args.resume_stage,
         resume_compatibility_path=args.resume_compatibility,
         mle_config_path=args.mle_config,
         planning_config_path=args.planning_config,
         output_dir=args.output_dir,
-        max_measurements=args.max_measurements,
         minimum_information_gain_nats=(
             stop_config.maximum_expected_information_gain_nats
         ),
@@ -356,8 +335,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments and execute the requested standalone operation."""
     parser = build_argument_parser()
     args = parser.parse_args(None if argv is None else list(argv))
-    if args.command == "ral-full-simulation":
-        return _run_ral_live_acquisition(args)
+    if args.command == "live-simulation":
+        return _run_live_acquisition(args)
     if args.command == "report":
         return _run_report(args)
     if args.command == "forward-conformance":

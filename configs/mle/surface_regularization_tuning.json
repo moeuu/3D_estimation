@@ -20,7 +20,7 @@
   "patch_spacing_m": [1.0, 1.0, 1.0],
   "quadrature_order": 4,
   "regularization_selection": "grouped_cv",
-  "response_cache_dir": ".cache/ral_regularization_tuning",
+  "response_cache_dir": ".cache/surface_regularization_tuning",
   "response_chunk_size": 65536,
   "response_measurement_chunk_size": 8,
   "response_energy_chunk_size": 1024,
@@ -28,7 +28,7 @@
   "response_worker_count": 0,
   "response_device_cache_fraction": 0.6,
   "spectral_response_mode": "matrix_free",
-  "tuning_environment_id": "ral-tuning-independent",
+  "tuning_environment_id": "surface-tuning-independent",
   "uncertainty_enable": false,
   "use_gpu": true
 }

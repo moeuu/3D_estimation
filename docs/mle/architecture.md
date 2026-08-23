@@ -11,7 +11,7 @@ observation-model, continuous-kernel, asset-resolution, and final-log validation
 It does not copy or synchronize runtime source.
 
 Production has one live estimator path. `OnlineMLESession` accepts each
-already-persisted runtime record. Production RA-L mode buffers all shield views at
+already-persisted runtime record. Production live mode buffers all shield views at
 one point and performs one coarse all-history warm fit only when the durable station
 marker closes that measurement point. `complete_live_state()` rebuilds and seals the
 configured full-resolution grid and uncertainty result before runtime publication.
@@ -31,17 +31,18 @@ ranking and shield-program selection. Cross-repository forward-response conforma
 tests detect estimator/kernel drift. The planning derivation and action contract are
 documented in [MLE information planning](information_planning.md).
 
-The RA-L integration follows the same boundary. `ral-full-simulation` performs a
+The live integration follows the same boundary. `live-simulation` performs a
 strict physical/configuration preflight and passes a private scenario path directly
 to `rotating-shield-sim run-adaptive-session`. The runtime publishes reachable
 truth-free candidates and each durably staged spectrum. The MLE refits all causal
 history, asks the runtime for local candidate refinement when useful, and selects the
-next eight-measurement station program. No action list, station count, shield program,
-or record count appears in the scenario. The immutable log is validated and bound to
+next runtime-sized station program. No action list or route appears in the scenario;
+station, view, live-time, and measurement limits come from the runtime experiment
+profile. The immutable log is validated and bound to
 the final MLE report only after the compound
 stability/coverage/ambiguity/information stop rule fires. The enforced order is
 scientific completion, runtime log publication, exact binding, then artifact
-publication. See the [RA-L closed-loop runbook](ral_full_simulation.md).
+publication. See the [live closed-loop runbook](live_full_simulation.md).
 
 ## Data contracts and dimensions
 
@@ -172,7 +173,7 @@ mu[m,b] = sum_g sum_i R_spec[m,b,g,i] * s[g,i]
 
 The optional spectral nuisance bases are non-negative, live-time-scaled, normalized background and scatter shapes. They fit one background rate and one scatter rate, rather than one unconstrained value per bin.
 
-Production RA-L fitting instead creates a `ResponseOperator`. Its forward and adjoint
+Production live fitting instead creates a `ResponseOperator`. Its forward and adjoint
 products stream measurement, energy-bin, patch, quadrature, and isotope blocks without
 materializing the full tensor. Per-measurement physical blocks use content-addressed
 disk caching, so an extended causal prefix evaluates only new rows. The cache key binds
@@ -296,14 +297,14 @@ NPZ member order and ZIP timestamps are fixed. The NPZ includes the SHA-256 of t
 
 ## CPU, GPU, cache, and memory
 
-`--cpu` forces the NumPy streamed path. The RA-L physical profile requests CUDA and
+`--cpu` forces the NumPy streamed path. The production live profile requests CUDA and
 fails closed if the configured device is unavailable; smaller default profiles remain
 CPU-friendly.
 
 `--gpu` runs shared physical-kernel evaluation and optimization through PyTorch
 tensors on `gpu_device` (default `cuda`). The request is strict: missing
 PyTorch/device support raises an error rather than falling back. `gpu_dtype` accepts
-`float32` or `float64`; the RA-L profiles retain `float64`.
+`float32` or `float64`; the production live profile retains `float64`.
 
 `response_measurement_chunk_size`, `response_energy_chunk_size`, and
 `response_patch_chunk_size` bound streamed spectral blocks. The default measurement

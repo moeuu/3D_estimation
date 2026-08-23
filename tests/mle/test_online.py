@@ -829,7 +829,6 @@ def test_online_dashboard_uses_runtime_resolved_file_obstacle_scene(
         "fit-spectrum",
         "online-replay",
         "online",
-        "ral-holdout",
         "plan-next",
         "score-future",
     ),
@@ -856,7 +855,7 @@ def test_cli_exposes_only_live_and_read_only_commands() -> None:
 
     assert len(subparser_actions) == 1
     assert set(subparser_actions[0].choices) == {
-        "ral-full-simulation",
+        "live-simulation",
         "report",
         "forward-conformance",
     }

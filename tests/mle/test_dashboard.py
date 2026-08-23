@@ -235,16 +235,16 @@ def test_cui_url_is_visible_without_corrupting_json_stdout(
     assert structured.err == f"CUI split visualization URL: {url}\n"
 
 
-def test_ral_command_announces_cui_url_once(
+def test_live_command_announces_cui_url_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The live RA-L command must not repeat its immediate CUI URL at exit."""
+    """The live command must not repeat its immediate CUI URL at exit."""
     url = "http://127.0.0.1:8877/index.html"
     monkeypatch.setattr(
         cli,
-        "preflight_ral_full_simulation",
+        "preflight_live_simulation",
         lambda **kwargs: SimpleNamespace(
             ready=True,
             errors=(),
@@ -271,10 +271,10 @@ def test_ral_command_announces_cui_url_once(
             dashboard_url=url,
         )
 
-    monkeypatch.setattr(cli, "run_ral_closed_loop", fake_closed_loop)
+    monkeypatch.setattr(cli, "run_live_closed_loop", fake_closed_loop)
     args = build_argument_parser().parse_args(
         [
-            "ral-full-simulation",
+            "live-simulation",
             "--scenario",
             str(tmp_path / "scenario.json"),
             "--output-dir",
@@ -282,7 +282,7 @@ def test_ral_command_announces_cui_url_once(
         ]
     )
 
-    assert cli._run_ral_live_acquisition(args) == 0
+    assert cli._run_live_acquisition(args) == 0
     captured = capsys.readouterr()
     assert captured.out.count(f"CUI split visualization URL: {url}\n") == 1
     assert captured.err == ""

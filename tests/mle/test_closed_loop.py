@@ -23,10 +23,10 @@ from runtime.adaptive_client import (
 from runtime.measurement_log import MeasurementLogValidationError
 
 from three_d_estimation.closed_loop import (
+    LiveClosedLoopResult,
     MLEStopConfig,
-    RALClosedLoopResult,
     evaluate_mle_stop,
-    run_ral_closed_loop,
+    run_live_closed_loop,
 )
 from three_d_estimation.information_planner import (
     MLEPlanningAction,
@@ -39,7 +39,21 @@ def _context_payload() -> dict[str, object]:
     return {
         "repository_commit": "a" * 40,
         "runtime_config": {},
-        "environment": {"size_x": 2.0, "size_y": 2.0, "size_z": 1.5},
+        "environment": {
+            "size_x": 10.0,
+            "size_y": 15.0,
+            "size_z": 5.0,
+            "experiment_profile_id": "multi_isotope_surface_search_v1",
+            "acquisition_contract": {
+                "schema_version": 1,
+                "max_stations": 16,
+                "views_per_station": 8,
+                "live_time_s": 20.0,
+                "max_measurements": 128,
+                "min_station_separation_m": 3.0,
+                "coverage_radius_m": 3.0,
+            },
+        },
         "sim_backend": "geant4",
         "spectrum_count_method": "joint_full_spectrum_generative",
         "isotopes": ["Co-60", "Cs-137", "Eu-154"],
@@ -316,7 +330,6 @@ class _FakeRuntimeClient:
         del args
         type(self).instance = self
         _FakeRuntimeClient.instance = self
-        self.private_scene_profile = kwargs.get("private_scene_profile")
         self.resume_stage_path = kwargs.get("resume_stage_path")
         self.resume_compatibility_path = kwargs.get("resume_compatibility_path")
         self.requests: list[dict[str, object]] = []
@@ -603,6 +616,48 @@ class _FakeOnlineProgramSession(_FakeOnlineSession):
         return MLEPlanningResult(action, (action,), {})
 
 
+def _patch_live_contract(
+    monkeypatch: Any,
+    closed_loop: object,
+    *,
+    max_measurements: int,
+    views_per_station: int = 1,
+    local_refinement_top_k: int = 0,
+    two_stage_screening: bool = False,
+) -> None:
+    """Bind one compact runtime contract to a closed-loop unit test."""
+    contract = SimpleNamespace(
+        max_measurements=max_measurements,
+        live_time_s=30.0,
+        views_per_station=views_per_station,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "experiment_profile_from_environment",
+        lambda environment: SimpleNamespace(profile_id="test-profile"),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "acquisition_contract_from_environment",
+        lambda environment: contract,
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "load_live_mle_config",
+        lambda path, isotopes: SimpleNamespace(isotope_names=tuple(isotopes)),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "load_live_planning_config",
+        lambda path, acquisition: SimpleNamespace(
+            shield_program_length=acquisition.views_per_station,
+            live_time_s=acquisition.live_time_s,
+            local_refinement_top_k=local_refinement_top_k,
+            two_stage_screening=two_stage_screening,
+        ),
+    )
+
+
 def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     monkeypatch: Any,
     tmp_path: Path,
@@ -616,41 +671,30 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     planning_path.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
-    monkeypatch.setattr(
-        closed_loop.MLEConfig,
-        "load",
-        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
-    )
-    monkeypatch.setattr(
-        closed_loop.MLEPlanningConfig,
-        "load",
-        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
-    )
+    _patch_live_contract(monkeypatch, closed_loop, max_measurements=2)
     fake_log = SimpleNamespace(
         path=Path("/tmp/adaptive-log"),
         run_id="adaptive-test",
         records=(SimpleNamespace(station_id=0), SimpleNamespace(station_id=1)),
     )
     monkeypatch.setattr(
-        closed_loop, "validate_ral_measurement_log", lambda path: fake_log
+        closed_loop, "validate_live_measurement_log", lambda path: fake_log
     )
     output_lines: list[str] = []
 
-    result = run_ral_closed_loop(
+    result = run_live_closed_loop(
         tmp_path / "private-scenario.json",
         runtime_root=tmp_path,
         mle_config_path=mle_path,
         planning_config_path=planning_path,
         output_dir=tmp_path / "output",
-        private_scene_profile="ral-cs4-co3-eu0",
-        max_measurements=2,
         output_hook=output_lines.append,
     )
 
     client = _FakeRuntimeClient.instance
-    assert isinstance(result, RALClosedLoopResult)
+    assert isinstance(result, LiveClosedLoopResult)
     assert client is not None
-    assert client.private_scene_profile == "ral-cs4-co3-eu0"
+    assert result.experiment_profile_id == "test-profile"
     assert client.cui_overlay_requests == []
     assert client.lifecycle_events[-4:] == [
         "complete_live_state",
@@ -702,25 +746,15 @@ def test_closed_loop_context_terminates_an_incomplete_runtime(
         _FailingRuntimeClient,
     )
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
-    monkeypatch.setattr(
-        closed_loop.MLEConfig,
-        "load",
-        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
-    )
-    monkeypatch.setattr(
-        closed_loop.MLEPlanningConfig,
-        "load",
-        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
-    )
+    _patch_live_contract(monkeypatch, closed_loop, max_measurements=1)
 
     with pytest.raises(RuntimeError, match="injected adaptive acquisition failure"):
-        run_ral_closed_loop(
+        run_live_closed_loop(
             tmp_path / "private-scenario.json",
             runtime_root=tmp_path,
             mle_config_path=mle_path,
             planning_config_path=planning_path,
             output_dir=tmp_path / "output",
-            max_measurements=1,
             output_hook=lambda line: None,
         )
 
@@ -742,32 +776,22 @@ def test_closed_loop_cui_remains_truth_free(
     planning_path.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
-    monkeypatch.setattr(
-        closed_loop.MLEConfig,
-        "load",
-        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
-    )
-    monkeypatch.setattr(
-        closed_loop.MLEPlanningConfig,
-        "load",
-        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
-    )
+    _patch_live_contract(monkeypatch, closed_loop, max_measurements=1)
     fake_log = SimpleNamespace(
         path=Path("/tmp/adaptive-log"),
         run_id="adaptive-test",
         records=(SimpleNamespace(station_id=0),),
     )
     monkeypatch.setattr(
-        closed_loop, "validate_ral_measurement_log", lambda path: fake_log
+        closed_loop, "validate_live_measurement_log", lambda path: fake_log
     )
 
-    run_ral_closed_loop(
+    run_live_closed_loop(
         tmp_path / "private-scenario.json",
         runtime_root=tmp_path,
         mle_config_path=mle_path,
         planning_config_path=planning_path,
         output_dir=tmp_path / "output",
-        max_measurements=1,
         output_hook=lambda line: None,
     )
 
@@ -798,16 +822,7 @@ def test_closed_loop_restores_resume_prefix_then_plans_next_station(
         _FakeResumeRuntimeClient,
     )
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
-    monkeypatch.setattr(
-        closed_loop.MLEConfig,
-        "load",
-        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
-    )
-    monkeypatch.setattr(
-        closed_loop.MLEPlanningConfig,
-        "load",
-        lambda path: SimpleNamespace(shield_program_length=1, live_time_s=30.0),
-    )
+    _patch_live_contract(monkeypatch, closed_loop, max_measurements=2)
     fake_log = SimpleNamespace(
         path=Path("/tmp/adaptive-log"),
         run_id="adaptive-test",
@@ -815,13 +830,13 @@ def test_closed_loop_restores_resume_prefix_then_plans_next_station(
     )
     monkeypatch.setattr(
         closed_loop,
-        "validate_ral_measurement_log",
+        "validate_live_measurement_log",
         lambda path: fake_log,
     )
     stage = tmp_path / ".measurement-log.stream-17"
     compatibility = tmp_path / "resume-compatibility.json"
 
-    result = run_ral_closed_loop(
+    result = run_live_closed_loop(
         tmp_path / "private-scenario.json",
         runtime_root=tmp_path,
         mle_config_path=mle_path,
@@ -829,7 +844,6 @@ def test_closed_loop_restores_resume_prefix_then_plans_next_station(
         output_dir=tmp_path / "output",
         resume_stage_path=stage,
         resume_compatibility_path=compatibility,
-        max_measurements=2,
     )
 
     client = _FakeResumeRuntimeClient.instance
@@ -857,20 +871,12 @@ def test_two_stage_closed_loop_screens_before_runtime_refinement(
     planning_path.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
-    monkeypatch.setattr(
-        closed_loop.MLEConfig,
-        "load",
-        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
-    )
-    monkeypatch.setattr(
-        closed_loop.MLEPlanningConfig,
-        "load",
-        lambda path: SimpleNamespace(
-            shield_program_length=1,
-            live_time_s=30.0,
-            local_refinement_top_k=1,
-            two_stage_screening=True,
-        ),
+    _patch_live_contract(
+        monkeypatch,
+        closed_loop,
+        max_measurements=2,
+        local_refinement_top_k=1,
+        two_stage_screening=True,
     )
     fake_log = SimpleNamespace(
         path=Path("/tmp/adaptive-log"),
@@ -879,17 +885,16 @@ def test_two_stage_closed_loop_screens_before_runtime_refinement(
     )
     monkeypatch.setattr(
         closed_loop,
-        "validate_ral_measurement_log",
+        "validate_live_measurement_log",
         lambda path: fake_log,
     )
 
-    run_ral_closed_loop(
+    run_live_closed_loop(
         tmp_path / "private-scenario.json",
         runtime_root=tmp_path,
         mle_config_path=mle_path,
         planning_config_path=planning_path,
         output_dir=tmp_path / "output",
-        max_measurements=2,
     )
 
     client = _FakeRuntimeClient.instance
@@ -915,19 +920,11 @@ def test_closed_loop_groups_same_pose_shield_views_into_one_station(
     planning_path.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineProgramSession)
-    monkeypatch.setattr(
-        closed_loop.MLEConfig,
-        "load",
-        lambda path: SimpleNamespace(isotope_names=("Co-60", "Cs-137", "Eu-154")),
-    )
-    monkeypatch.setattr(
-        closed_loop.MLEPlanningConfig,
-        "load",
-        lambda path: SimpleNamespace(
-            shield_program_length=2,
-            live_time_s=30.0,
-            local_refinement_top_k=0,
-        ),
+    _patch_live_contract(
+        monkeypatch,
+        closed_loop,
+        max_measurements=3,
+        views_per_station=2,
     )
     fake_log = SimpleNamespace(
         path=Path("/tmp/adaptive-log"),
@@ -940,17 +937,16 @@ def test_closed_loop_groups_same_pose_shield_views_into_one_station(
     )
     monkeypatch.setattr(
         closed_loop,
-        "validate_ral_measurement_log",
+        "validate_live_measurement_log",
         lambda path: fake_log,
     )
 
-    result = run_ral_closed_loop(
+    result = run_live_closed_loop(
         tmp_path / "private-scenario.json",
         runtime_root=tmp_path,
         mle_config_path=mle_path,
         planning_config_path=planning_path,
         output_dir=tmp_path / "output",
-        max_measurements=3,
     )
 
     client = _FakeRuntimeClient.instance

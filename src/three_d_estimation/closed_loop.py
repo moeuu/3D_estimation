@@ -21,20 +21,22 @@ from runtime.defaults import (
     DEFAULT_CUI_SPLIT_VIEW_PORT,
 )
 from runtime.measurement_log import MeasurementLogRecord
-
-from .config import MLEConfig
-from .information_planner import MLEPlanningConfig, MLEPlanningResult
-from .online import OnlineMLESession
-from .ral import validate_ral_measurement_log
-
-RAL_PRIVATE_SCENE_PROFILES = (
-    "ral-mix9",
-    "ral-cs4-co3-eu0",
+from runtime.experiment_profiles import (
+    acquisition_contract_from_environment,
+    experiment_profile_from_environment,
 )
+
+from .information_planner import MLEPlanningResult
+from .live_validation import (
+    load_live_mle_config,
+    load_live_planning_config,
+    validate_live_measurement_log,
+)
+from .online import OnlineMLESession
 
 
 @dataclass(frozen=True, slots=True)
-class RALClosedLoopResult:
+class LiveClosedLoopResult:
     """Describe a completed MLE-controlled physical acquisition."""
 
     measurement_log_path: Path
@@ -44,15 +46,15 @@ class RALClosedLoopResult:
     station_count: int
     stop_reason: str
     dashboard_url: str | None
-    private_scene_profile: str
+    experiment_profile_id: str
 
     def to_dict(self) -> dict[str, object]:
         """Return a strict JSON-safe result payload."""
         return {
             "schema_version": 1,
             "status": "complete",
-            "profile": "ral_surface_mle_closed_loop_v1",
-            "private_scene_profile": self.private_scene_profile,
+            "profile": "live_surface_mle_closed_loop_v1",
+            "experiment_profile_id": self.experiment_profile_id,
             "control_mode": "mle_closed_loop",
             "measurement_log_path": self.measurement_log_path.as_posix(),
             "mle_output_dir": self.mle_output_dir.as_posix(),
@@ -364,17 +366,15 @@ def evaluate_mle_stop(
     return MLEStopDecision(all(gates.values()), gates, details)
 
 
-def run_ral_closed_loop(
+def run_live_closed_loop(
     scenario_path: str | Path,
     *,
     runtime_root: str | Path,
     mle_config_path: str | Path,
     planning_config_path: str | Path,
     output_dir: str | Path,
-    private_scene_profile: str = "ral-mix9",
     resume_stage_path: str | Path | None = None,
     resume_compatibility_path: str | Path | None = None,
-    max_measurements: int = 256,
     minimum_information_gain_nats: float = 1.0e-3,
     low_information_patience: int = 3,
     stop_config: MLEStopConfig | None = None,
@@ -386,14 +386,8 @@ def run_ral_closed_loop(
     dashboard_public_host: str | None = None,
     dashboard_url_hook: Callable[[str], None] | None = None,
     output_hook: Callable[[str], None] = print,
-) -> RALClosedLoopResult:
+) -> LiveClosedLoopResult:
     """Run observation, MLE fit, Fisher selection, and runtime action in a loop."""
-    if private_scene_profile not in RAL_PRIVATE_SCENE_PROFILES:
-        raise ValueError(
-            f"private_scene_profile must be one of {RAL_PRIVATE_SCENE_PROFILES}."
-        )
-    if isinstance(max_measurements, bool) or int(max_measurements) < 1:
-        raise ValueError("max_measurements must be a positive safety bound.")
     if isinstance(low_information_patience, bool) or int(low_information_patience) < 1:
         raise ValueError("low_information_patience must be positive.")
     threshold = float(minimum_information_gain_nats)
@@ -402,8 +396,6 @@ def run_ral_closed_loop(
     mle_path = Path(mle_config_path).expanduser().resolve()
     planning_path = Path(planning_config_path).expanduser().resolve()
     target = Path(output_dir).expanduser().resolve()
-    mle_config = MLEConfig.load(mle_path)
-    planning_config = MLEPlanningConfig.load(planning_path)
     resolved_stop = stop_config or MLEStopConfig(
         maximum_expected_information_gain_nats=threshold,
         low_information_patience=int(low_information_patience),
@@ -433,16 +425,21 @@ def run_ral_closed_loop(
             f"elapsed={elapsed:.1f}s eta={eta}"
         )
 
-    def run_session(client: AdaptiveRuntimeClient) -> RALClosedLoopResult:
+    def run_session(client: AdaptiveRuntimeClient) -> LiveClosedLoopResult:
         """Drive one context-owned adaptive session to publication."""
         ready = client.handshake()
         context = ready.context
+        experiment = experiment_profile_from_environment(context.environment)
+        acquisition = acquisition_contract_from_environment(context.environment)
+        mle_config = load_live_mle_config(mle_path, tuple(context.isotopes))
+        planning_config = load_live_planning_config(planning_path, acquisition)
+        max_measurements = acquisition.max_measurements
         candidates = ready.candidates
         bootstrap = ready.bootstrap
         resume_prefix = ready.resume
         if tuple(mle_config.isotope_names) != tuple(context.isotopes):
             raise ValueError(
-                "RAL MLE isotopes must match the adaptive runtime scenario."
+                "Live MLE isotopes must match the adaptive runtime scenario."
             )
         online = OnlineMLESession(
             context=context,
@@ -603,13 +600,13 @@ def run_ral_closed_loop(
             request = plan_next_station(record, candidates)
         online.complete_live_state()
         published = client.finalize_log()
-        log = validate_ral_measurement_log(published.path)
+        log = validate_live_measurement_log(published.path)
         if published.record_count != len(log.records):
             raise RuntimeError("Published runtime record count is inconsistent.")
         online.bind_finalized_measurement_log(log.path)
         completed = online.publish_bound_result()
         station_count = len({record.station_id for record in log.records})
-        return RALClosedLoopResult(
+        return LiveClosedLoopResult(
             measurement_log_path=log.path.resolve(),
             mle_output_dir=target,
             run_id=log.run_id,
@@ -617,13 +614,12 @@ def run_ral_closed_loop(
             station_count=station_count,
             stop_reason=stop_reason,
             dashboard_url=completed.dashboard_url,
-            private_scene_profile=private_scene_profile,
+            experiment_profile_id=experiment.profile_id,
         )
 
     with AdaptiveRuntimeClient(
         scenario_path,
         runtime_root=runtime_root,
-        private_scene_profile=private_scene_profile,
         resume_stage_path=resume_stage_path,
         resume_compatibility_path=resume_compatibility_path,
         output_hook=output_hook,
@@ -632,7 +628,6 @@ def run_ral_closed_loop(
 
 
 __all__ = [
-    "RALClosedLoopResult",
-    "RAL_PRIVATE_SCENE_PROFILES",
-    "run_ral_closed_loop",
+    "LiveClosedLoopResult",
+    "run_live_closed_loop",
 ]

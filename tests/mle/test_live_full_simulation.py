@@ -1,4 +1,4 @@
-"""Tests for strict RA-L runtime acquisition and MLE launch integration."""
+"""Tests for strict live runtime acquisition and MLE launch integration."""
 
 from __future__ import annotations
 
@@ -9,24 +9,27 @@ from pathlib import Path
 import pytest
 
 from three_d_estimation.cli import (
-    RAL_MLE_CONFIG,
-    RAL_PLANNING_CONFIG,
-    RAL_STOP_CONFIG,
+    LIVE_MLE_CONFIG,
+    LIVE_PLANNING_CONFIG,
+    LIVE_STOP_CONFIG,
     build_argument_parser,
 )
 from three_d_estimation.config import MLEConfig
-from three_d_estimation.ral import (
-    _runtime_config_errors,
-    preflight_ral_full_simulation,
+from three_d_estimation.live_validation import (
+    _full_fidelity_runtime_config_errors,
+    load_live_mle_config,
+    load_live_planning_config,
+    preflight_live_simulation,
 )
+from runtime.experiment_profiles import STANDARD_EXPERIMENT_PROFILE
 
 
 def _physical_config(registry_digest: str) -> dict[str, object]:
-    """Return the minimum standard RA-L runtime configuration for preflight."""
+    """Return the minimum standard live runtime configuration for preflight."""
     return {
         "backend": "geant4",
         "engine_mode": "external",
-        "isotope_experiment_profile": "ral_eu154",
+        "isotope_experiment_profile": "unconditioned_eu154",
         "energy_bin_count": 851,
         "energy_min_keV": 0.0,
         "energy_max_keV": 1700.0,
@@ -46,7 +49,7 @@ def _physical_config(registry_digest: str) -> dict[str, object]:
     }
 
 
-def test_ral_preflight_binds_runtime_assets_and_mle_profiles(
+def test_live_preflight_binds_runtime_assets_and_mle_profiles(
     tmp_path: Path,
 ) -> None:
     """Preflight should prove all authoritative runtime and local config assets."""
@@ -72,10 +75,10 @@ def test_ral_preflight_binds_runtime_assets_and_mle_profiles(
         encoding="utf-8",
     )
 
-    result = preflight_ral_full_simulation(
-        mle_config_path=RAL_MLE_CONFIG,
-        planning_config_path=RAL_PLANNING_CONFIG,
-        stop_config_path=RAL_STOP_CONFIG,
+    result = preflight_live_simulation(
+        mle_config_path=LIVE_MLE_CONFIG,
+        planning_config_path=LIVE_PLANNING_CONFIG,
+        stop_config_path=LIVE_STOP_CONFIG,
         runtime_root=tmp_path,
     )
 
@@ -90,8 +93,8 @@ def test_ral_preflight_binds_runtime_assets_and_mle_profiles(
     }
 
 
-def test_ral_runtime_contract_rejects_shortcuts() -> None:
-    """Analytic, thinned, or weighted acquisition cannot be called RA-L full."""
+def test_live_runtime_contract_rejects_shortcuts() -> None:
+    """Analytic, thinned, or weighted acquisition cannot be called full fidelity."""
     config = _physical_config("0" * 64)
     config.update(
         {
@@ -101,39 +104,39 @@ def test_ral_runtime_contract_rejects_shortcuts() -> None:
         }
     )
 
-    errors = _runtime_config_errors(config, require_named_profile=True)
+    errors = _full_fidelity_runtime_config_errors(
+        config,
+        isotope_experiment_profile="unconditioned_eu154",
+    )
 
     assert any("backend" in error for error in errors)
     assert any("primary_sampling_fraction" in error for error in errors)
     assert any("weighted_transport" in error for error in errors)
 
 
-def test_ral_full_simulation_cli_supports_only_live_acquisition() -> None:
-    """The RA-L launcher must expose only private live acquisition inputs."""
+def test_live_simulation_cli_supports_only_live_acquisition() -> None:
+    """The live launcher must expose only private live acquisition inputs."""
     parser = build_argument_parser()
-    preflight = parser.parse_args(["ral-full-simulation", "--preflight-only", "--json"])
+    preflight = parser.parse_args(["live-simulation", "--preflight-only", "--json"])
     adaptive = parser.parse_args(
         [
-            "ral-full-simulation",
+            "live-simulation",
             "--scenario",
-            "/private/ral-scenario.json",
-            "--private-scene-profile",
-            "ral-cs4-co3-eu0",
+            "/private/live-scenario.json",
             "--resume-stage",
             "/tmp/.measurement-log.stream-17",
             "--resume-compatibility",
             "/tmp/resume-compatibility.json",
             "--output-dir",
-            "/tmp/ral-mle",
+            "/tmp/live-mle",
         ]
     )
     assert preflight.preflight_only is True
-    assert adaptive.scenario == Path("/private/ral-scenario.json")
-    assert adaptive.private_scene_profile == "ral-cs4-co3-eu0"
+    assert adaptive.scenario == Path("/private/live-scenario.json")
     assert adaptive.resume_stage == Path("/tmp/.measurement-log.stream-17")
     assert adaptive.resume_compatibility == Path("/tmp/resume-compatibility.json")
     assert not hasattr(adaptive, "plan")
-    assert adaptive.max_measurements == 256
+    assert not hasattr(adaptive, "max_measurements")
     assert adaptive.minimum_information_gain_nats is None
     assert adaptive.low_information_patience is None
     for removed_arguments in (
@@ -141,7 +144,25 @@ def test_ral_full_simulation_cli_supports_only_live_acquisition() -> None:
         ("--final-only",),
     ):
         with pytest.raises(SystemExit):
-            parser.parse_args(["ral-full-simulation", *removed_arguments])
+            parser.parse_args(["live-simulation", *removed_arguments])
+
+
+def test_live_configs_reject_runtime_owned_acquisition_fields(
+    tmp_path: Path,
+) -> None:
+    """Estimator JSON must not duplicate runtime profile axes or timing."""
+    mle_path = tmp_path / "mle.json"
+    mle_path.write_text('{"isotope_names": ["Cs-137"]}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="must not pin isotopes"):
+        load_live_mle_config(mle_path, ("Cs-137",))
+
+    planning_path = tmp_path / "planning.json"
+    planning_path.write_text('{"live_time_s": 12.0}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicates runtime acquisition fields"):
+        load_live_planning_config(
+            planning_path,
+            STANDARD_EXPERIMENT_PROFILE.acquisition,
+        )
 
 
 def test_mle_config_rejects_invalid_online_and_laplace_controls() -> None:

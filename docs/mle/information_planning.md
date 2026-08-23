@@ -131,7 +131,7 @@ in the nuisance Schur complement. This stops common absolute-count changes from
 being mistaken for directional information.
 
 Shield pairs at each pose are optimized as a complete ordered station program with a
-bounded beam search, without repeating a pair. The checked-in default and RA-L
+bounded beam search, without repeating a pair. The checked-in default and live
 profiles select eight measurements per planned station. With beam width 64, the
 planner retains the best 64 partial programs after each expansion instead of
 enumerating every eight-pair permutation. Pair-specific vertical/support ambiguity
